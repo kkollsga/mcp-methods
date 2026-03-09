@@ -3,7 +3,7 @@
 import tempfile
 from pathlib import Path
 
-from mcp_methods import grep_files, read_file
+from mcp_methods import grep, grep_files, read_file
 
 
 def _make_tree(tmp: Path) -> None:
@@ -209,6 +209,50 @@ def test_grep_files_custom_skip_dirs():
         # With custom skip_dirs that includes "src", should skip src/
         result = grep_files([tmp], "hello", skip_dirs=["src"])
         assert "No matches" in result
+
+
+# ---------------------------------------------------------------------------
+# grep — Claude-compatible wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_grep_basic():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep("hello", path=tmp)
+        # Default output_mode is files_with_matches
+        assert "main.py" in result
+        assert "print" not in result  # no content in files_with_matches mode
+
+
+def test_grep_content_mode():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep("hello", path=tmp, output_mode="content")
+        assert "1 match" in result
+        assert "main.py:2:" in result
+
+
+def test_grep_type_filter():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep("line", path=tmp, type="txt")
+        assert "data.txt" in result
+
+
+def test_grep_context():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep("hello", path=tmp, output_mode="content", context=1)
+        assert "import os" in result
+        assert "TODO" in result
+
+
+def test_grep_case_insensitive():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep("HELLO", path=tmp, case_insensitive=True)
+        assert "main.py" in result
 
 
 # ---------------------------------------------------------------------------
