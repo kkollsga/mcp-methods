@@ -3,7 +3,7 @@
 import tempfile
 from pathlib import Path
 
-from mcp_methods.files import grep_files, read_file
+from mcp_methods import grep_files, read_file
 
 
 def _make_tree(tmp: Path) -> None:
@@ -97,6 +97,120 @@ def test_grep_files_multiple_dirs():
         assert "2 match" in result
 
 
+def test_grep_files_output_mode_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "hello", output_mode="files_with_matches")
+        assert "main.py" in result
+        # Should NOT contain line numbers or content
+        assert "print" not in result
+
+
+def test_grep_files_output_mode_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "line", glob="*.txt", output_mode="count")
+        assert "data.txt:3" in result
+
+
+def test_grep_files_context():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "hello", context=1)
+        # Should include the line before (import os) and after (# TODO: fix)
+        assert "import os" in result
+        assert "TODO" in result
+
+
+def test_grep_files_context_before():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "hello", context_before=1)
+        assert "import os" in result
+
+
+def test_grep_files_context_after():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "hello", context_after=1)
+        assert "TODO" in result
+
+
+def test_grep_files_type_filter():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "line", type_filter="txt")
+        assert "3 match" in result
+        # With py filter, should not find "line" in txt
+        result2 = grep_files([tmp], "line", type_filter="py")
+        assert "No matches" in result2
+
+
+def test_grep_files_head_limit():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "line", glob="*.txt", head_limit=2)
+        lines = [l for l in result.split("\n") if l.startswith("  ")]
+        assert len(lines) == 2
+
+
+def test_grep_files_offset():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "line", glob="*.txt", offset=1, head_limit=1)
+        lines = [l for l in result.split("\n") if l.startswith("  ")]
+        assert len(lines) == 1
+
+
+def test_grep_files_multiline():
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "multi.txt").write_text("start\nmiddle\nend\n")
+        result = grep_files([tmp], r"start\nmiddle", multiline=True)
+        assert "1 match" in result
+
+
+def test_grep_files_binary_skip():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        # Write a file with null bytes (binary)
+        (Path(tmp) / "binary.bin").write_bytes(b"hello\x00world")
+        result = grep_files([tmp], "hello")
+        # Should only match main.py, not the binary file
+        assert "1 match" in result
+
+
+def test_grep_files_respects_gitignore():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        # Initialize a git repo and add .gitignore
+        import subprocess
+        subprocess.run(["git", "init", tmp], capture_output=True)
+        (Path(tmp) / ".gitignore").write_text("ignored_dir/\n")
+        (Path(tmp) / "ignored_dir").mkdir()
+        (Path(tmp) / "ignored_dir" / "secret.py").write_text("hello secret\n")
+        result = grep_files([tmp], "secret", respect_gitignore=True)
+        assert "No matches" in result
+        # With gitignore disabled, should find it
+        result2 = grep_files([tmp], "secret", respect_gitignore=False)
+        assert "1 match" in result2
+
+
+def test_grep_files_no_line_numbers():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        result = grep_files([tmp], "hello", line_numbers=False)
+        assert ":2:" not in result
+        assert "hello" in result
+
+
+def test_grep_files_custom_skip_dirs():
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        # With custom skip_dirs that includes "src", should skip src/
+        result = grep_files([tmp], "hello", skip_dirs=["src"])
+        assert "No matches" in result
+
+
 # ---------------------------------------------------------------------------
 # read_file
 # ---------------------------------------------------------------------------
@@ -118,6 +232,17 @@ def test_read_file_line_range():
         result = read_file("data.txt", [tmp], start_line=2, end_line=2)
         assert "1 of 3 lines" in result
         assert "line2" in result
+
+
+def test_read_file_csv_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        csv = Path(tmp) / "data.csv"
+        csv.write_text("name,value\nalpha,1\nbeta,2\ngamma,3\ndelta,4\n")
+        result = read_file("data.csv", [tmp], rows=[1, 2])
+        assert "name,value" in result  # header always included
+        assert "beta,2" in result
+        assert "gamma,3" in result
+        assert "rows 1-2 of 4 total" in result
 
 
 def test_read_file_max_chars():

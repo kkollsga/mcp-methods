@@ -1,14 +1,15 @@
-"""Tests for mcp_methods.git."""
+"""Tests for mcp_methods git functionality (Rust-powered)."""
 
 import json
 import os
-from unittest.mock import MagicMock, patch
+import tempfile
+from unittest.mock import patch
 
-from mcp_methods.git import (
+from mcp_methods import (
     ElementCache,
-    _collapse_code_blocks,
-    _compact_discussion,
-    _grep_lines,
+    collapse_code_blocks,
+    compact_discussion,
+    grep_lines,
     detect_git_repo,
     extract_github_refs,
     git_api,
@@ -23,7 +24,7 @@ from mcp_methods.git import (
 
 
 def test_validate_repo_valid():
-    assert validate_repo("pydata/xarray") is None
+    assert validate_repo("numpy/numpy") is None
     assert validate_repo("org/repo") is None
 
 
@@ -58,8 +59,8 @@ def test_extract_github_refs_short():
 
 
 def test_extract_github_refs_empty():
-    assert extract_github_refs("", "repo/x") == set()
-    assert extract_github_refs("no refs here", "repo/x") == set()
+    assert len(extract_github_refs("", "repo/x")) == 0
+    assert len(extract_github_refs("no refs here", "repo/x")) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -81,34 +82,20 @@ def test_has_git_token_false():
 
 
 # ---------------------------------------------------------------------------
-# detect_git_repo
+# detect_git_repo (Rust — uses real git subprocess)
 # ---------------------------------------------------------------------------
 
 
-def test_detect_git_repo_ssh():
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "git@github.com:org/repo.git\n"
-
-    with patch("mcp_methods.git.subprocess.run", return_value=mock_result):
-        assert detect_git_repo("/some/path") == "org/repo"
-
-
-def test_detect_git_repo_https():
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "https://github.com/org/repo.git\n"
-
-    with patch("mcp_methods.git.subprocess.run", return_value=mock_result):
-        assert detect_git_repo("/some/path") == "org/repo"
+def test_detect_git_repo_real():
+    # This test runs in a real git repo (our project)
+    result = detect_git_repo(".")
+    assert result is not None
+    assert "/" in result  # Should be org/repo format
 
 
 def test_detect_git_repo_not_git():
-    mock_result = MagicMock()
-    mock_result.returncode = 128
-
-    with patch("mcp_methods.git.subprocess.run", return_value=mock_result):
-        assert detect_git_repo("/some/path") is None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert detect_git_repo(tmpdir) is None
 
 
 # ---------------------------------------------------------------------------
@@ -118,40 +105,76 @@ def test_detect_git_repo_not_git():
 
 def test_element_cache_store_and_get():
     cache = ElementCache()
-    cache.store("org/repo", 1, {"cb_1": {"type": "code_block", "content": "x"}})
-    assert cache.get("org/repo", 1, "cb_1")["content"] == "x"
+    elements = json.dumps({"cb_1": {"type": "code_block", "content": "x"}})
+    cache.store_elements("org/repo", 1, elements)
+    result = cache.get("org/repo", 1, "cb_1")
+    assert result is not None
+    assert json.loads(result)["content"] == "x"
     assert cache.get("org/repo", 1, "missing") is None
 
 
 def test_element_cache_available():
     cache = ElementCache()
-    cache.store("org/repo", 1, {"cb_1": {}, "comment_1": {}})
+    elements = json.dumps({"cb_1": {}, "comment_1": {}})
+    cache.store_elements("org/repo", 1, elements)
     assert cache.available("org/repo", 1) == ["cb_1", "comment_1"]
     assert cache.available("org/repo", 999) == []
 
 
 def test_element_cache_update():
     cache = ElementCache()
-    cache.store("org/repo", 1, {"cb_1": {"content": "a"}})
-    cache.update("org/repo", 1, {"overflow": {"content": "b"}})
+    cache.store_elements("org/repo", 1, json.dumps({"cb_1": {"content": "a"}}))
+    cache.update_elements("org/repo", 1, json.dumps({"overflow": {"content": "b"}}))
     assert cache.get("org/repo", 1, "cb_1") is not None
-    assert cache.get("org/repo", 1, "overflow")["content"] == "b"
+    result = cache.get("org/repo", 1, "overflow")
+    assert json.loads(result)["content"] == "b"
+
+
+def test_element_cache_retrieve():
+    cache = ElementCache()
+    cache.store_elements(
+        "org/repo",
+        1,
+        json.dumps({"cb_1": {"type": "code_block", "content": "line1\nline2\nline3"}}),
+    )
+    # Full content
+    result = cache.retrieve("org/repo", 1, "cb_1")
+    assert "line1" in result
+    # Line slicing
+    result = cache.retrieve("org/repo", 1, "cb_1", lines="1-2")
+    data = json.loads(result)
+    assert "line1" in data["content"]
+    assert "line3" not in data["content"]
+    # Not found
+    result = cache.retrieve("org/repo", 1, "missing")
+    assert "not found" in result.lower()
+
+
+def test_element_cache_fetch_issue_no_token():
+    cache = ElementCache()
+    env = os.environ.copy()
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    with patch.dict(os.environ, env, clear=True):
+        result = cache.fetch_issue("org/repo", 1)
+        assert "token" in result.lower()
 
 
 # ---------------------------------------------------------------------------
-# _collapse_code_blocks
+# collapse_code_blocks
 # ---------------------------------------------------------------------------
 
 
 def test_collapse_code_blocks_small_block():
     text = "```python\nline1\nline2\n```"
-    assert _collapse_code_blocks(text) == text
+    result, _ = collapse_code_blocks(text)
+    assert result == text
 
 
 def test_collapse_code_blocks_large_block():
     inner = "\n".join(f"line{i}" for i in range(30))
     text = f"```python\n{inner}\n```"
-    result = _collapse_code_blocks(text)
+    result, _ = collapse_code_blocks(text)
     assert "... (" in result
     assert "lines hidden" in result
 
@@ -159,65 +182,62 @@ def test_collapse_code_blocks_large_block():
 def test_collapse_code_blocks_caches_elements():
     inner = "\n".join(f"line{i}" for i in range(30))
     text = f"```python\n{inner}\n```"
-    cache: dict = {"_n": 0}
-    _collapse_code_blocks(text, cache)
+    cache_json = json.dumps({"_n": 0})
+    _, new_cache_json = collapse_code_blocks(text, cache_json)
+    cache = json.loads(new_cache_json)
     assert "cb_1" in cache
     assert cache["cb_1"]["type"] == "code_block"
     assert cache["cb_1"]["language"] == "python"
 
 
 # ---------------------------------------------------------------------------
-# _compact_discussion
+# compact_discussion
 # ---------------------------------------------------------------------------
 
 
 def test_compact_discussion_filters_bots():
-    result = {
+    discussion = {
         "body": "test",
         "comments": [
             {"author": "real-user", "author_association": "MEMBER", "body": "hi"},
             {"author": "dependabot[bot]", "author_association": "NONE", "body": "bump"},
         ],
     }
-    _compact_discussion(result, set())
+    result_json, _ = compact_discussion(json.dumps(discussion), [])
+    result = json.loads(result_json)
     assert len(result["comments"]) == 1
     assert result["comments"][0]["author"] == "real-user"
     assert result["_bot_comments_hidden"] == 1
 
 
 def test_compact_discussion_expand_all():
-    result = {
+    discussion = {
         "body": "test" * 5000,
         "comments": [
             {"author": "bot[bot]", "body": "bump"},
         ],
     }
-    _compact_discussion(result, {"all"})
+    result_json, _ = compact_discussion(json.dumps(discussion), ["all"])
+    result = json.loads(result_json)
     assert len(result["comments"]) == 1  # bot kept
 
 
 # ---------------------------------------------------------------------------
-# _grep_lines
+# grep_lines
 # ---------------------------------------------------------------------------
 
 
 def test_grep_lines_basic():
-    import re
-
     lines = ["alpha", "beta", "gamma", "delta", "alpha again"]
-    pattern = re.compile("alpha")
-    matches = _grep_lines(lines, pattern, context=1)
+    matches = grep_lines(lines, "alpha", 1)
     assert len(matches) == 2
     assert 1 in matches[0]["lines"]
     assert 5 in matches[1]["lines"]
 
 
 def test_grep_lines_overlapping_context():
-    import re
-
     lines = ["a", "b", "match1", "c", "match2", "d", "e"]
-    pattern = re.compile("match")
-    matches = _grep_lines(lines, pattern, context=1)
+    matches = grep_lines(lines, "match", 1)
     # The two matches are close enough that their context windows merge
     assert len(matches) == 1
     assert 3 in matches[0]["lines"]
@@ -225,42 +245,10 @@ def test_grep_lines_overlapping_context():
 
 
 # ---------------------------------------------------------------------------
-# git_api (mocked)
+# git_api (Rust — uses real ureq HTTP, only test validation)
 # ---------------------------------------------------------------------------
 
 
 def test_git_api_invalid_repo():
     result = git_api("bad-repo", "pulls")
     assert "Invalid repo" in result
-
-
-def test_git_api_success():
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = [{"number": 1, "title": "Test PR"}]
-
-    with patch("mcp_methods.git.requests.get", return_value=mock_response):
-        result = git_api("org/repo", "pulls?state=open")
-        data = json.loads(result)
-        assert data[0]["number"] == 1
-
-
-def test_git_api_top_level_path():
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {"items": []}
-
-    with patch("mcp_methods.git.requests.get", return_value=mock_response) as mock_get:
-        git_api("org/repo", "search/issues?q=test")
-        called_url = mock_get.call_args[0][0]
-        assert "/repos/" not in called_url
-        assert "search/issues" in called_url
-
-
-def test_git_api_404():
-    mock_response = MagicMock()
-    mock_response.status_code = 404
-
-    with patch("mcp_methods.git.requests.get", return_value=mock_response):
-        result = git_api("org/repo", "nonexistent")
-        assert "Not found" in result
