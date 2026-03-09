@@ -1,8 +1,9 @@
 """Head-to-head benchmark: mcp_methods.grep_files vs native rg (ripgrep)."""
 
+import statistics
 import subprocess
 import time
-import statistics
+
 from mcp_methods import grep_files
 
 RG = "/opt/homebrew/bin/rg"
@@ -37,7 +38,9 @@ def compare(label, ours_fn, rg_args, corpus, runs=5):
     rg_time = bench(label, lambda: rg_run(rg_args, cwd=corpus), runs=runs)
     ratio = ours / rg_time if rg_time > 0 else float("inf")
     marker = "✓" if ratio <= 1.5 else ("~" if ratio <= 3.0 else "✗")
-    print(f"  {label:48s}  ours: {ours:8.1f} ms  rg: {rg_time:8.1f} ms  ratio: {ratio:.2f}x  {marker}")
+    print(
+        f"  {label:48s}  ours: {ours:8.1f} ms  rg: {rg_time:8.1f} ms  ratio: {ratio:.2f}x  {marker}"
+    )
     return ours, rg_time
 
 
@@ -49,7 +52,9 @@ def main():
 
     # ── KGLite ──────────────────────────────────────────────────────────
     print(f"\n{'─' * 105}")
-    print(f"CORPUS: KGLite — Rust project (163K files, 39GB, .gitignore filters to ~5K source files)")
+    print(
+        "CORPUS: KGLite — Rust project (163K files, 39GB, .gitignore filters to ~5K source files)"
+    )
     print(f"{'─' * 105}")
 
     print("\n  Pattern searches (with .gitignore):")
@@ -67,7 +72,9 @@ def main():
     )
     compare(
         "Case insensitive: 'error'",
-        lambda: grep_files([KGLITE], "error", case_insensitive=True, type_filter="rust", max_results=50),
+        lambda: grep_files(
+            [KGLITE], "error", case_insensitive=True, type_filter="rust", max_results=50
+        ),
         ["error", "-i", "-t", "rust", "-m", "50"],
         KGLITE,
     )
@@ -93,19 +100,29 @@ def main():
     )
     compare(
         "Files only (-l): 'struct'",
-        lambda: grep_files([KGLITE], r"struct", output_mode="files_with_matches", type_filter="rust", max_results=50),
+        lambda: grep_files(
+            [KGLITE],
+            r"struct",
+            output_mode="files_with_matches",
+            type_filter="rust",
+            max_results=50,
+        ),
         ["struct", "-l", "-t", "rust", "-m", "50"],
         KGLITE,
     )
     compare(
         "Count (-c): 'use '",
-        lambda: grep_files([KGLITE], r"use ", output_mode="count", type_filter="rust", max_results=50),
+        lambda: grep_files(
+            [KGLITE], r"use ", output_mode="count", type_filter="rust", max_results=50
+        ),
         ["use ", "-c", "-t", "rust", "-m", "50"],
         KGLITE,
     )
     compare(
         "Multiline: 'struct.*\\n.*pub'",
-        lambda: grep_files([KGLITE], r"struct \w+.*\n.*pub", multiline=True, type_filter="rust", max_results=20),
+        lambda: grep_files(
+            [KGLITE], r"struct \w+.*\n.*pub", multiline=True, type_filter="rust", max_results=20
+        ),
         ["-U", r"struct \w+.*\n.*pub", "-t", "rust", "-m", "20"],
         KGLITE,
     )
@@ -126,7 +143,7 @@ def main():
 
     # ── HTML corpus ─────────────────────────────────────────────────────
     print(f"\n{'─' * 105}")
-    print(f"CORPUS: Scraping/processed — 53K HTML files, 2.1GB (no .gitignore)")
+    print("CORPUS: Scraping/processed — 53K HTML files, 2.1GB (no .gitignore)")
     print(f"{'─' * 105}")
 
     print("\n  Pattern searches:")

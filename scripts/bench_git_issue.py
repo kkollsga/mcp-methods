@@ -36,7 +36,7 @@ def main():
     result = cache.fetch_issue(REPO, ISSUE_NUMBER)
     dt_fetch = time.perf_counter() - t0
 
-    print(f"  Time:   {dt_fetch*1000:.0f} ms")
+    print(f"  Time:   {dt_fetch * 1000:.0f} ms")
     print(f"  Size:   {len(result):,} chars")
     print(f"  Lines:  {result.count(chr(10)) + 1}")
 
@@ -70,7 +70,7 @@ def main():
         t0 = time.perf_counter()
         elem = cache.retrieve(REPO, ISSUE_NUMBER, eid)
         dt_elem = time.perf_counter() - t0
-        print(f"  Time: {dt_elem*1000:.2f} ms")
+        print(f"  Time: {dt_elem * 1000:.2f} ms")
         print(f"  Size: {len(elem):,} chars")
 
     # Fetch with expand=all
@@ -79,7 +79,7 @@ def main():
     t0 = time.perf_counter()
     result_full = cache2.fetch_issue(REPO, ISSUE_NUMBER, expand=["all"])
     dt_full = time.perf_counter() - t0
-    print(f"  Time: {dt_full*1000:.0f} ms")
+    print(f"  Time: {dt_full * 1000:.0f} ms")
     print(f"  Size: {len(result_full):,} chars")
 
     # Benchmark extract_github_refs on the full body
@@ -92,7 +92,7 @@ def main():
             for _ in range(1000):
                 refs = extract_github_refs(body, REPO)
             dt_refs = time.perf_counter() - t0
-            print(f"  1000 iterations: {dt_refs*1000:.1f} ms ({dt_refs:.4f} ms/call)")
+            print(f"  1000 iterations: {dt_refs * 1000:.1f} ms ({dt_refs:.4f} ms/call)")
             print(f"  Refs found: {len(refs)}")
             for repo, num in sorted(refs)[:10]:
                 print(f"    {repo}#{num}")
@@ -107,7 +107,7 @@ def main():
         for _ in range(100):
             compact_discussion(full_json, [])
         dt_compact = time.perf_counter() - t0
-        print(f"  100 iterations: {dt_compact*1000:.1f} ms ({dt_compact*10:.2f} ms/call)")
+        print(f"  100 iterations: {dt_compact * 1000:.1f} ms ({dt_compact * 10:.2f} ms/call)")
     except Exception as e:
         print(f"  Error: {e}")
 
@@ -118,7 +118,7 @@ def main():
         for _ in range(1000):
             collapse_code_blocks(body)
         dt_collapse = time.perf_counter() - t0
-        print(f"  1000 iterations: {dt_collapse*1000:.1f} ms ({dt_collapse:.4f} ms/call)")
+        print(f"  1000 iterations: {dt_collapse * 1000:.1f} ms ({dt_collapse:.4f} ms/call)")
 
     print("\n" + "=" * 70)
     print("Done.")

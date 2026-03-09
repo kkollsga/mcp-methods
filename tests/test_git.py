@@ -9,14 +9,13 @@ from mcp_methods import (
     ElementCache,
     collapse_code_blocks,
     compact_discussion,
-    grep_lines,
     detect_git_repo,
     extract_github_refs,
     git_api,
+    grep_lines,
     has_git_token,
     validate_repo,
 )
-
 
 # ---------------------------------------------------------------------------
 # validate_repo

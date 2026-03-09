@@ -28,7 +28,7 @@ def main():
 
         lines = result.strip().split("\n")
         header = lines[0] if lines else ""
-        print(f"\n{label:25s}  {dt*1000:7.1f} ms  {header}")
+        print(f"\n{label:25s}  {dt * 1000:7.1f} ms  {header}")
 
     print("\n" + "=" * 70)
     print("Done.")

@@ -75,8 +75,7 @@ def test_grep_files_transform():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
         result = grep_files(
-            [tmp], "TRANSFORMED", glob="*.py",
-            transform=lambda _: "TRANSFORMED content\n"
+            [tmp], "TRANSFORMED", glob="*.py", transform=lambda _: "TRANSFORMED content\n"
         )
         assert "match" in result.lower()
 
@@ -150,7 +149,7 @@ def test_grep_files_head_limit():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
         result = grep_files([tmp], "line", glob="*.txt", head_limit=2)
-        lines = [l for l in result.split("\n") if l.startswith("  ")]
+        lines = [line for line in result.split("\n") if line.startswith("  ")]
         assert len(lines) == 2
 
 
@@ -158,7 +157,7 @@ def test_grep_files_offset():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
         result = grep_files([tmp], "line", glob="*.txt", offset=1, head_limit=1)
-        lines = [l for l in result.split("\n") if l.startswith("  ")]
+        lines = [line for line in result.split("\n") if line.startswith("  ")]
         assert len(lines) == 1
 
 
@@ -184,6 +183,7 @@ def test_grep_files_respects_gitignore():
         _make_tree(Path(tmp))
         # Initialize a git repo and add .gitignore
         import subprocess
+
         subprocess.run(["git", "init", tmp], capture_output=True)
         (Path(tmp) / ".gitignore").write_text("ignored_dir/\n")
         (Path(tmp) / "ignored_dir").mkdir()
@@ -313,7 +313,8 @@ def test_read_file_transform():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
         result = read_file(
-            "data.txt", [tmp],
+            "data.txt",
+            [tmp],
             transform=lambda t: t.upper(),
         )
         assert "LINE1" in result
