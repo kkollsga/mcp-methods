@@ -162,9 +162,13 @@ pub fn walk_and_search_parallel(
             }
 
             // Search this file right here in the walker thread
-            if let Some(fm) =
-                searcher::search_file(entry.path(), matcher, context_before, context_after, multiline)
-            {
+            if let Some(fm) = searcher::search_file(
+                entry.path(),
+                matcher,
+                context_before,
+                context_after,
+                multiline,
+            ) {
                 let count = fm.match_count;
                 matches.lock().unwrap().push(fm);
                 total_count.fetch_add(count, Ordering::Relaxed);

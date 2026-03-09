@@ -57,11 +57,7 @@ impl Sink for CollectSink {
         Ok(true)
     }
 
-    fn context(
-        &mut self,
-        _searcher: &Searcher,
-        ctx: &SinkContext<'_>,
-    ) -> Result<bool, io::Error> {
+    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
         if self.has_context {
             let line_number = ctx.line_number().unwrap_or(0);
             let content = Self::line_from_bytes(ctx.bytes());
@@ -131,9 +127,7 @@ pub fn search_text(
     let result = searcher.search_reader(matcher, text.as_bytes(), &mut sink);
 
     match result {
-        Ok(()) if !sink.line_matches.is_empty() => {
-            Some((sink.line_matches, sink.context_lines))
-        }
+        Ok(()) if !sink.line_matches.is_empty() => Some((sink.line_matches, sink.context_lines)),
         _ => None,
     }
 }
