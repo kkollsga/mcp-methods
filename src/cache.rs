@@ -213,17 +213,16 @@ impl ElementCache {
     ///
     /// Takes discussion as JSON string, returns compacted JSON string.
     /// Cache entries are stored directly in this cache object.
-    #[pyo3(signature = (repo, number, discussion_json, expand))]
+    #[pyo3(signature = (repo, number, discussion_json))]
     pub fn compact_and_store(
         &mut self,
         repo: &str,
         number: u64,
         discussion_json: &str,
-        expand: Vec<String>,
     ) -> PyResult<String> {
         let cache_json = serde_json::to_string(&serde_json::json!({"_n": 0})).unwrap();
         let (compacted_json, cache_out) =
-            compact::compact_discussion(discussion_json, expand, Some(&cache_json))?;
+            compact::compact_discussion(discussion_json, Some(&cache_json), None, None)?;
 
         // Extract and store cache entries
         if let Some(ref cache_str) = cache_out {
@@ -237,13 +236,12 @@ impl ElementCache {
     ///
     /// Releases the GIL during all HTTP and computation. This is the primary
     /// entry point for fetching discussions with caching.
-    #[pyo3(signature = (repo, number, *, expand=None, element_id=None, lines=None, grep=None, context=3, refresh=false))]
+    #[pyo3(signature = (repo, number, *, element_id=None, lines=None, grep=None, context=3, refresh=false))]
     #[allow(clippy::too_many_arguments)]
     pub fn fetch_discussion(
         &mut self,
         repo: &str,
         number: u64,
-        expand: Option<Vec<String>>,
         element_id: Option<&str>,
         lines: Option<&str>,
         grep: Option<&str>,
@@ -283,8 +281,7 @@ impl ElementCache {
         }
 
         // All HTTP + computation runs in Rust; parallel requests use std::thread::scope
-        let expand_list = expand.unwrap_or_default();
-        let (text, cache_json) = match github::fetch_issue_internal(repo, number, &expand_list) {
+        let (text, cache_json) = match github::fetch_issue_internal(repo, number) {
             Ok(r) => r,
             Err(e) => return Ok(e),
         };

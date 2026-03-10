@@ -33,7 +33,7 @@ def main():
     # Fetch with compact view (default) — uses Rust HTTP + parallel requests
     print("\n--- Compact fetch (Rust ureq + parallel) ---")
     t0 = time.perf_counter()
-    result = cache.fetch_issue(REPO, ISSUE_NUMBER)
+    result = cache.fetch_discussion(REPO, ISSUE_NUMBER)
     dt_fetch = time.perf_counter() - t0
 
     print(f"  Time:   {dt_fetch * 1000:.0f} ms")
@@ -50,8 +50,8 @@ def main():
         n_comments = len(data.get("comments", []))
         n_reviews = len(data.get("reviews", []))
         print(f"  Comments: {n_comments}, Reviews: {n_reviews}")
-        if data.get("_expand"):
-            print(f"  Expand:   {data['_expand'][:100]}")
+        if data.get("_compaction"):
+            print(f"  Compaction: {data['_compaction'][:100]}")
         if data.get("_bot_comments_hidden"):
             print(f"  Bot comments hidden: {data['_bot_comments_hidden']}")
     except json.JSONDecodeError:
@@ -73,11 +73,10 @@ def main():
         print(f"  Time: {dt_elem * 1000:.2f} ms")
         print(f"  Size: {len(elem):,} chars")
 
-    # Fetch with expand=all
-    print("\n--- Full fetch (expand=['all']) ---")
-    cache2 = ElementCache()
+    # Fetch with refresh (no compaction caching test)
+    print("\n--- Re-fetch (refresh=True) ---")
     t0 = time.perf_counter()
-    result_full = cache2.fetch_issue(REPO, ISSUE_NUMBER, expand=["all"])
+    result_full = cache.fetch_discussion(REPO, ISSUE_NUMBER, refresh=True)
     dt_full = time.perf_counter() - t0
     print(f"  Time: {dt_full * 1000:.0f} ms")
     print(f"  Size: {len(result_full):,} chars")
@@ -105,7 +104,7 @@ def main():
         full_json = json.dumps(full_data, ensure_ascii=False)
         t0 = time.perf_counter()
         for _ in range(100):
-            compact_discussion(full_json, [])
+            compact_discussion(full_json)
         dt_compact = time.perf_counter() - t0
         print(f"  100 iterations: {dt_compact * 1000:.1f} ms ({dt_compact * 10:.2f} ms/call)")
     except Exception as e:

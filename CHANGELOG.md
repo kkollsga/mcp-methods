@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.6
+
+### Improvements
+
+- **Budget-based adaptive compaction** — `fetch_discussion` / `compact_discussion` now start with full content and only compact what's needed to fit within a byte budget (default 60KB). Small/medium PRs return fully expanded with no user effort. Large PRs gracefully degrade through 9 progressive tiers (bot filter → code blocks → comments → large patches → body → reviews → all patches → aggressive).
+- **Removed `expand` parameter** — no longer needed. Compaction is fully automatic based on size constraints. Compacted content is always available via `element_id` drill-down.
+- **Per-item budget** (default 15KB) prevents any single patch, comment, or body from consuming more than 25% of the total budget, ensuring balanced output even when one file dominates a PR.
+- **`budget` / `item_budget` parameters** on `compact_discussion` for power users who want to tune output size.
+- **`_compaction` metadata** in output describes what was compacted and at which tier, so callers know what to drill into.
+
 ## 0.3.5
 
 ### Improvements

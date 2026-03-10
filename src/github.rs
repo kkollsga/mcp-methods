@@ -14,8 +14,8 @@ use crate::git_refs;
 // ---------------------------------------------------------------------------
 
 const GITHUB_API: &str = "https://api.github.com";
-pub const OVERFLOW_LIMIT: usize = 50_000;
-pub const OVERFLOW_PREVIEW: usize = 20_000;
+pub const OVERFLOW_LIMIT: usize = 100_000;
+pub const OVERFLOW_PREVIEW: usize = 40_000;
 const MAX_RELATED: usize = 10;
 
 static URL_RE: LazyLock<Regex> =
@@ -35,7 +35,7 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 });
 
 /// Rough byte-size estimate for a serde_json::Value without allocating a string.
-fn estimate_json_size(val: &Value) -> usize {
+pub fn estimate_json_size(val: &Value) -> usize {
     match val {
         Value::Null => 4,
         Value::Bool(b) => {
@@ -634,11 +634,7 @@ fn collect_refs_from_discussion(result: &Value, default_repo: &str) -> HashSet<(
 ///
 /// This function does all network I/O and CPU work. Designed to run with the
 /// GIL released via `py.allow_threads()`.
-pub fn fetch_issue_internal(
-    repo: &str,
-    number: u64,
-    expand: &[String],
-) -> Result<(String, Option<String>), String> {
+pub fn fetch_issue_internal(repo: &str, number: u64) -> Result<(String, Option<String>), String> {
     if !has_git_token() {
         return Err(
             "No GitHub token found. A token is required for fetching issues/PRs \
@@ -682,8 +678,9 @@ pub fn fetch_issue_internal(
                             let cache_json = serde_json::to_string(&json!({"_n": 0})).unwrap();
                             if let Ok((compacted, _)) = compact::compact_discussion(
                                 &disc_json,
-                                Vec::new(),
                                 Some(&cache_json),
+                                None,
+                                None,
                             ) {
                                 if let Ok(val) = serde_json::from_str(&compacted) {
                                     results.push(val);
@@ -740,7 +737,7 @@ pub fn fetch_issue_internal(
     let parent_json = serde_json::to_string(&parent).map_err(|e| format!("JSON error: {}", e))?;
     let cache_json = serde_json::to_string(&json!({"_n": 0})).unwrap();
     let (compacted, cache_out) =
-        compact::compact_discussion(&parent_json, expand.to_vec(), Some(&cache_json))
+        compact::compact_discussion(&parent_json, Some(&cache_json), None, None)
             .map_err(|e| format!("Compaction error: {}", e))?;
 
     Ok((compacted, cache_out))
@@ -810,7 +807,6 @@ pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> S
     sort = "created",
     limit = 20,
     labels = None,
-    expand = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn github_discussions(
@@ -822,7 +818,6 @@ pub fn github_discussions(
     sort: &str,
     limit: usize,
     labels: Option<Vec<String>>,
-    expand: Option<Vec<String>>,
 ) -> PyResult<String> {
     // Resolve repo: explicit or auto-detect from cwd
     let repo_str = match repo {
@@ -843,8 +838,7 @@ pub fn github_discussions(
     match number {
         Some(num) => {
             // Single discussion mode
-            let expand = expand.unwrap_or_default();
-            let (text, _cache) = fetch_issue_internal(&repo_str, num, &expand)
+            let (text, _cache) = fetch_issue_internal(&repo_str, num)
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             Ok(text)
         }

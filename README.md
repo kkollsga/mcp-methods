@@ -84,7 +84,7 @@ results = ripgrep_files(
 )
 ```
 
-### `github_discussions(*, repo=None, number=None, kind="all", state="open", sort="created", limit=20, labels=None, expand=None)`
+### `github_discussions(*, repo=None, number=None, kind="all", state="open", sort="created", limit=20, labels=None)`
 
 Fetch a single discussion or list discussions.
 

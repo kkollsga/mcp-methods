@@ -259,23 +259,11 @@ def test_compact_discussion_filters_bots():
             {"author": "dependabot[bot]", "author_association": "NONE", "body": "bump"},
         ],
     }
-    result_json, _ = compact_discussion(json.dumps(discussion), [])
+    result_json, _ = compact_discussion(json.dumps(discussion))
     result = json.loads(result_json)
     assert len(result["comments"]) == 1
     assert result["comments"][0]["author"] == "real-user"
     assert result["_bot_comments_hidden"] == 1
-
-
-def test_compact_discussion_expand_all():
-    discussion = {
-        "body": "test" * 5000,
-        "comments": [
-            {"author": "bot[bot]", "body": "bump"},
-        ],
-    }
-    result_json, _ = compact_discussion(json.dumps(discussion), ["all"])
-    result = json.loads(result_json)
-    assert len(result["comments"]) == 1  # bot kept
 
 
 def test_compact_discussion_patches_small_diff_inline():
@@ -300,7 +288,7 @@ def test_compact_discussion_patches_small_diff_inline():
         ],
     }
     cache_json = json.dumps({"_n": 0})
-    result_json, new_cache_json = compact_discussion(json.dumps(discussion), [], cache_json)
+    result_json, new_cache_json = compact_discussion(json.dumps(discussion), cache_json)
     result = json.loads(result_json)
     cache = json.loads(new_cache_json)
 
@@ -322,56 +310,34 @@ def test_compact_discussion_patches_small_diff_inline():
 
 
 def test_compact_discussion_patches_large_diff_collapsed():
-    """Large diffs collapse patches into navigation tree with patch_ids only."""
-    # Generate a large patch (> 200 lines total)
-    large_patch = "@@ -1,5 +1,250 @@\n" + "\n".join(f"+line {i}" for i in range(250))
+    """Large diffs collapse patches via per-item budget."""
+    # Generate a large patch (> 15KB per-item budget)
+    large_patch = "@@ -1,5 +1,2000 @@\n" + "\n".join(f"+line {i}" for i in range(2000))
     discussion = {
         "body": "Big refactor",
         "files": [
             {
                 "filename": "src/engine.py",
                 "status": "modified",
-                "additions": 250,
+                "additions": 2000,
                 "deletions": 5,
                 "patch": large_patch,
             },
         ],
     }
     cache_json = json.dumps({"_n": 0})
-    result_json, new_cache_json = compact_discussion(json.dumps(discussion), [], cache_json)
+    result_json, new_cache_json = compact_discussion(json.dumps(discussion), cache_json)
     result = json.loads(result_json)
     cache = json.loads(new_cache_json)
 
-    # Large diff: patch removed from inline, only patch_id remains
+    # Large patch: collapsed to preview, patch_id for drill-down
     f = result["files"][0]
     assert "patch" not in f
     assert "patch_id" in f
 
     # Cache has the full patch
     assert "patch_1" in cache
-    assert cache["patch_1"]["total_lines"] == 251
     assert cache["patch_1"]["filename"] == "src/engine.py"
-
-
-def test_compact_discussion_patches_expanded():
-    """With expand=['patches'], raw patches are kept inline."""
-    discussion = {
-        "body": "Fix bug",
-        "files": [
-            {
-                "filename": "src/main.py",
-                "status": "modified",
-                "additions": 5,
-                "deletions": 2,
-                "patch": "@@ -1,3 +1,6 @@\n+import os",
-            },
-        ],
-    }
-    result_json, _ = compact_discussion(json.dumps(discussion), ["patches"])
-    result = json.loads(result_json)
-    # Patches kept inline
-    assert result["files"][0]["patch"] == "@@ -1,3 +1,6 @@\n+import os"
-    assert "patch_id" not in result["files"][0]
 
 
 def test_compact_discussion_patch_drilldown():
@@ -389,7 +355,7 @@ def test_compact_discussion_patch_drilldown():
         ],
     }
     cache = ElementCache()
-    cache.compact_and_store("org/repo", 42, json.dumps(discussion), [])
+    cache.compact_and_store("org/repo", 42, json.dumps(discussion))
 
     # Verify patch was cached
     available = cache.available("org/repo", 42)
