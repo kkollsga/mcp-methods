@@ -135,7 +135,7 @@ pub fn walk_and_search_parallel(
     context_before: usize,
     context_after: usize,
     multiline: bool,
-    max_results: usize,
+    match_limit: usize,
 ) -> Result<Vec<FileMatch>, String> {
     let builder = build_walker(
         source_dirs,
@@ -186,7 +186,7 @@ pub fn walk_and_search_parallel(
 
         Box::new(move |entry| {
             // Check early termination
-            if max_results > 0 && total_count.load(Ordering::Relaxed) >= max_results {
+            if match_limit > 0 && total_count.load(Ordering::Relaxed) >= match_limit {
                 return ignore::WalkState::Quit;
             }
 
@@ -211,7 +211,7 @@ pub fn walk_and_search_parallel(
                     total_count.fetch_add(fm.match_count, Ordering::Relaxed) + fm.match_count;
                 guard.matches.push(fm);
 
-                if max_results > 0 && new_total >= max_results {
+                if match_limit > 0 && new_total >= match_limit {
                     return ignore::WalkState::Quit;
                 }
             }

@@ -30,9 +30,9 @@ use types::{FileMatch, OutputMode};
     context_after = 0,
     context = 0,
     line_numbers = true,
-    head_limit = None,
-    offset = 0,
     max_results = None,
+    offset = 0,
+    match_limit = None,
     skip_dirs = None,
     relative_to = None,
     respect_gitignore = true,
@@ -52,9 +52,9 @@ pub fn ripgrep_files(
     context_after: usize,
     context: usize,
     line_numbers: bool,
-    head_limit: Option<usize>,
-    offset: usize,
     max_results: Option<usize>,
+    offset: usize,
+    match_limit: Option<usize>,
     skip_dirs: Option<Vec<String>>,
     relative_to: Option<String>,
     respect_gitignore: bool,
@@ -124,7 +124,7 @@ pub fn ripgrep_files(
                     line_matches,
                     context_lines,
                 });
-                if let Some(cap) = max_results {
+                if let Some(cap) = match_limit {
                     if total >= cap {
                         break;
                     }
@@ -144,7 +144,7 @@ pub fn ripgrep_files(
             ctx_before,
             ctx_after,
             multiline,
-            max_results.unwrap_or(0),
+            match_limit.unwrap_or(0),
         ) {
             Ok(m) => m,
             Err(e) => return Ok(e),
@@ -158,9 +158,9 @@ pub fn ripgrep_files(
         pattern,
         mode,
         line_numbers,
-        head_limit,
-        offset,
         max_results,
+        offset,
+        match_limit,
         rel_base.as_deref(),
         &source_path,
         glob,
@@ -179,9 +179,9 @@ fn format_output(
     pattern: &str,
     mode: OutputMode,
     line_numbers: bool,
-    head_limit: Option<usize>,
-    offset: usize,
     max_results: Option<usize>,
+    offset: usize,
+    match_limit: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
     glob: &str,
@@ -191,26 +191,26 @@ fn format_output(
             file_matches,
             pattern,
             line_numbers,
-            head_limit,
-            offset,
             max_results,
+            offset,
+            match_limit,
             relative_to,
             source_path,
             glob,
         ),
         OutputMode::FilesWithMatches => format_files(
             file_matches,
-            head_limit,
-            offset,
             max_results,
+            offset,
+            match_limit,
             relative_to,
             source_path,
         ),
         OutputMode::Count => format_count(
             file_matches,
-            head_limit,
-            offset,
             max_results,
+            offset,
+            match_limit,
             relative_to,
             source_path,
         ),
@@ -222,9 +222,9 @@ fn format_content(
     file_matches: &[FileMatch],
     pattern: &str,
     line_numbers: bool,
-    head_limit: Option<usize>,
-    offset: usize,
     max_results: Option<usize>,
+    offset: usize,
+    match_limit: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
     glob: &str,
@@ -300,13 +300,13 @@ fn format_content(
         }
     }
 
-    // Apply offset + head_limit
+    // Apply offset + max_results
     if offset > 0 && offset < lines.len() {
         lines.drain(..offset);
     } else if offset >= lines.len() && !lines.is_empty() {
         lines.clear();
     }
-    if let Some(limit) = head_limit {
+    if let Some(limit) = max_results {
         if lines.len() > limit {
             lines.truncate(limit);
         }
@@ -318,7 +318,7 @@ fn format_content(
 
     let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
     let mut header = format!("Found {} match(es) for '{}'", total_matches, pattern);
-    if let Some(cap) = max_results {
+    if let Some(cap) = match_limit {
         if total_matches >= cap {
             header.push_str(&format!(" (capped at {})", cap));
         }
@@ -330,9 +330,9 @@ fn format_content(
 
 fn format_files(
     file_matches: &[FileMatch],
-    head_limit: Option<usize>,
-    offset: usize,
     max_results: Option<usize>,
+    offset: usize,
+    match_limit: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
 ) -> String {
@@ -346,7 +346,7 @@ fn format_files(
     } else if offset >= paths.len() && !paths.is_empty() {
         paths.clear();
     }
-    if let Some(limit) = head_limit {
+    if let Some(limit) = max_results {
         if paths.len() > limit {
             paths.truncate(limit);
         }
@@ -357,7 +357,7 @@ fn format_files(
     }
 
     let mut result = paths.join("\n");
-    if let Some(cap) = max_results {
+    if let Some(cap) = match_limit {
         let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
         if total_matches >= cap {
             result.push_str(&format!(
@@ -372,9 +372,9 @@ fn format_files(
 
 fn format_count(
     file_matches: &[FileMatch],
-    head_limit: Option<usize>,
-    offset: usize,
     max_results: Option<usize>,
+    offset: usize,
+    match_limit: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
 ) -> String {
@@ -391,7 +391,7 @@ fn format_count(
     } else if offset >= entries.len() && !entries.is_empty() {
         entries.clear();
     }
-    if let Some(limit) = head_limit {
+    if let Some(limit) = max_results {
         if entries.len() > limit {
             entries.truncate(limit);
         }
@@ -402,7 +402,7 @@ fn format_count(
     }
 
     let mut result = entries.join("\n");
-    if let Some(cap) = max_results {
+    if let Some(cap) = match_limit {
         let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
         if total_matches >= cap {
             result.push_str(&format!(

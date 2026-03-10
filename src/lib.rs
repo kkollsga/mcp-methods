@@ -30,7 +30,8 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(github::has_git_token, m)?)?;
     m.add_function(wrap_pyfunction!(github::detect_git_repo, m)?)?;
     m.add_function(wrap_pyfunction!(github::git_api, m)?)?;
-    m.add_function(wrap_pyfunction!(github::git_issue, m)?)?;
+    m.add_function(wrap_pyfunction!(github::github_discussions, m)?)?;
+    m.add_function(wrap_pyfunction!(github::git_diff, m)?)?;
     // cache
     m.add_class::<cache::ElementCache>()?;
     Ok(())

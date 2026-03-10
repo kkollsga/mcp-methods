@@ -1,7 +1,7 @@
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use pyo3::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -68,9 +68,11 @@ impl Entry {
     respect_gitignore = true,
     skip_dirs = None,
     include_size = false,
+    annotate = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn list_dir(
+    py: Python<'_>,
     path: &str,
     depth: usize,
     glob: Option<&str>,
@@ -79,6 +81,7 @@ pub fn list_dir(
     respect_gitignore: bool,
     skip_dirs: Option<Vec<String>>,
     include_size: bool,
+    annotate: Option<Py<PyAny>>,
 ) -> PyResult<String> {
     let root = PathBuf::from(path).canonicalize().map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("Cannot resolve '{}': {}", path, e))
@@ -178,10 +181,53 @@ pub fn list_dir(
         return Ok(format!("{}/ (empty)", tree.name));
     }
 
+    // Collect annotations if callback provided
+    let annotations = if let Some(ref annotate_fn) = annotate {
+        let mut map = HashMap::new();
+        collect_annotations(py, &tree, &root, annotate_fn, &mut map)?;
+        map
+    } else {
+        HashMap::new()
+    };
+
     let mut output = Vec::new();
     output.push(format!("{}/", tree.name));
-    render_tree(&tree, "", &mut output, include_size, &leaf_counts);
+    render_tree(
+        &tree,
+        "",
+        &mut output,
+        include_size,
+        &leaf_counts,
+        &annotations,
+    );
     Ok(output.join("\n"))
+}
+
+/// Recursively collect annotations for all entries in the tree.
+fn collect_annotations(
+    py: Python<'_>,
+    entry: &Entry,
+    root: &Path,
+    annotate_fn: &Py<PyAny>,
+    map: &mut HashMap<PathBuf, String>,
+) -> PyResult<()> {
+    for child in entry.children.values() {
+        let rel_path = child
+            .full_path
+            .strip_prefix(root)
+            .unwrap_or(&child.full_path)
+            .to_string_lossy()
+            .to_string();
+        let result = annotate_fn.call1(py, (rel_path,))?;
+        if !result.is_none(py) {
+            let annotation: String = result.extract(py)?;
+            map.insert(child.full_path.clone(), annotation);
+        }
+        if child.is_dir && !child.children.is_empty() {
+            collect_annotations(py, child, root, annotate_fn, map)?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_entry(
@@ -229,8 +275,28 @@ fn render_tree(
     output: &mut Vec<String>,
     include_size: bool,
     leaf_counts: &BTreeMap<PathBuf, (usize, usize)>,
+    annotations: &HashMap<PathBuf, String>,
 ) {
     let len = entry.children.len();
+
+    // Pre-compute max name width for annotation alignment
+    let max_name_width = if !annotations.is_empty() {
+        entry
+            .children
+            .values()
+            .map(|child| {
+                let base = child.name.len() + if child.is_dir { 1 } else { 0 }; // +1 for "/"
+                if include_size && !child.is_dir {
+                    base + 2 + format_size(child.size).len() + 1 // "  (NNN B)"
+                } else {
+                    base
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     for (i, child) in entry.children.values().enumerate() {
         let is_last = i == len - 1;
@@ -246,7 +312,26 @@ fn render_tree(
             } else {
                 String::new()
             };
-            output.push(format!("{}{}{}/{}", prefix, connector, child.name, summary));
+            let annotation = annotations.get(&child.full_path);
+            if let Some(ann) = annotation {
+                let name_part = format!("{}/", child.name);
+                let pad = if max_name_width > name_part.len() {
+                    max_name_width - name_part.len()
+                } else {
+                    0
+                };
+                output.push(format!(
+                    "{}{}{}{}{}  {}",
+                    prefix,
+                    connector,
+                    name_part,
+                    summary,
+                    " ".repeat(pad),
+                    ann
+                ));
+            } else {
+                output.push(format!("{}{}{}/{}", prefix, connector, child.name, summary));
+            }
             if !child.children.is_empty() {
                 render_tree(
                     child,
@@ -254,6 +339,7 @@ fn render_tree(
                     output,
                     include_size,
                     leaf_counts,
+                    annotations,
                 );
             }
         } else {
@@ -262,7 +348,25 @@ fn render_tree(
             } else {
                 String::new()
             };
-            output.push(format!("{}{}{}{}", prefix, connector, child.name, size_str));
+            let annotation = annotations.get(&child.full_path);
+            if let Some(ann) = annotation {
+                let name_part = format!("{}{}", child.name, size_str);
+                let pad = if max_name_width > name_part.len() {
+                    max_name_width - name_part.len()
+                } else {
+                    0
+                };
+                output.push(format!(
+                    "{}{}{}{}  {}",
+                    prefix,
+                    connector,
+                    name_part,
+                    " ".repeat(pad),
+                    ann
+                ));
+            } else {
+                output.push(format!("{}{}{}{}", prefix, connector, child.name, size_str));
+            }
         }
     }
 }

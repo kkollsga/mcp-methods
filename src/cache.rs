@@ -239,7 +239,7 @@ impl ElementCache {
     /// entry point for fetching discussions with caching.
     #[pyo3(signature = (repo, number, *, expand=None, element_id=None, lines=None, grep=None, context=3))]
     #[allow(clippy::too_many_arguments)]
-    pub fn fetch_issue(
+    pub fn fetch_discussion(
         &mut self,
         repo: &str,
         number: u64,

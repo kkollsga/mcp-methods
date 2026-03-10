@@ -57,10 +57,10 @@ def test_ripgrep_files_skips_git():
         assert "No matches" in result
 
 
-def test_ripgrep_files_max_results():
+def test_ripgrep_files_match_limit():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
-        result = ripgrep_files([tmp], "line", glob="*.txt", max_results=2)
+        result = ripgrep_files([tmp], "line", glob="*.txt", match_limit=2)
         assert "capped at 2" in result
 
 
@@ -145,10 +145,10 @@ def test_ripgrep_files_type_filter():
         assert "No matches" in result2
 
 
-def test_ripgrep_files_head_limit():
+def test_ripgrep_files_max_results():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
-        result = ripgrep_files([tmp], "line", glob="*.txt", head_limit=2)
+        result = ripgrep_files([tmp], "line", glob="*.txt", max_results=2)
         lines = [line for line in result.split("\n") if line.startswith("  ")]
         assert len(lines) == 2
 
@@ -156,7 +156,7 @@ def test_ripgrep_files_head_limit():
 def test_ripgrep_files_offset():
     with tempfile.TemporaryDirectory() as tmp:
         _make_tree(Path(tmp))
-        result = ripgrep_files([tmp], "line", glob="*.txt", offset=1, head_limit=1)
+        result = ripgrep_files([tmp], "line", glob="*.txt", offset=1, max_results=1)
         lines = [line for line in result.split("\n") if line.startswith("  ")]
         assert len(lines) == 1
 

@@ -12,6 +12,8 @@ from mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
+    git_diff,
+    github_discussions,
     has_git_token,
     ripgrep_lines,
     validate_repo,
@@ -149,14 +151,79 @@ def test_element_cache_retrieve():
     assert "not found" in result.lower()
 
 
-def test_element_cache_fetch_issue_no_token():
+def test_element_cache_fetch_discussion_no_token():
     cache = ElementCache()
     env = os.environ.copy()
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
     with patch.dict(os.environ, env, clear=True):
-        result = cache.fetch_issue("org/repo", 1)
+        result = cache.fetch_discussion("org/repo", 1)
         assert "token" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# github_discussions
+# ---------------------------------------------------------------------------
+
+
+def test_github_discussions_invalid_repo():
+    result = github_discussions(repo="bad-repo", number=1)
+    assert "Invalid repo" in result
+
+
+def test_github_discussions_no_token():
+    env = os.environ.copy()
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    with patch.dict(os.environ, env, clear=True):
+        try:
+            result = github_discussions(repo="org/repo", number=1)
+            assert "token" in result.lower()
+        except RuntimeError as e:
+            assert "token" in str(e).lower()
+
+
+def test_github_discussions_list_invalid_repo():
+    result = github_discussions(repo="bad-repo", kind="issue")
+    assert "Invalid repo" in result
+
+
+def test_github_discussions_auto_detect_repo():
+    # In our git repo, with no number, should attempt listing (may fail without token)
+    result = github_discussions(kind="issue", limit=1)
+    # Either lists results or returns an error about token/rate limit
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# git_diff
+# ---------------------------------------------------------------------------
+
+
+def test_git_diff_basic():
+    # Use real git repo — diff between HEAD~1 and HEAD
+    result = git_diff("HEAD~1", "HEAD")
+    assert isinstance(result, str)
+    # Should contain diff output or "No differences"
+    assert len(result) > 0
+
+
+def test_git_diff_stat_only():
+    result = git_diff("HEAD~1", "HEAD", stat_only=True)
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+def test_git_diff_not_a_repo():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = git_diff("main", "HEAD", repo_path=tmpdir)
+        assert "error" in result.lower()
+
+
+def test_git_diff_invalid_refs():
+    result = git_diff("nonexistent-branch-abc123", "HEAD")
+    assert "error" in result.lower() or "unknown revision" in result.lower()
 
 
 # ---------------------------------------------------------------------------

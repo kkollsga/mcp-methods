@@ -171,3 +171,54 @@ def test_list_dir_summary_format():
             if "src/" in line and "[" in line:
                 assert "file" in line
                 break
+
+
+# ---------------------------------------------------------------------------
+# annotate callback
+# ---------------------------------------------------------------------------
+
+
+def test_list_dir_annotate():
+    """Annotate callback adds metadata to entries."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+
+        def annotate(rel_path):
+            if rel_path.endswith(".py"):
+                return "(42 loc)"
+            return None
+
+        result = list_dir(tmp, depth=2, annotate=annotate)
+        assert "(42 loc)" in result
+        # .md files should NOT have annotation
+        for line in result.split("\n"):
+            if ".md" in line:
+                assert "(42 loc)" not in line
+
+
+def test_list_dir_annotate_none_passthrough():
+    """Annotate returning None for all entries produces same output as no annotate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        without = list_dir(tmp, depth=2)
+        with_none = list_dir(tmp, depth=2, annotate=lambda _path: None)
+        assert without == with_none
+
+
+def test_list_dir_annotate_alignment():
+    """Annotations within same directory level are column-aligned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp)
+        (p / "short.py").write_text("x")
+        (p / "very_long_name.py").write_text("y")
+
+        def annotate(rel_path):
+            return "(ok)"
+
+        result = list_dir(tmp, depth=1, annotate=annotate)
+        lines = [line for line in result.split("\n") if "(ok)" in line]
+        assert len(lines) == 2
+        # Both annotations should start at the same column
+        col0 = lines[0].index("(ok)")
+        col1 = lines[1].index("(ok)")
+        assert col0 == col1

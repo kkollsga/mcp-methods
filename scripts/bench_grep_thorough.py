@@ -133,10 +133,10 @@ def main():
         ),
     )
 
-    print("\n[12] head_limit + offset (pagination)")
+    print("\n[12] max_results + offset (pagination)")
     bench(
-        "grep 'let' head_limit=10 offset=5",
-        lambda: ripgrep_files([KGLITE], r"let ", head_limit=10, offset=5, type_filter="rust"),
+        "grep 'let' max_results=10 offset=5",
+        lambda: ripgrep_files([KGLITE], r"let ", max_results=10, offset=5, type_filter="rust"),
     )
 
     print("\n[13] No line numbers")

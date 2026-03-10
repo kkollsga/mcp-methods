@@ -786,6 +786,79 @@ pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// git_diff — local git subprocess
+// ---------------------------------------------------------------------------
+
+const DIFF_TRUNCATE_LIMIT: usize = 100_000;
+
+/// Compare two commits/branches and return the diff output.
+#[pyfunction]
+#[pyo3(signature = (
+    base,
+    head,
+    *,
+    repo_path = ".",
+    stat_only = false,
+    path_filter = None,
+    context = 3,
+))]
+pub fn git_diff(
+    _py: Python<'_>,
+    base: &str,
+    head: &str,
+    repo_path: &str,
+    stat_only: bool,
+    path_filter: Option<&str>,
+    context: usize,
+) -> PyResult<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(repo_path);
+
+    if stat_only {
+        cmd.args(["diff", "--stat", "--summary"]);
+    } else {
+        cmd.args(["diff", &format!("-U{}", context)]);
+    }
+
+    cmd.arg(format!("{}...{}", base, head));
+
+    if let Some(filter) = path_filter {
+        cmd.arg("--");
+        cmd.arg(filter);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to run git diff: {}. Is git installed?",
+            e
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Ok(format!("git diff error: {}", stderr.trim()));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.is_empty() {
+        return Ok(format!("No differences between {} and {}.", base, head));
+    }
+
+    if text.len() > DIFF_TRUNCATE_LIMIT {
+        let truncated = &text[..DIFF_TRUNCATE_LIMIT];
+        // Find last newline to avoid cutting mid-line
+        let end = truncated.rfind('\n').unwrap_or(DIFF_TRUNCATE_LIMIT);
+        Ok(format!(
+            "{}\n\n... (truncated at {} chars — use stat_only=True or path_filter to narrow)",
+            &text[..end],
+            text.len()
+        ))
+    } else {
+        Ok(text)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PyO3 wrappers
 // ---------------------------------------------------------------------------
 
@@ -796,20 +869,309 @@ pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> S
     git_api_internal(repo, path, truncate_at)
 }
 
-/// Fetch a GitHub issue or PR conversation as JSON (one-shot, no cache).
+/// Fetch or list GitHub issues/PRs.
+///
+/// When `number` is given, fetches a single discussion (same as old `git_issue`).
+/// When `number` is None, lists discussions matching the given filters.
 #[pyfunction]
-#[pyo3(signature = (repo, number, *, expand=None))]
-pub fn git_issue(
+#[pyo3(signature = (
+    *,
+    repo = None,
+    number = None,
+    kind = "all",
+    state = "open",
+    sort = "created",
+    limit = 20,
+    labels = None,
+    expand = None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn github_discussions(
     _py: Python<'_>,
-    repo: &str,
-    number: u64,
+    repo: Option<&str>,
+    number: Option<u64>,
+    kind: &str,
+    state: &str,
+    sort: &str,
+    limit: usize,
+    labels: Option<Vec<String>>,
     expand: Option<Vec<String>>,
 ) -> PyResult<String> {
-    if let Some(err) = git_refs::validate_repo(repo) {
+    // Resolve repo: explicit or auto-detect from cwd
+    let repo_str = match repo {
+        Some(r) => r.to_string(),
+        None => match detect_git_repo(".") {
+            Some(r) => r,
+            None => {
+                return Ok(
+                    "No repo specified and could not auto-detect from git remote.".to_string(),
+                )
+            }
+        },
+    };
+    if let Some(err) = git_refs::validate_repo(&repo_str) {
         return Ok(err);
     }
-    let expand = expand.unwrap_or_default();
-    let (text, _cache) = fetch_issue_internal(repo, number, &expand)
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-    Ok(text)
+
+    match number {
+        Some(num) => {
+            // Single discussion mode
+            let expand = expand.unwrap_or_default();
+            let (text, _cache) = fetch_issue_internal(&repo_str, num, &expand)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            Ok(text)
+        }
+        None => {
+            // Listing mode
+            Ok(list_discussions_internal(
+                &repo_str,
+                kind,
+                state,
+                sort,
+                limit,
+                labels.as_deref(),
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discussion listing
+// ---------------------------------------------------------------------------
+
+fn list_discussions_internal(
+    repo: &str,
+    kind: &str,
+    state: &str,
+    sort: &str,
+    limit: usize,
+    labels: Option<&[String]>,
+) -> String {
+    let per_page = limit.min(100);
+    let direction = "desc";
+
+    match kind {
+        "pr" => list_pulls(repo, state, sort, direction, per_page),
+        "issue" => list_issues_only(repo, state, sort, direction, per_page, labels),
+        _ => list_all(repo, state, sort, direction, per_page, labels),
+    }
+}
+
+fn list_pulls(repo: &str, state: &str, sort: &str, direction: &str, per_page: usize) -> String {
+    let path = format!(
+        "repos/{}/pulls?state={}&sort={}&direction={}&per_page={}",
+        repo, state, sort, direction, per_page
+    );
+    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+        Ok(Value::Array(items)) => format_pull_list(repo, state, &items),
+        Ok(_) => "Unexpected response format.".to_string(),
+        Err(e) => e,
+    }
+}
+
+fn list_issues_only(
+    repo: &str,
+    state: &str,
+    sort: &str,
+    direction: &str,
+    per_page: usize,
+    labels: Option<&[String]>,
+) -> String {
+    let mut path = format!(
+        "repos/{}/issues?state={}&sort={}&direction={}&per_page={}",
+        repo, state, sort, direction, per_page
+    );
+    if let Some(lbls) = labels {
+        if !lbls.is_empty() {
+            path.push_str(&format!("&labels={}", lbls.join(",")));
+        }
+    }
+    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+        Ok(Value::Array(items)) => {
+            // Filter out PRs (GitHub Issues API returns both)
+            let issues: Vec<&Value> = items
+                .iter()
+                .filter(|item| item.get("pull_request").is_none())
+                .collect();
+            format_issue_list(repo, state, &issues)
+        }
+        Ok(_) => "Unexpected response format.".to_string(),
+        Err(e) => e,
+    }
+}
+
+fn list_all(
+    repo: &str,
+    state: &str,
+    sort: &str,
+    direction: &str,
+    per_page: usize,
+    labels: Option<&[String]>,
+) -> String {
+    let mut path = format!(
+        "repos/{}/issues?state={}&sort={}&direction={}&per_page={}",
+        repo, state, sort, direction, per_page
+    );
+    if let Some(lbls) = labels {
+        if !lbls.is_empty() {
+            path.push_str(&format!("&labels={}", lbls.join(",")));
+        }
+    }
+    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+        Ok(Value::Array(items)) => {
+            let refs: Vec<&Value> = items.iter().collect();
+            format_mixed_list(repo, state, &refs)
+        }
+        Ok(_) => "Unexpected response format.".to_string(),
+        Err(e) => e,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List formatting helpers
+// ---------------------------------------------------------------------------
+
+fn format_label_tags(item: &Value) -> String {
+    item.get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" [{}]", s))
+        .unwrap_or_default()
+}
+
+fn format_date(item: &Value, key: &str) -> String {
+    item.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.get(..10).unwrap_or(s).to_string())
+        .unwrap_or_default()
+}
+
+fn format_comments(item: &Value) -> String {
+    let count = item.get("comments").and_then(|v| v.as_u64()).unwrap_or(0);
+    if count > 0 {
+        format!(", {} comment{}", count, if count == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    }
+}
+
+fn format_issue_line(item: &Value) -> String {
+    let number = item.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+    let title = json_str(item, "title");
+    let author = json_author(item);
+    let labels = format_label_tags(item);
+    let date = format_date(item, "created_at");
+    let comments = format_comments(item);
+    format!(
+        "  #{}{} {} — {} ({}{})",
+        number, labels, title, author, date, comments
+    )
+}
+
+fn format_pr_line(item: &Value) -> String {
+    let number = item.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+    let title = json_str(item, "title");
+    let author = json_author(item);
+    let labels = format_label_tags(item);
+    let date = format_date(item, "created_at");
+    let comments = format_comments(item);
+    let draft = if item.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+        " [draft]"
+    } else {
+        ""
+    };
+    let base = item
+        .get("base")
+        .and_then(|b| b.get("ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let head = item
+        .get("head")
+        .and_then(|h| h.get("ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let branch_info = if !base.is_empty() && !head.is_empty() {
+        format!(" {} -> {}", head, base)
+    } else {
+        String::new()
+    };
+    format!(
+        "  #{}{}{} {} — {} ({}{}){}",
+        number, labels, draft, title, author, date, comments, branch_info
+    )
+}
+
+fn format_issue_list(repo: &str, state: &str, items: &[&Value]) -> String {
+    if items.is_empty() {
+        return format!("No {} issues in {}.", state, repo);
+    }
+    let mut out = format!(
+        "{} issue{} in {} ({}):\n",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" },
+        repo,
+        state
+    );
+    for item in items {
+        out.push_str(&format_issue_line(item));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn format_pull_list(repo: &str, state: &str, items: &[Value]) -> String {
+    if items.is_empty() {
+        return format!("No {} pull requests in {}.", state, repo);
+    }
+    let mut out = format!(
+        "{} pull request{} in {} ({}):\n",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" },
+        repo,
+        state
+    );
+    for item in items {
+        out.push_str(&format_pr_line(item));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn format_mixed_list(repo: &str, state: &str, items: &[&Value]) -> String {
+    if items.is_empty() {
+        return format!("No {} discussions in {}.", state, repo);
+    }
+    let mut out = format!(
+        "{} discussion{} in {} ({}):\n",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" },
+        repo,
+        state
+    );
+    for item in items {
+        let is_pr = item.get("pull_request").is_some();
+        if is_pr {
+            // Issues API doesn't return full PR data (base/head), so format as issue with PR marker
+            let number = item.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+            let title = json_str(item, "title");
+            let author = json_author(item);
+            let labels = format_label_tags(item);
+            let date = format_date(item, "created_at");
+            let comments = format_comments(item);
+            out.push_str(&format!(
+                "  #{}{} [PR] {} — {} ({}{})\n",
+                number, labels, title, author, date, comments
+            ));
+        } else {
+            out.push_str(&format_issue_line(item));
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
 }

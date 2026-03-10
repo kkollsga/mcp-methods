@@ -18,11 +18,12 @@ pip install -e ".[dev]"
 
 | Function | Purpose |
 |---|---|
-| `list_dir` | Tree-formatted directory listing with depth control, glob filtering, `.gitignore` support, and dir summaries |
+| `list_dir` | Tree-formatted directory listing with depth control, glob filtering, `.gitignore` support, dir summaries, and annotation callback |
 | `ripgrep_files` | Ripgrep-powered file search with parallel walking, early termination, context lines, and multiple output modes |
 | `ripgrep` | Drop-in replacement for the Claude Code Grep tool interface |
 | `read_file` | Safe file reading with path traversal protection and line range support |
-| `git_issue` | Fetch GitHub issues/PRs with smart compaction (collapses code blocks, filters bots, truncates) |
+| `github_discussions` | Fetch a single issue/PR with smart compaction, or list issues/PRs with filters |
+| `git_diff` | Compare two commits/branches — full diff or stat-only summary |
 | `git_api` | GitHub REST API wrapper with token auth |
 | `ElementCache` | Drill-down cache for collapsed elements in GitHub discussions |
 | `ripgrep_lines` | Search through text lines with context window merging |
@@ -31,37 +32,106 @@ pip install -e ".[dev]"
 | `extract_github_refs` | Parse GitHub issue/PR references from text |
 | `detect_git_repo` / `validate_repo` | Git repository detection and validation |
 
-## Usage in an MCP server
+## Python API
+
+### `list_dir(path, *, depth=1, glob=None, dirs_only=False, relative_to=None, respect_gitignore=True, skip_dirs=None, include_size=False, annotate=None)`
+
+Tree-formatted directory listing.
 
 ```python
-from mcp_methods import list_dir, ripgrep, ripgrep_files, read_file, git_issue, ElementCache
+from mcp_methods import list_dir
 
-PROJECT = "/path/to/project"
+# Basic tree
+tree = list_dir("/project/src", depth=2, glob="*.py", relative_to="/project")
 
-# list_dir() — tree-formatted directory listing
-tree = list_dir(PROJECT, depth=2, glob="*.py", relative_to=PROJECT)
+# With annotation callback (e.g. loc from knowledge graph)
+def get_loc(rel_path):
+    node = graph.get_file(rel_path)
+    return f"({node.loc} loc)" if node else None
 
-# ripgrep() — Claude Code Grep-compatible interface
-# Returns all matches by default (head_limit=None means no cap)
-results = ripgrep(r"def \w+", path=PROJECT, type="py")
+tree = list_dir("/project/src", depth=2, annotate=get_loc)
+# src/
+# ├── main.py        (144 loc)
+# ├── utils.py       (28 loc)
+# └── models/
+#     ├── user.py    (89 loc)
+#     └── post.py    (112 loc)
+```
 
-# ripgrep_files() — full interface with multi-dir, max_results, transform
+### `ripgrep(pattern, *, path=".", glob="*", type=None, output_mode="files_with_matches", max_results=None, offset=0, ...)`
+
+Claude Code Grep-compatible interface.
+
+```python
+from mcp_methods import ripgrep
+
+results = ripgrep(r"def \w+", path="/project", type="py", max_results=50)
+```
+
+### `ripgrep_files(source_dirs, pattern, *, glob="*", type_filter=None, output_mode="content", max_results=None, offset=0, match_limit=None, relative_to=None, ...)`
+
+Full interface with multi-directory search. `max_results` limits output entries, `match_limit` caps the search engine for early termination.
+
+```python
+from mcp_methods import ripgrep_files
+
 results = ripgrep_files(
-    [PROJECT],
+    ["/project"],
     r"def \w+",
     type_filter="py",
-    relative_to=PROJECT,  # project-relative paths in output
-    max_results=500,      # early termination at engine level
+    relative_to="/project",
+    match_limit=500,
+    max_results=100,
 )
+```
 
-# Safe file reading with allowed directory enforcement
-content = read_file("src/main.py", [PROJECT])
+### `github_discussions(*, repo=None, number=None, kind="all", state="open", sort="created", limit=20, labels=None, expand=None)`
 
-# GitHub issue with compaction for context windows
+Fetch a single discussion or list discussions.
+
+```python
+from mcp_methods import github_discussions, ElementCache
+
+# List open issues
+issues = github_discussions(repo="owner/repo", kind="issue", state="open")
+
+# List pull requests
+prs = github_discussions(repo="owner/repo", kind="pr", limit=10)
+
+# Fetch a single issue/PR with smart compaction
+issue = github_discussions(repo="owner/repo", number=123)
+
+# With caching for drill-down into collapsed elements
 cache = ElementCache()
-issue = cache.fetch_issue("owner/repo", 123)
-# Drill into collapsed elements
+issue = cache.fetch_discussion("owner/repo", 123)
 element = cache.retrieve("owner/repo", 123, "cb_1")
+```
+
+### `git_diff(base, head, *, repo_path=".", stat_only=False, path_filter=None, context=3)`
+
+Compare two commits or branches.
+
+```python
+from mcp_methods import git_diff
+
+# Full diff
+diff = git_diff("main", "feature-branch")
+
+# Stat summary only
+stat = git_diff("main", "feature-branch", stat_only=True)
+
+# Filter to specific files
+diff = git_diff("v1.0", "v2.0", path_filter="*.py", context=5)
+```
+
+### `read_file(path, allowed_dirs, *, offset=0, limit=0, max_chars=0, transform=None)`
+
+Safe file reading with path traversal protection.
+
+```python
+from mcp_methods import read_file
+
+content = read_file("src/main.py", ["/project"])
 ```
 
 ## Architecture

@@ -10,7 +10,8 @@ from mcp_methods._mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
-    git_issue,
+    git_diff,
+    github_discussions,
     has_git_token,
     list_dir,
     read_file,
@@ -35,7 +36,7 @@ def ripgrep(
     context_after: int = 0,
     context: int = 0,
     line_numbers: bool = True,
-    head_limit: int | None = None,
+    max_results: int | None = None,
     offset: int = 0,
     relative_to: str | None = None,
 ) -> str:
@@ -57,7 +58,7 @@ def ripgrep(
         context_after   Lines after each match (-A)
         context         Lines before and after (-C)
         line_numbers    Show line numbers (default: True)
-        head_limit      Limit output entries (None = unlimited)
+        max_results     Limit output entries (None = unlimited)
         offset          Skip first N entries
         relative_to     Base path for relative output paths
     """
@@ -73,7 +74,7 @@ def ripgrep(
         context_after=context_after,
         context=context,
         line_numbers=line_numbers,
-        head_limit=head_limit,
+        max_results=max_results,
         offset=offset,
         relative_to=relative_to,
     )
@@ -93,7 +94,8 @@ __all__ = [
     "compact_text",
     "compact_discussion",
     "git_api",
-    "git_issue",
+    "git_diff",
+    "github_discussions",
     "has_git_token",
     "detect_git_repo",
     "ElementCache",
