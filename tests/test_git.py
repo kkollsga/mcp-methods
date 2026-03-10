@@ -278,8 +278,8 @@ def test_compact_discussion_expand_all():
     assert len(result["comments"]) == 1  # bot kept
 
 
-def test_compact_discussion_patches_collapsed():
-    """Patches are collapsed into cache elements with patch_id references."""
+def test_compact_discussion_patches_small_diff_inline():
+    """Small diffs keep patches inline while still caching for drill-down."""
     discussion = {
         "body": "Fix bug",
         "files": [
@@ -304,12 +304,12 @@ def test_compact_discussion_patches_collapsed():
     result = json.loads(result_json)
     cache = json.loads(new_cache_json)
 
-    # Files should have patch_id instead of raw patch
+    # Small diff: patches stay inline AND have patch_id for drill-down
     for f in result["files"]:
-        assert "patch" not in f
+        assert "patch" in f
         assert "patch_id" in f
 
-    # Cache should contain patch elements
+    # Cache should contain patch elements for drill-down
     assert "patch_1" in cache
     assert cache["patch_1"]["type"] == "patch"
     assert cache["patch_1"]["filename"] == "src/main.py"
@@ -319,6 +319,38 @@ def test_compact_discussion_patches_collapsed():
 
     assert "patch_2" in cache
     assert cache["patch_2"]["filename"] == "tests/test_main.py"
+
+
+def test_compact_discussion_patches_large_diff_collapsed():
+    """Large diffs collapse patches into navigation tree with patch_ids only."""
+    # Generate a large patch (> 200 lines total)
+    large_patch = "@@ -1,5 +1,250 @@\n" + "\n".join(f"+line {i}" for i in range(250))
+    discussion = {
+        "body": "Big refactor",
+        "files": [
+            {
+                "filename": "src/engine.py",
+                "status": "modified",
+                "additions": 250,
+                "deletions": 5,
+                "patch": large_patch,
+            },
+        ],
+    }
+    cache_json = json.dumps({"_n": 0})
+    result_json, new_cache_json = compact_discussion(json.dumps(discussion), [], cache_json)
+    result = json.loads(result_json)
+    cache = json.loads(new_cache_json)
+
+    # Large diff: patch removed from inline, only patch_id remains
+    f = result["files"][0]
+    assert "patch" not in f
+    assert "patch_id" in f
+
+    # Cache has the full patch
+    assert "patch_1" in cache
+    assert cache["patch_1"]["total_lines"] == 251
+    assert cache["patch_1"]["filename"] == "src/engine.py"
 
 
 def test_compact_discussion_patches_expanded():

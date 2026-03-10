@@ -13,6 +13,14 @@ const CODE_BLOCK_KEEP: usize = 5;
 const BODY_LIMIT: usize = 10_000;
 const MAINTAINER_LIMIT: usize = 5_000;
 const COMMENT_PREVIEW_CHARS: usize = 500;
+const REVIEW_PREVIEW_LINES: usize = 3;
+const REVIEW_PREVIEW_CHARS: usize = 300;
+/// Total patch lines below which diffs are shown inline (with per-file collapsing).
+const SMALL_DIFF_THRESHOLD: usize = 200;
+/// Individual patch collapse: patches above this are collapsed even in small diffs.
+const PATCH_INLINE_MAX_LINES: usize = 80;
+/// How many lines to keep as preview when collapsing an inline patch.
+const PATCH_INLINE_KEEP: usize = 20;
 
 const MAINTAINER_ROLES: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
@@ -292,35 +300,76 @@ pub fn compact_discussion(
         }
     }
 
-    // Collapse patches into cache elements
+    // Collapse patches — smart sizing based on total diff size
     if !expand_set.contains("patches") {
         if let Some(files) = result.get_mut("files").and_then(|v| v.as_array_mut()) {
+            // Calculate total diff lines to decide strategy
+            let total_patch_lines: usize = files
+                .iter()
+                .filter_map(|f| {
+                    f.get("patch")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.matches('\n').count() + 1)
+                })
+                .sum();
+
+            let is_small_diff = total_patch_lines <= SMALL_DIFF_THRESHOLD;
+
             for f in files.iter_mut() {
                 if let Some(obj) = f.as_object_mut() {
                     let patch = obj.remove("patch");
-                    if let Some(ref mut c) = cache {
-                        if let Some(Value::String(patch_text)) = patch {
-                            if !patch_text.is_empty() {
-                                let n = c.get("_n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
-                                c["_n"] = Value::from(n);
-                                let eid = format!("patch_{}", n);
-                                let filename =
-                                    obj.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                                let additions =
-                                    obj.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let deletions =
-                                    obj.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let total_lines = patch_text.matches('\n').count() + 1;
-                                c[&eid] = serde_json::json!({
-                                    "type": "patch",
-                                    "filename": filename,
-                                    "additions": additions,
-                                    "deletions": deletions,
-                                    "total_lines": total_lines,
-                                    "content": patch_text,
-                                });
-                                obj.insert("patch_id".to_string(), Value::String(eid));
+                    if let Some(Value::String(patch_text)) = patch {
+                        if patch_text.is_empty() {
+                            continue;
+                        }
+                        let total_lines = patch_text.matches('\n').count() + 1;
+                        let filename = obj.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let additions = obj.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let deletions = obj.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                        // Always cache the full patch for drill-down
+                        let eid = if let Some(ref mut c) = cache {
+                            let n = c.get("_n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                            c["_n"] = Value::from(n);
+                            let eid = format!("patch_{}", n);
+                            c[&eid] = serde_json::json!({
+                                "type": "patch",
+                                "filename": filename,
+                                "additions": additions,
+                                "deletions": deletions,
+                                "total_lines": total_lines,
+                                "content": patch_text,
+                            });
+                            Some(eid)
+                        } else {
+                            None
+                        };
+
+                        if is_small_diff {
+                            // Small diff: show patch inline, collapse if individually large
+                            if total_lines <= PATCH_INLINE_MAX_LINES {
+                                obj.insert("patch".to_string(), Value::String(patch_text));
+                            } else {
+                                // Collapse large individual patch: show preview
+                                let preview: String = patch_text
+                                    .split('\n')
+                                    .take(PATCH_INLINE_KEEP)
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                obj.insert(
+                                    "patch_preview".to_string(),
+                                    Value::String(format!(
+                                        "{}\n\n... [{} more lines]",
+                                        preview,
+                                        total_lines - PATCH_INLINE_KEEP
+                                    )),
+                                );
                             }
+                        }
+
+                        // Always set patch_id for drill-down
+                        if let Some(eid) = eid {
+                            obj.insert("patch_id".to_string(), Value::String(eid));
                         }
                     }
                 }
@@ -328,7 +377,7 @@ pub fn compact_discussion(
         }
     }
 
-    // Compact inline review comments
+    // Compact inline review comments — longer previews, cache as review_N elements
     if let Some(reviews) = result.get_mut("reviews").and_then(|v| v.as_array_mut()) {
         for review in reviews.iter_mut() {
             let reviewer = review
@@ -349,24 +398,58 @@ pub fn compact_discussion(
                         .iter()
                         .map(|ic| {
                             let body = ic.get("body").and_then(|b| b.as_str()).unwrap_or("");
-                            let preview: String = body
-                                .split('\n')
-                                .next()
-                                .unwrap_or("")
-                                .chars()
-                                .take(120)
-                                .collect();
+                            // Take first REVIEW_PREVIEW_LINES lines, up to REVIEW_PREVIEW_CHARS
+                            let preview: String = {
+                                let lines: Vec<&str> = body.split('\n').collect();
+                                let kept: String =
+                                    lines[..lines.len().min(REVIEW_PREVIEW_LINES)].join("\n");
+                                if kept.len() > REVIEW_PREVIEW_CHARS {
+                                    let mut s: String =
+                                        kept.chars().take(REVIEW_PREVIEW_CHARS).collect();
+                                    s.push_str("...");
+                                    s
+                                } else if lines.len() > REVIEW_PREVIEW_LINES {
+                                    format!("{}...", kept)
+                                } else {
+                                    kept
+                                }
+                            };
                             let replies = ic
                                 .get("replies")
                                 .and_then(|r| r.as_array())
                                 .map(|r| r.len())
                                 .unwrap_or(0);
-                            serde_json::json!({
-                                "path": ic.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                            let path = ic.get("path").and_then(|p| p.as_str()).unwrap_or("");
+
+                            // Cache full comment as review_N element
+                            let eid = if let Some(ref mut c) = cache {
+                                let n = c.get("_n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                                c["_n"] = Value::from(n);
+                                let eid = format!("review_{}", n);
+                                c[&eid] = serde_json::json!({
+                                    "type": "review_comment",
+                                    "author": reviewer,
+                                    "path": path,
+                                    "line": ic.get("line"),
+                                    "total_lines": body.matches('\n').count() + 1,
+                                    "content": body,
+                                    "replies": ic.get("replies"),
+                                });
+                                Some(eid)
+                            } else {
+                                None
+                            };
+
+                            let mut entry = serde_json::json!({
+                                "path": path,
                                 "line": ic.get("line"),
                                 "preview": preview,
                                 "replies": replies,
-                            })
+                            });
+                            if let Some(eid) = eid {
+                                entry["_element_id"] = Value::String(eid);
+                            }
+                            entry
                         })
                         .collect();
                     review["inline_comments"] = Value::Array(compacted);
