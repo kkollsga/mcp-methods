@@ -34,8 +34,9 @@ def ripgrep(
     context_after: int = 0,
     context: int = 0,
     line_numbers: bool = True,
-    head_limit: int = 0,
+    head_limit: int | None = None,
     offset: int = 0,
+    relative_to: str | None = None,
 ) -> str:
     """Ripgrep tool matching the Claude Code Grep interface.
 
@@ -55,8 +56,9 @@ def ripgrep(
         context_after   Lines after each match (-A)
         context         Lines before and after (-C)
         line_numbers    Show line numbers (default: True)
-        head_limit      Limit output entries (0 = unlimited)
+        head_limit      Limit output entries (None = unlimited)
         offset          Skip first N entries
+        relative_to     Base path for relative output paths
     """
     return ripgrep_files(
         [path],
@@ -72,6 +74,7 @@ def ripgrep(
         line_numbers=line_numbers,
         head_limit=head_limit,
         offset=offset,
+        relative_to=relative_to,
     )
 
 

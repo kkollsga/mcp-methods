@@ -33,18 +33,25 @@ pip install -e ".[dev]"
 ## Usage in an MCP server
 
 ```python
-from mcp_methods import ripgrep_files, read_file, git_issue, ElementCache
+from mcp_methods import ripgrep, ripgrep_files, read_file, git_issue, ElementCache
 
-# File search — returns formatted string ready for LLM consumption
-# By default returns all matches; set max_results to cap early
+PROJECT = "/path/to/project"
+
+# ripgrep() — Claude Code Grep-compatible interface
+# Returns all matches by default (head_limit=None means no cap)
+results = ripgrep(r"def \w+", path=PROJECT, type="py")
+
+# ripgrep_files() — full interface with multi-dir, max_results, transform
 results = ripgrep_files(
-    ["/path/to/project"],
+    [PROJECT],
     r"def \w+",
     type_filter="py",
+    relative_to=PROJECT,  # project-relative paths in output
+    max_results=500,      # early termination at engine level
 )
 
 # Safe file reading with allowed directory enforcement
-content = read_file("src/main.py", ["/path/to/project"])
+content = read_file("src/main.py", [PROJECT])
 
 # GitHub issue with compaction for context windows
 cache = ElementCache()

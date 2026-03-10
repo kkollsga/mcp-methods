@@ -31,7 +31,7 @@ use types::{FileMatch, OutputMode};
     context_after = 0,
     context = 0,
     line_numbers = true,
-    head_limit = 0,
+    head_limit = None,
     offset = 0,
     max_results = None,
     skip_dirs = None,
@@ -53,7 +53,7 @@ pub fn ripgrep_files(
     context_after: usize,
     context: usize,
     line_numbers: bool,
-    head_limit: usize,
+    head_limit: Option<usize>,
     offset: usize,
     max_results: Option<usize>,
     skip_dirs: Option<Vec<String>>,
@@ -180,7 +180,7 @@ fn format_output(
     pattern: &str,
     mode: OutputMode,
     line_numbers: bool,
-    head_limit: usize,
+    head_limit: Option<usize>,
     offset: usize,
     max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
@@ -223,7 +223,7 @@ fn format_content(
     file_matches: &[FileMatch],
     pattern: &str,
     line_numbers: bool,
-    head_limit: usize,
+    head_limit: Option<usize>,
     offset: usize,
     max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
@@ -288,8 +288,10 @@ fn format_content(
     } else if offset >= lines.len() && !lines.is_empty() {
         lines.clear();
     }
-    if head_limit > 0 && lines.len() > head_limit {
-        lines.truncate(head_limit);
+    if let Some(limit) = head_limit {
+        if lines.len() > limit {
+            lines.truncate(limit);
+        }
     }
 
     if lines.is_empty() {
@@ -310,7 +312,7 @@ fn format_content(
 
 fn format_files(
     file_matches: &[FileMatch],
-    head_limit: usize,
+    head_limit: Option<usize>,
     offset: usize,
     max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
@@ -326,8 +328,10 @@ fn format_files(
     } else if offset >= paths.len() && !paths.is_empty() {
         paths.clear();
     }
-    if head_limit > 0 && paths.len() > head_limit {
-        paths.truncate(head_limit);
+    if let Some(limit) = head_limit {
+        if paths.len() > limit {
+            paths.truncate(limit);
+        }
     }
 
     if paths.is_empty() {
@@ -350,7 +354,7 @@ fn format_files(
 
 fn format_count(
     file_matches: &[FileMatch],
-    head_limit: usize,
+    head_limit: Option<usize>,
     offset: usize,
     max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
@@ -369,8 +373,10 @@ fn format_count(
     } else if offset >= entries.len() && !entries.is_empty() {
         entries.clear();
     }
-    if head_limit > 0 && entries.len() > head_limit {
-        entries.truncate(head_limit);
+    if let Some(limit) = head_limit {
+        if entries.len() > limit {
+            entries.truncate(limit);
+        }
     }
 
     if entries.is_empty() {
