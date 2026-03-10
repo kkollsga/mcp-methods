@@ -1,19 +1,17 @@
 # Changelog
 
+## 0.3.9
+
+- **`lines` on array elements** — `lines="1-20"` on `comments_middle` now returns structured comment objects by index range (with `items_shown`, `total_items`) instead of raw JSON text. Enables clean pagination through digested threads.
+- **`_index` on highlights** — maintainer highlights in thread digests include `_index` for seamless drill-down to neighbours.
+- **Grep metadata on comments** — grep matches on comment segments include `author`, `created_at`, `comment_index`, and `element_id` for chronological context.
+
 ## 0.3.7
 
-### Improvements
-
-- **Thread digest for large discussions** — discussions with 50+ comments are automatically condensed: first 5 comments + up to 15 maintainer highlights (with `_element_id` for drill-down) + last 5 comments. Middle comments are cached individually as `comment_N` elements and as a searchable `comments_middle` segment.
-- **Bookend pagination** — comment fetching now retrieves first 5 + last 5 pages (skipping the middle) instead of all pages sequentially. Timeline capped at 3+2 pages. Prevents freezing on huge issues (e.g. numpy#10161, vscode#10121).
-- **Related discussions replaced with ref list** — instead of eagerly fetching up to 10 related issues/PRs, cross-references are listed as `related_refs` for the agent to dive into on demand. Eliminates cascading fetch delays.
-- **Structured content drill-down** — `ElementCache.retrieve()` now supports `grep` on JSON array/object content (not just strings), enabling search within `comments_middle` and other structured cache elements.
-- **`comment_count` field** — total comment count from the GitHub API is included in the output, so agents know the full thread size even when comments are digested.
-
-### Fixes
-
-- **Unicode safety** — fixed byte-slicing panics on multi-byte UTF-8 characters (em-dash, smart quotes) in `compact_text`, overflow preview, and `git_api` truncation. Added `safe_byte_index()` helper.
-- **HTML tag detection** — replaced `stripped[..8]` byte slicing with `starts_with_ignore_ascii_case()` to handle non-ASCII content safely.
+- **Thread digest** — discussions with 50+ comments are condensed: first 5 + maintainer highlights + last 5 inline, middle cached as `comment_N` and searchable `comments_middle`.
+- **Bookend pagination** — fetches first 5 + last 5 comment pages, skipping the middle. Prevents freezing on huge threads.
+- **Lazy related refs** — cross-references listed as `related_refs` instead of eagerly fetched.
+- **Unicode safety** — fixed byte-slicing panics on multi-byte UTF-8 characters.
 
 ## 0.3.6
 

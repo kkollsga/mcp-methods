@@ -743,6 +743,7 @@ fn build_thread_digest(result: &mut Value, cache: &mut Option<Value>) -> String 
                     }
                 }
                 highlight["_element_id"] = Value::String(eid);
+                highlight["_index"] = Value::Number((middle_start + i).into());
                 maintainer_highlights.push(highlight);
             }
         }

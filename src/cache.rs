@@ -191,7 +191,7 @@ impl ElementCache {
             return serde_json::to_string_pretty(&Value::Object(result)).unwrap_or_default();
         }
 
-        // Lines mode — build result with sliced content
+        // Lines mode
         if let Some(lines_str) = lines {
             let m = match LINE_RANGE_RE.captures(lines_str) {
                 Some(m) => m,
@@ -203,7 +203,34 @@ impl ElementCache {
                 }
             };
             let start: usize = m[1].parse().unwrap_or(1);
-            let end: usize = m[2].parse().unwrap_or(content_lines.len());
+            let end: usize = m[2].parse().unwrap_or(usize::MAX);
+
+            // Array elements (e.g. comments_middle): interpret lines as item index range
+            if content_is_structured {
+                if let Some(Value::Array(arr)) = content_val {
+                    let from = start.saturating_sub(1);
+                    let to = end.min(arr.len());
+                    let selected: Vec<Value> = arr[from..to].to_vec();
+                    let mut result = serde_json::Map::new();
+                    if let Some(obj) = elem_data.as_object() {
+                        for (k, v) in obj {
+                            if k != "content" {
+                                result.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    result.insert("content".to_string(), Value::Array(selected));
+                    result.insert(
+                        "items_shown".to_string(),
+                        Value::String(format!("{}-{}", start, to)),
+                    );
+                    result.insert("total_items".to_string(), Value::from(arr.len()));
+                    return serde_json::to_string_pretty(&Value::Object(result))
+                        .unwrap_or_default();
+                }
+            }
+
+            // String elements: interpret lines as text line range
             let selected: Vec<&str> =
                 content_lines[start.saturating_sub(1)..end.min(content_lines.len())].to_vec();
             let mut result = serde_json::Map::new();

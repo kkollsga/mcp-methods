@@ -459,6 +459,67 @@ def test_compact_discussion_thread_digest_drilldown():
     assert "FINDME" in parsed["content"]["body"]
 
 
+def test_compact_discussion_thread_digest_lines_pagination():
+    """lines on comments_middle returns structured comment objects by index range."""
+    comments = []
+    for i in range(80):
+        comments.append(
+            {
+                "author": f"user_{i}",
+                "author_association": "NONE",
+                "created_at": f"2024-01-{(i % 28) + 1:02d}T12:00:00Z",
+                "body": f"Comment {i} body text.",
+            }
+        )
+    discussion = {"body": "Issue body", "comments": comments}
+
+    cache = ElementCache()
+    cache.compact_and_store("org/repo", 200, json.dumps(discussion))
+
+    # Paginate: get items 1-10 from the middle
+    result = cache.retrieve("org/repo", 200, "comments_middle", lines="1-10")
+    parsed = json.loads(result)
+    items = parsed["content"]
+    assert isinstance(items, list), "lines on array element should return a list"
+    assert len(items) == 10
+    assert items[0]["author"] == "user_5"  # middle starts at index 5
+    assert items[9]["author"] == "user_14"
+    assert parsed["items_shown"] == "1-10"
+    assert parsed["total_items"] == 70  # 80 - 5 head - 5 tail
+
+    # Second page
+    result2 = cache.retrieve("org/repo", 200, "comments_middle", lines="11-20")
+    parsed2 = json.loads(result2)
+    items2 = parsed2["content"]
+    assert len(items2) == 10
+    assert items2[0]["author"] == "user_15"
+
+
+def test_compact_discussion_highlight_index():
+    """Maintainer highlights in the digest include _index for drill-down."""
+    comments = []
+    for i in range(80):
+        assoc = "MEMBER" if i == 25 else "NONE"
+        comments.append(
+            {
+                "author": f"user_{i}",
+                "author_association": assoc,
+                "created_at": f"2024-01-{(i % 28) + 1:02d}T12:00:00Z",
+                "body": f"Comment {i}.",
+            }
+        )
+    discussion = {"body": "Issue body", "comments": comments}
+
+    compacted_json, _ = compact_discussion(json.dumps(discussion), json.dumps({"_n": 0}))
+    data = json.loads(compacted_json)
+
+    highlights = [c for c in data["comments"] if c.get("_element_id")]
+    assert len(highlights) > 0
+    for h in highlights:
+        assert "_index" in h, "Highlights should include _index"
+        assert isinstance(h["_index"], int)
+
+
 # ---------------------------------------------------------------------------
 # ripgrep_lines
 # ---------------------------------------------------------------------------
