@@ -104,8 +104,7 @@ pub fn grep_files(
         let mut matches = Vec::new();
         let mut total = 0;
         let has_context = ctx_before > 0 || ctx_after > 0;
-        let mut text_searcher =
-            searcher::build_searcher(ctx_before, ctx_after, multiline, false);
+        let mut text_searcher = searcher::build_searcher(ctx_before, ctx_after, multiline, false);
         let mut sink = searcher::CollectSink::new(has_context);
 
         for path in &paths {
@@ -228,15 +227,17 @@ fn format_content(
             // Fast path: no context — matches are already in order, skip HashSet/sort/dedup
             for lm in &fm.line_matches {
                 if line_numbers {
-                    lines.push(format!("  {}:{}:{} {}", rel, lm.line_number, ':', lm.content));
+                    lines.push(format!(
+                        "  {}:{}:{} {}",
+                        rel, lm.line_number, ':', lm.content
+                    ));
                 } else {
                     lines.push(format!("  {}  {}", rel, lm.content));
                 }
             }
         } else {
             // Context path: merge matches + context lines, sorted by line number
-            let match_lines: HashSet<u64> =
-                fm.line_matches.iter().map(|m| m.line_number).collect();
+            let match_lines: HashSet<u64> = fm.line_matches.iter().map(|m| m.line_number).collect();
 
             let mut all_lines: Vec<(u64, &str, bool)> = Vec::new();
             for lm in &fm.line_matches {
