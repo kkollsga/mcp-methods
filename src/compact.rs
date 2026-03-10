@@ -31,18 +31,18 @@ pub fn collapse_code_blocks_mut(text: &str, cache: &mut Option<Value>) -> String
     let mut i = 0;
 
     while i < lines.len() {
-        let stripped = lines[i].trim().to_lowercase();
+        let stripped = lines[i].trim();
 
         // Collapse <details> blocks
-        if stripped.starts_with("<details") {
+        if stripped.len() >= 8 && stripped[..8].eq_ignore_ascii_case("<details") {
             let mut j = i + 1;
             let mut summary = String::new();
             while j < lines.len() {
                 let s = lines[j].trim();
-                if summary.is_empty() && s.to_lowercase().starts_with("<summary") {
+                if summary.is_empty() && s.len() >= 8 && s[..8].eq_ignore_ascii_case("<summary") {
                     summary = SUMMARY_RE.replace_all(s, "").trim().to_string();
                 }
-                if s.to_lowercase().starts_with("</details") {
+                if s.len() >= 9 && s[..9].eq_ignore_ascii_case("</details") {
                     break;
                 }
                 j += 1;

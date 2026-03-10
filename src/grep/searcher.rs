@@ -64,10 +64,12 @@ impl CollectSink {
     }
 
     fn line_from_bytes(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes)
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string()
+        // Strip trailing \r\n as raw bytes before UTF-8 decode
+        let mut end = bytes.len();
+        while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+            end -= 1;
+        }
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
     }
 
     /// True if the last search produced matches.

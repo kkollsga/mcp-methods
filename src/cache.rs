@@ -1,8 +1,27 @@
 use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+thread_local! {
+    static CACHED_RE: RefCell<Option<(String, Regex)>> = const { RefCell::new(None) };
+}
+
+fn get_or_compile_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    CACHED_RE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((ref cached_pat, ref re)) = *cache {
+            if cached_pat == pattern {
+                return Ok(re.clone());
+            }
+        }
+        let re = Regex::new(pattern)?;
+        *cache = Some((pattern.to_string(), re.clone()));
+        Ok(re)
+    })
+}
 
 static LINE_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)-(\d+)$").unwrap());
 
@@ -119,7 +138,7 @@ impl ElementCache {
 
         // Grep mode
         if let Some(grep_pattern) = grep {
-            let regex = match Regex::new(grep_pattern) {
+            let regex = match get_or_compile_regex(grep_pattern) {
                 Ok(r) => r,
                 Err(e) => return format!("Invalid grep pattern: {}", e),
             };

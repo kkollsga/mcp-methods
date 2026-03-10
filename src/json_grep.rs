@@ -2,6 +2,25 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::Regex;
 use serde_json::Value;
+use std::cell::RefCell;
+
+thread_local! {
+    static CACHED_RE: RefCell<Option<(String, Regex)>> = const { RefCell::new(None) };
+}
+
+fn get_or_compile_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    CACHED_RE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((ref cached_pat, ref re)) = *cache {
+            if cached_pat == pattern {
+                return Ok(re.clone());
+            }
+        }
+        let re = Regex::new(pattern)?;
+        *cache = Some((pattern.to_string(), re.clone()));
+        Ok(re)
+    })
+}
 
 /// Walk a parsed JSON structure, grep within string values.
 /// Returns a list of match dicts with field, lines, context_start, context_end, content.
@@ -13,7 +32,7 @@ pub fn ripgrep_json_fields(
     pattern: &str,
     context: usize,
 ) -> PyResult<Py<PyAny>> {
-    let regex = match Regex::new(pattern) {
+    let regex = match get_or_compile_regex(pattern) {
         Ok(r) => r,
         Err(e) => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(

@@ -7,6 +7,7 @@ mod git_refs;
 mod github;
 mod grep;
 mod json_grep;
+mod list_dir;
 
 #[pymodule]
 fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -18,6 +19,7 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grep::ripgrep_lines, m)?)?;
     // files
     m.add_function(wrap_pyfunction!(files::read_file, m)?)?;
+    m.add_function(wrap_pyfunction!(list_dir::list_dir, m)?)?;
     // compact
     m.add_function(wrap_pyfunction!(compact::collapse_code_blocks, m)?)?;
     m.add_function(wrap_pyfunction!(compact::compact_text, m)?)?;

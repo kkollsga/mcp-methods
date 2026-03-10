@@ -26,15 +26,20 @@ pub fn read_file(
     max_chars: Option<usize>,
     transform: Option<Py<PyAny>>,
 ) -> PyResult<String> {
+    // Pre-canonicalize allowed directories once, reuse across both loops.
+    let canon_dirs: Vec<PathBuf> = allowed_dirs
+        .iter()
+        .filter_map(|d| PathBuf::from(d).canonicalize().ok())
+        .collect();
+
     // Resolve file against allowed directories
     let mut resolved: Option<PathBuf> = None;
 
-    for d in &allowed_dirs {
-        let dir_path = PathBuf::from(d);
-        let candidate = dir_path.join(file_path);
+    for (i, d) in allowed_dirs.iter().enumerate() {
+        let candidate = PathBuf::from(d).join(file_path);
         if let Ok(canon) = candidate.canonicalize() {
-            if let Ok(dir_canon) = dir_path.canonicalize() {
-                if canon.starts_with(&dir_canon) && canon.exists() {
+            if let Some(dir_canon) = canon_dirs.get(i) {
+                if canon.starts_with(dir_canon) && canon.exists() {
                     resolved = Some(canon);
                     break;
                 }
@@ -46,13 +51,10 @@ pub fn read_file(
     if resolved.is_none() {
         let abs_path = PathBuf::from(file_path);
         if let Ok(canon) = abs_path.canonicalize() {
-            for d in &allowed_dirs {
-                let dir_path = PathBuf::from(d);
-                if let Ok(dir_canon) = dir_path.canonicalize() {
-                    if canon.starts_with(&dir_canon) && canon.exists() {
-                        resolved = Some(canon);
-                        break;
-                    }
+            for dir_canon in &canon_dirs {
+                if canon.starts_with(dir_canon) && canon.exists() {
+                    resolved = Some(canon);
+                    break;
                 }
             }
         }

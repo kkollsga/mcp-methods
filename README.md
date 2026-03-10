@@ -18,6 +18,7 @@ pip install -e ".[dev]"
 
 | Function | Purpose |
 |---|---|
+| `list_dir` | Tree-formatted directory listing with depth control, glob filtering, `.gitignore` support, and dir summaries |
 | `ripgrep_files` | Ripgrep-powered file search with parallel walking, early termination, context lines, and multiple output modes |
 | `ripgrep` | Drop-in replacement for the Claude Code Grep tool interface |
 | `read_file` | Safe file reading with path traversal protection and line range support |
@@ -33,9 +34,12 @@ pip install -e ".[dev]"
 ## Usage in an MCP server
 
 ```python
-from mcp_methods import ripgrep, ripgrep_files, read_file, git_issue, ElementCache
+from mcp_methods import list_dir, ripgrep, ripgrep_files, read_file, git_issue, ElementCache
 
 PROJECT = "/path/to/project"
+
+# list_dir() — tree-formatted directory listing
+tree = list_dir(PROJECT, depth=2, glob="*.py", relative_to=PROJECT)
 
 # ripgrep() — Claude Code Grep-compatible interface
 # Returns all matches by default (head_limit=None means no cap)

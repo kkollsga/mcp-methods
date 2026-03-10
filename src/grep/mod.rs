@@ -4,7 +4,6 @@ mod walker;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use types::{FileMatch, OutputMode};
@@ -230,13 +229,17 @@ fn format_content(
     source_path: &std::path::Path,
     glob: &str,
 ) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    let estimated: usize = file_matches
+        .iter()
+        .map(|fm| fm.line_matches.len() + fm.context_lines.len())
+        .sum();
+    let mut lines: Vec<String> = Vec::with_capacity(estimated);
 
     for fm in file_matches {
         let rel = walker::relativize(&fm.path, relative_to, source_path);
 
         if fm.context_lines.is_empty() {
-            // Fast path: no context — matches are already in order, skip HashSet/sort/dedup
+            // Fast path: no context — matches are already in order
             for lm in &fm.line_matches {
                 if line_numbers {
                     lines.push(format!(
@@ -248,32 +251,47 @@ fn format_content(
                 }
             }
         } else {
-            // Context path: merge matches + context lines, sorted by line number
-            let match_lines: HashSet<u64> = fm.line_matches.iter().map(|m| m.line_number).collect();
-
-            let mut all_lines: Vec<(u64, &str, bool)> = Vec::new();
-            for lm in &fm.line_matches {
-                all_lines.push((lm.line_number, &lm.content, true));
-            }
-            for (ln, content) in &fm.context_lines {
-                if !match_lines.contains(ln) {
-                    all_lines.push((*ln, content, false));
-                }
-            }
-            all_lines.sort_by_key(|(ln, _, _)| *ln);
-            all_lines.dedup_by_key(|(ln, _, _)| *ln);
-
+            // Context path: O(n) sorted merge (both sources are in line-number order)
+            let matches = &fm.line_matches;
+            let contexts = &fm.context_lines;
+            let mut mi = 0;
+            let mut ci = 0;
             let mut prev_ln: Option<u64> = None;
-            for (ln, content, is_match) in &all_lines {
+
+            while mi < matches.len() || ci < contexts.len() {
+                let (ln, content, is_match) = match (matches.get(mi), contexts.get(ci)) {
+                    (Some(m), Some((cln, _))) if m.line_number <= *cln => {
+                        // Skip context line if it duplicates this match line
+                        if *cln == m.line_number {
+                            ci += 1;
+                        }
+                        mi += 1;
+                        (m.line_number, m.content.as_str(), true)
+                    }
+                    (Some(_), Some((cln, cc))) => {
+                        ci += 1;
+                        (*cln, cc.as_str(), false)
+                    }
+                    (Some(m), None) => {
+                        mi += 1;
+                        (m.line_number, m.content.as_str(), true)
+                    }
+                    (None, Some((cln, cc))) => {
+                        ci += 1;
+                        (*cln, cc.as_str(), false)
+                    }
+                    (None, None) => unreachable!(),
+                };
+
                 if let Some(prev) = prev_ln {
-                    if *ln > prev + 1 {
+                    if ln > prev + 1 {
                         lines.push("--".to_string());
                     }
                 }
-                prev_ln = Some(*ln);
+                prev_ln = Some(ln);
 
                 if line_numbers {
-                    let sep = if *is_match { ':' } else { '-' };
+                    let sep = if is_match { ':' } else { '-' };
                     lines.push(format!("  {}:{}{} {}", rel, ln, sep, content));
                 } else {
                     lines.push(format!("  {}  {}", rel, content));
@@ -284,7 +302,7 @@ fn format_content(
 
     // Apply offset + head_limit
     if offset > 0 && offset < lines.len() {
-        lines = lines[offset..].to_vec();
+        lines.drain(..offset);
     } else if offset >= lines.len() && !lines.is_empty() {
         lines.clear();
     }
@@ -324,7 +342,7 @@ fn format_files(
         .collect();
 
     if offset > 0 && offset < paths.len() {
-        paths = paths[offset..].to_vec();
+        paths.drain(..offset);
     } else if offset >= paths.len() && !paths.is_empty() {
         paths.clear();
     }
@@ -369,7 +387,7 @@ fn format_count(
         .collect();
 
     if offset > 0 && offset < entries.len() {
-        entries = entries[offset..].to_vec();
+        entries.drain(..offset);
     } else if offset >= entries.len() && !entries.is_empty() {
         entries.clear();
     }

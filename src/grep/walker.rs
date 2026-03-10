@@ -4,7 +4,7 @@ use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::searcher;
 use super::types::FileMatch;
@@ -26,6 +26,9 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     ".ruff_cache",
 ];
 
+static DEFAULT_SKIP_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| DEFAULT_SKIP_DIRS.iter().copied().collect());
+
 fn build_walker(
     source_dirs: &[String],
     glob_pattern: &str,
@@ -37,10 +40,9 @@ fn build_walker(
         return Err("No source directories provided.".into());
     }
 
-    let skip: HashSet<String> = match skip_dirs {
-        Some(dirs) => dirs.iter().map(|s| s.to_string()).collect(),
-        None => DEFAULT_SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
-    };
+    // Use static set for default skip dirs (no allocation), owned set only for custom.
+    let custom_skip: Option<HashSet<String>> =
+        skip_dirs.map(|dirs| dirs.iter().map(|s| s.to_string()).collect());
 
     let mut builder = WalkBuilder::new(&source_dirs[0]);
     for dir in &source_dirs[1..] {
@@ -80,7 +82,10 @@ fn build_walker(
     builder.filter_entry(move |entry| {
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             if let Some(name) = entry.file_name().to_str() {
-                return !skip.contains(name as &str);
+                return match &custom_skip {
+                    Some(set) => !set.contains(name),
+                    None => !DEFAULT_SKIP_SET.contains(name),
+                };
             }
         }
         true
@@ -141,15 +146,16 @@ pub fn walk_and_search_parallel(
     )?;
     let walker = builder.build_parallel();
 
-    let matches: Arc<Mutex<Vec<FileMatch>>> = Arc::new(Mutex::new(Vec::new()));
+    // Thread-local buffering: each thread collects matches locally,
+    // flushes to shared vec once via Drop — one lock per thread instead of per file.
+    let all_batches: Arc<Mutex<Vec<Vec<FileMatch>>>> = Arc::new(Mutex::new(Vec::new()));
     let total_count = Arc::new(AtomicUsize::new(0));
 
     let has_context = context_before > 0 || context_after > 0;
 
     walker.run(|| {
-        let matches = Arc::clone(&matches);
+        let all_batches = Arc::clone(&all_batches);
         let total_count = Arc::clone(&total_count);
-        // Create searcher and sink ONCE per thread — reused across all files
         let mut thread_searcher = searcher::build_searcher(
             context_before,
             context_after,
@@ -158,8 +164,28 @@ pub fn walk_and_search_parallel(
         );
         let mut thread_sink = searcher::CollectSink::new(has_context);
 
+        // Drop guard: flushes thread-local batch to shared vec when closure is dropped.
+        struct FlushGuard {
+            matches: Vec<FileMatch>,
+            target: Arc<Mutex<Vec<Vec<FileMatch>>>>,
+        }
+        impl Drop for FlushGuard {
+            fn drop(&mut self) {
+                if !self.matches.is_empty() {
+                    self.target
+                        .lock()
+                        .unwrap()
+                        .push(std::mem::take(&mut self.matches));
+                }
+            }
+        }
+        let mut guard = FlushGuard {
+            matches: Vec::new(),
+            target: Arc::clone(&all_batches),
+        };
+
         Box::new(move |entry| {
-            // Check if we've already hit max_results (0 = unlimited)
+            // Check early termination
             if max_results > 0 && total_count.load(Ordering::Relaxed) >= max_results {
                 return ignore::WalkState::Quit;
             }
@@ -173,21 +199,19 @@ pub fn walk_and_search_parallel(
                 return ignore::WalkState::Continue;
             }
 
-            // Clear sink for reuse (preserves allocated capacity)
             thread_sink.clear();
 
-            // Search this file in the walker thread with reused searcher/sink
             if let Some(fm) = searcher::search_file(
                 entry.path(),
                 matcher,
                 &mut thread_searcher,
                 &mut thread_sink,
             ) {
-                let count = fm.match_count;
-                matches.lock().unwrap().push(fm);
-                total_count.fetch_add(count, Ordering::Relaxed);
+                let new_total =
+                    total_count.fetch_add(fm.match_count, Ordering::Relaxed) + fm.match_count;
+                guard.matches.push(fm);
 
-                if max_results > 0 && total_count.load(Ordering::Relaxed) >= max_results {
+                if max_results > 0 && new_total >= max_results {
                     return ignore::WalkState::Quit;
                 }
             }
@@ -196,7 +220,13 @@ pub fn walk_and_search_parallel(
         })
     });
 
-    let mut matches = Arc::try_unwrap(matches).unwrap().into_inner().unwrap();
+    // Collect all thread-local batches into a single sorted vec
+    let batches = Arc::try_unwrap(all_batches).unwrap().into_inner().unwrap();
+    let total_len: usize = batches.iter().map(|b| b.len()).sum();
+    let mut matches = Vec::with_capacity(total_len);
+    for batch in batches {
+        matches.extend(batch);
+    }
     matches.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(matches)
 }
