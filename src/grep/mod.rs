@@ -103,6 +103,10 @@ pub fn grep_files(
         };
         let mut matches = Vec::new();
         let mut total = 0;
+        let has_context = ctx_before > 0 || ctx_after > 0;
+        let mut text_searcher =
+            searcher::build_searcher(ctx_before, ctx_after, multiline, false);
+        let mut sink = searcher::CollectSink::new(has_context);
 
         for path in &paths {
             let text = match std::fs::read_to_string(path) {
@@ -111,8 +115,9 @@ pub fn grep_files(
             };
             let text: String = tf.call1(py, (text,))?.extract(py)?;
 
+            sink.clear();
             if let Some((line_matches, context_lines)) =
-                searcher::search_text(&text, &matcher, ctx_before, ctx_after, multiline)
+                searcher::search_text(&text, &matcher, &mut text_searcher, &mut sink)
             {
                 total += line_matches.len();
                 matches.push(FileMatch {
@@ -219,41 +224,47 @@ fn format_content(
     for fm in file_matches {
         let rel = walker::relativize(&fm.path, relative_to, source_path);
 
-        // Build set of match line numbers for this file
-        let match_lines: HashSet<u64> = fm.line_matches.iter().map(|m| m.line_number).collect();
-
-        // Combine matches and context, sorted by line number
-        let mut all_lines: Vec<(u64, &str, bool)> = Vec::new();
-        for lm in &fm.line_matches {
-            all_lines.push((lm.line_number, &lm.content, true));
-        }
-        for (ln, content) in &fm.context_lines {
-            if !match_lines.contains(ln) {
-                all_lines.push((*ln, content, false));
+        if fm.context_lines.is_empty() {
+            // Fast path: no context — matches are already in order, skip HashSet/sort/dedup
+            for lm in &fm.line_matches {
+                if line_numbers {
+                    lines.push(format!("  {}:{}:{} {}", rel, lm.line_number, ':', lm.content));
+                } else {
+                    lines.push(format!("  {}  {}", rel, lm.content));
+                }
             }
-        }
-        all_lines.sort_by_key(|(ln, _, _)| *ln);
-        all_lines.dedup_by_key(|(ln, _, _)| *ln);
+        } else {
+            // Context path: merge matches + context lines, sorted by line number
+            let match_lines: HashSet<u64> =
+                fm.line_matches.iter().map(|m| m.line_number).collect();
 
-        let has_context = !fm.context_lines.is_empty();
-        let mut prev_ln: Option<u64> = None;
+            let mut all_lines: Vec<(u64, &str, bool)> = Vec::new();
+            for lm in &fm.line_matches {
+                all_lines.push((lm.line_number, &lm.content, true));
+            }
+            for (ln, content) in &fm.context_lines {
+                if !match_lines.contains(ln) {
+                    all_lines.push((*ln, content, false));
+                }
+            }
+            all_lines.sort_by_key(|(ln, _, _)| *ln);
+            all_lines.dedup_by_key(|(ln, _, _)| *ln);
 
-        for (ln, content, is_match) in &all_lines {
-            // Insert separator for non-contiguous blocks
-            if has_context {
+            let mut prev_ln: Option<u64> = None;
+            for (ln, content, is_match) in &all_lines {
                 if let Some(prev) = prev_ln {
                     if *ln > prev + 1 {
                         lines.push("--".to_string());
                     }
                 }
                 prev_ln = Some(*ln);
-            }
 
-            if line_numbers {
-                let sep = if *is_match { ':' } else { '-' };
-                lines.push(format!("  {}:{}{} {}", rel, ln, sep, content));
-            } else {
-                lines.push(format!("  {}  {}", rel, content));
+                if line_numbers {
+                    let sep = if *is_match { ':' } else { '-' };
+                    lines.push(format!("  {}:{}{} {}", rel, ln, sep, content));
+                } else {
+                    lines.push(format!("  {}  {}", rel, content));
+                }
             }
         }
     }

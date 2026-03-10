@@ -9,6 +9,16 @@ KGLITE = "/Volumes/EksternalHome/Koding/Rust/KGLite"
 SCRAPED = "/Volumes/EksternalHome/Koding/Python/Scraping/processed"
 
 
+def warmup():
+    """Pre-warm filesystem cache to avoid cold-cache noise in timings."""
+    print("Warming filesystem cache...")
+    grep_files([KGLITE], "warmup_pass_xyz", max_results=1)
+    grep_files([SCRAPED], "warmup_pass_xyz", max_results=1)
+    # Full scan warmup for the HTML corpus (most affected by cold cache)
+    grep_files([SCRAPED], "WARMUP_FULL_SCAN_XYZ")
+    print("Cache warm.\n")
+
+
 def bench(label, fn, runs=3):
     """Run fn multiple times, report median and all times."""
     times = []
@@ -32,6 +42,8 @@ def main():
     print("=" * 90)
     print("RIPGREP BENCHMARK — grep_files (all features)")
     print("=" * 90)
+
+    warmup()
 
     # -------------------------------------------------------------------------
     # KGLite: 163K files, 39GB (Rust project with build artifacts)

@@ -15,7 +15,7 @@ wheels/
 *.pyd
 
 # Virtual environments
-.venv/
+.venv*/
 venv/
 
 # IDE

@@ -118,6 +118,7 @@ pub fn walk_sequential(
 /// Walk and search files in parallel using ignore crate's thread pool.
 /// Each walker thread searches files as it discovers them.
 /// Stops early when max_results is reached.
+/// Searcher and Sink are created once per thread and reused across files.
 #[allow(clippy::too_many_arguments)]
 pub fn walk_and_search_parallel(
     source_dirs: &[String],
@@ -143,9 +144,20 @@ pub fn walk_and_search_parallel(
     let matches: Arc<Mutex<Vec<FileMatch>>> = Arc::new(Mutex::new(Vec::new()));
     let total_count = Arc::new(AtomicUsize::new(0));
 
+    let has_context = context_before > 0 || context_after > 0;
+
     walker.run(|| {
         let matches = Arc::clone(&matches);
         let total_count = Arc::clone(&total_count);
+        // Create searcher and sink ONCE per thread — reused across all files
+        let mut thread_searcher = searcher::build_searcher(
+            context_before,
+            context_after,
+            multiline,
+            true, // use mmap
+        );
+        let mut thread_sink = searcher::CollectSink::new(has_context);
+
         Box::new(move |entry| {
             // Check if we've already hit max_results
             if total_count.load(Ordering::Relaxed) >= max_results {
@@ -161,13 +173,15 @@ pub fn walk_and_search_parallel(
                 return ignore::WalkState::Continue;
             }
 
-            // Search this file right here in the walker thread
+            // Clear sink for reuse (preserves allocated capacity)
+            thread_sink.clear();
+
+            // Search this file in the walker thread with reused searcher/sink
             if let Some(fm) = searcher::search_file(
                 entry.path(),
                 matcher,
-                context_before,
-                context_after,
-                multiline,
+                &mut thread_searcher,
+                &mut thread_sink,
             ) {
                 let count = fm.match_count;
                 matches.lock().unwrap().push(fm);

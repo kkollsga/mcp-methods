@@ -20,15 +20,36 @@ pub fn build_matcher(
         .map_err(|e| format!("Invalid regex pattern: {}", e))
 }
 
-/// Custom Sink that collects both matches and context lines.
-struct CollectSink {
+/// Build a reusable Searcher with the given configuration.
+pub fn build_searcher(
+    context_before: usize,
+    context_after: usize,
+    multiline: bool,
+    use_mmap: bool,
+) -> Searcher {
+    let mut builder = SearcherBuilder::new();
+    builder
+        .binary_detection(grep_searcher::BinaryDetection::quit(0))
+        .multi_line(multiline)
+        .before_context(context_before)
+        .after_context(context_after)
+        .line_number(true);
+    if use_mmap {
+        builder.memory_map(unsafe { MmapChoice::auto() });
+    }
+    builder.build()
+}
+
+/// Reusable Sink that collects both matches and context lines.
+/// Call `clear()` between files to reuse allocations.
+pub struct CollectSink {
     line_matches: Vec<LineMatch>,
     context_lines: Vec<(u64, String)>,
     has_context: bool,
 }
 
 impl CollectSink {
-    fn new(has_context: bool) -> Self {
+    pub fn new(has_context: bool) -> Self {
         Self {
             line_matches: Vec::new(),
             context_lines: Vec::new(),
@@ -36,11 +57,30 @@ impl CollectSink {
         }
     }
 
+    /// Reset for reuse without deallocating buffers.
+    pub fn clear(&mut self) {
+        self.line_matches.clear();
+        self.context_lines.clear();
+    }
+
     fn line_from_bytes(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes)
             .trim_end_matches('\n')
             .trim_end_matches('\r')
             .to_string()
+    }
+
+    /// True if the last search produced matches.
+    pub fn has_matches(&self) -> bool {
+        !self.line_matches.is_empty()
+    }
+
+    /// Take collected results, leaving empty vecs behind (preserves capacity).
+    pub fn take_results(&mut self) -> (Vec<LineMatch>, Vec<(u64, String)>) {
+        (
+            std::mem::take(&mut self.line_matches),
+            std::mem::take(&mut self.context_lines),
+        )
     }
 }
 
@@ -67,36 +107,25 @@ impl Sink for CollectSink {
     }
 }
 
-/// Search a file for matches using grep-searcher.
+/// Search a file using a pre-built Searcher and reusable Sink.
+/// Caller must call `sink.clear()` before each invocation.
 /// Returns None if no matches or file is binary/unreadable.
 pub fn search_file(
     path: &Path,
     matcher: &grep_regex::RegexMatcher,
-    context_before: usize,
-    context_after: usize,
-    multiline: bool,
+    searcher: &mut Searcher,
+    sink: &mut CollectSink,
 ) -> Option<FileMatch> {
-    let has_context = context_before > 0 || context_after > 0;
-    let mut sink = CollectSink::new(has_context);
-
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(grep_searcher::BinaryDetection::quit(0))
-        .memory_map(unsafe { MmapChoice::auto() })
-        .multi_line(multiline)
-        .before_context(context_before)
-        .after_context(context_after)
-        .line_number(true)
-        .build();
-
-    let result = searcher.search_path(matcher, path, &mut sink);
+    let result = searcher.search_path(matcher, path, &mut *sink);
 
     match result {
-        Ok(()) if !sink.line_matches.is_empty() => {
-            let match_count = sink.line_matches.len();
+        Ok(()) if sink.has_matches() => {
+            let (line_matches, context_lines) = sink.take_results();
+            let match_count = line_matches.len();
             Some(FileMatch {
                 path: path.to_path_buf(),
-                line_matches: sink.line_matches,
-                context_lines: sink.context_lines,
+                line_matches,
+                context_lines,
                 match_count,
             })
         }
@@ -109,25 +138,13 @@ pub fn search_file(
 pub fn search_text(
     text: &str,
     matcher: &grep_regex::RegexMatcher,
-    context_before: usize,
-    context_after: usize,
-    multiline: bool,
+    searcher: &mut Searcher,
+    sink: &mut CollectSink,
 ) -> Option<(Vec<LineMatch>, Vec<(u64, String)>)> {
-    let has_context = context_before > 0 || context_after > 0;
-    let mut sink = CollectSink::new(has_context);
-
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(grep_searcher::BinaryDetection::quit(0))
-        .multi_line(multiline)
-        .before_context(context_before)
-        .after_context(context_after)
-        .line_number(true)
-        .build();
-
-    let result = searcher.search_reader(matcher, text.as_bytes(), &mut sink);
+    let result = searcher.search_reader(matcher, text.as_bytes(), &mut *sink);
 
     match result {
-        Ok(()) if !sink.line_matches.is_empty() => Some((sink.line_matches, sink.context_lines)),
+        Ok(()) if sink.has_matches() => Some(sink.take_results()),
         _ => None,
     }
 }
