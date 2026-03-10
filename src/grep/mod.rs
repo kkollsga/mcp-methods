@@ -33,7 +33,7 @@ use types::{FileMatch, OutputMode};
     line_numbers = true,
     head_limit = 0,
     offset = 0,
-    max_results = 200,
+    max_results = None,
     skip_dirs = None,
     relative_to = None,
     respect_gitignore = true,
@@ -55,7 +55,7 @@ pub fn ripgrep_files(
     line_numbers: bool,
     head_limit: usize,
     offset: usize,
-    max_results: usize,
+    max_results: Option<usize>,
     skip_dirs: Option<Vec<String>>,
     relative_to: Option<String>,
     respect_gitignore: bool,
@@ -125,8 +125,10 @@ pub fn ripgrep_files(
                     line_matches,
                     context_lines,
                 });
-                if total >= max_results {
-                    break;
+                if let Some(cap) = max_results {
+                    if total >= cap {
+                        break;
+                    }
                 }
             }
         }
@@ -143,7 +145,7 @@ pub fn ripgrep_files(
             ctx_before,
             ctx_after,
             multiline,
-            max_results,
+            max_results.unwrap_or(0),
         ) {
             Ok(m) => m,
             Err(e) => return Ok(e),
@@ -180,7 +182,7 @@ fn format_output(
     line_numbers: bool,
     head_limit: usize,
     offset: usize,
-    max_results: usize,
+    max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
     glob: &str,
@@ -197,12 +199,22 @@ fn format_output(
             source_path,
             glob,
         ),
-        OutputMode::FilesWithMatches => {
-            format_files(file_matches, head_limit, offset, relative_to, source_path)
-        }
-        OutputMode::Count => {
-            format_count(file_matches, head_limit, offset, relative_to, source_path)
-        }
+        OutputMode::FilesWithMatches => format_files(
+            file_matches,
+            head_limit,
+            offset,
+            max_results,
+            relative_to,
+            source_path,
+        ),
+        OutputMode::Count => format_count(
+            file_matches,
+            head_limit,
+            offset,
+            max_results,
+            relative_to,
+            source_path,
+        ),
     }
 }
 
@@ -213,7 +225,7 @@ fn format_content(
     line_numbers: bool,
     head_limit: usize,
     offset: usize,
-    max_results: usize,
+    max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
     glob: &str,
@@ -286,8 +298,10 @@ fn format_content(
 
     let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
     let mut header = format!("Found {} match(es) for '{}'", total_matches, pattern);
-    if total_matches >= max_results {
-        header.push_str(&format!(" (capped at {})", max_results));
+    if let Some(cap) = max_results {
+        if total_matches >= cap {
+            header.push_str(&format!(" (capped at {})", cap));
+        }
     }
     header.push(':');
 
@@ -298,6 +312,7 @@ fn format_files(
     file_matches: &[FileMatch],
     head_limit: usize,
     offset: usize,
+    max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
 ) -> String {
@@ -319,13 +334,25 @@ fn format_files(
         return "No matching files.".to_string();
     }
 
-    paths.join("\n")
+    let mut result = paths.join("\n");
+    if let Some(cap) = max_results {
+        let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
+        if total_matches >= cap {
+            result.push_str(&format!(
+                "\n\n(results may be incomplete — hit {} match limit across {} files)",
+                cap,
+                file_matches.len()
+            ));
+        }
+    }
+    result
 }
 
 fn format_count(
     file_matches: &[FileMatch],
     head_limit: usize,
     offset: usize,
+    max_results: Option<usize>,
     relative_to: Option<&std::path::Path>,
     source_path: &std::path::Path,
 ) -> String {
@@ -350,7 +377,18 @@ fn format_count(
         return "No matching files.".to_string();
     }
 
-    entries.join("\n")
+    let mut result = entries.join("\n");
+    if let Some(cap) = max_results {
+        let total_matches: usize = file_matches.iter().map(|fm| fm.match_count).sum();
+        if total_matches >= cap {
+            result.push_str(&format!(
+                "\n\n(results may be incomplete — hit {} match limit across {} files)",
+                cap,
+                file_matches.len()
+            ));
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

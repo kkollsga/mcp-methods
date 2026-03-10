@@ -36,11 +36,11 @@ pip install -e ".[dev]"
 from mcp_methods import ripgrep_files, read_file, git_issue, ElementCache
 
 # File search — returns formatted string ready for LLM consumption
+# By default returns all matches; set max_results to cap early
 results = ripgrep_files(
     ["/path/to/project"],
     r"def \w+",
     type_filter="py",
-    max_results=50,
 )
 
 # Safe file reading with allowed directory enforcement

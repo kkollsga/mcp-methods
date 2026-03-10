@@ -159,8 +159,8 @@ pub fn walk_and_search_parallel(
         let mut thread_sink = searcher::CollectSink::new(has_context);
 
         Box::new(move |entry| {
-            // Check if we've already hit max_results
-            if total_count.load(Ordering::Relaxed) >= max_results {
+            // Check if we've already hit max_results (0 = unlimited)
+            if max_results > 0 && total_count.load(Ordering::Relaxed) >= max_results {
                 return ignore::WalkState::Quit;
             }
 
@@ -187,7 +187,7 @@ pub fn walk_and_search_parallel(
                 matches.lock().unwrap().push(fm);
                 total_count.fetch_add(count, Ordering::Relaxed);
 
-                if total_count.load(Ordering::Relaxed) >= max_results {
+                if max_results > 0 && total_count.load(Ordering::Relaxed) >= max_results {
                     return ignore::WalkState::Quit;
                 }
             }
