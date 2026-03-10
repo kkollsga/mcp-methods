@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+### Fixes
+
+- **`list_dir` annotate callback paths** — the callback now receives paths relative to `relative_to` (e.g. `src/core/engine.py`) instead of bare filenames (`engine.py`). This was a bug that made it impossible to match callback paths against external data sources (knowledge graphs, databases) when listing subdirectories.
+
 ## 0.3.3
 
 ### Improvements

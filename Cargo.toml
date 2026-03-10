@@ -1,6 +1,6 @@
 [package]
 name = "mcp-methods"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 authors = ["Kristian Kollsgard"]
 description = "Reusable utility methods for MCP servers — Rust core"

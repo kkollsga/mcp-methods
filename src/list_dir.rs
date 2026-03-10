@@ -184,7 +184,13 @@ pub fn list_dir(
     // Collect annotations if callback provided
     let annotations = if let Some(ref annotate_fn) = annotate {
         let mut map = HashMap::new();
-        collect_annotations(py, &tree, &root, annotate_fn, &mut map)?;
+        // Use relative_to base (canonicalized) so callback receives paths like
+        // "networkx/algorithms/bridges.py" instead of just "bridges.py".
+        // Falls back to root when relative_to is not set.
+        let base = relative_to
+            .and_then(|r| PathBuf::from(r).canonicalize().ok())
+            .unwrap_or_else(|| root.clone());
+        collect_annotations(py, &tree, &base, annotate_fn, &mut map)?;
         map
     } else {
         HashMap::new()
@@ -207,14 +213,14 @@ pub fn list_dir(
 fn collect_annotations(
     py: Python<'_>,
     entry: &Entry,
-    root: &Path,
+    base: &Path,
     annotate_fn: &Py<PyAny>,
     map: &mut HashMap<PathBuf, String>,
 ) -> PyResult<()> {
     for child in entry.children.values() {
         let rel_path = child
             .full_path
-            .strip_prefix(root)
+            .strip_prefix(base)
             .unwrap_or(&child.full_path)
             .to_string_lossy()
             .to_string();
@@ -224,7 +230,7 @@ fn collect_annotations(
             map.insert(child.full_path.clone(), annotation);
         }
         if child.is_dir && !child.children.is_empty() {
-            collect_annotations(py, child, root, annotate_fn, map)?;
+            collect_annotations(py, child, base, annotate_fn, map)?;
         }
     }
     Ok(())

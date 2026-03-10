@@ -205,6 +205,29 @@ def test_list_dir_annotate_none_passthrough():
         assert without == with_none
 
 
+def test_list_dir_annotate_relative_to_subdir():
+    """Annotate callback receives paths relative to relative_to, not bare names.
+
+    Regression: listing a subdirectory with relative_to set to a parent used to
+    pass bare filenames (e.g. 'engine.py') instead of full relative paths
+    (e.g. 'src/core/engine.py').
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _make_tree(Path(tmp))
+        received_paths = []
+
+        def annotate(rel_path):
+            received_paths.append(rel_path)
+            return None
+
+        # List src/core/ with relative_to=tmp (the project root)
+        list_dir(str(Path(tmp) / "src" / "core"), depth=1, relative_to=tmp, annotate=annotate)
+        # Callback should receive "src/core/engine.py", not "engine.py"
+        assert any("src/core/" in p for p in received_paths), (
+            f"Expected paths relative to project root, got: {received_paths}"
+        )
+
+
 def test_list_dir_annotate_alignment():
     """Annotations within same directory level are column-aligned."""
     with tempfile.TemporaryDirectory() as tmp:
