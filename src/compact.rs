@@ -789,16 +789,24 @@ fn build_thread_digest(result: &mut Value, cache: &mut Option<Value>) -> String 
 
     digest.extend(tail_comments);
 
-    // Cache the full middle for drill-down
+    // Cache the full middle for drill-down (with _index for grep metadata)
     if let Some(ref mut cache_obj) = cache {
         if let Some(obj) = cache_obj.as_object_mut() {
+            let indexed: Vec<Value> = middle_comments
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut c)| {
+                    c["_index"] = Value::Number((middle_start + i).into());
+                    c
+                })
+                .collect();
             obj.insert(
                 "comments_middle".to_string(),
                 serde_json::json!({
                     "type": "comment_segment",
                     "label": "middle",
                     "comment_count": middle_count,
-                    "content": Value::Array(middle_comments),
+                    "content": Value::Array(indexed),
                 }),
             );
         }

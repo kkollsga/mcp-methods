@@ -427,7 +427,31 @@ fn grep_json_value(data: &Value, regex: &Regex, context: usize, path: &str) -> V
             let mut matches = Vec::new();
             for (i, item) in arr.iter().enumerate() {
                 let child = format!("{}[{}]", path, i);
-                matches.extend(grep_json_value(item, regex, context, &child));
+                let mut item_matches = grep_json_value(item, regex, context, &child);
+
+                // Enrich matches from comment-like objects with metadata
+                if let Value::Object(obj) = item {
+                    if obj.contains_key("author") && obj.contains_key("body") {
+                        for m in &mut item_matches {
+                            if let Some(author) = obj.get("author") {
+                                m["author"] = author.clone();
+                            }
+                            if let Some(date) = obj.get("created_at") {
+                                m["created_at"] = date.clone();
+                            }
+                            if let Some(assoc) = obj.get("author_association") {
+                                m["author_association"] = assoc.clone();
+                            }
+                            if let Some(idx) = obj.get("_index") {
+                                m["comment_index"] = idx.clone();
+                                m["element_id"] =
+                                    Value::String(format!("comment_{}", idx.as_u64().unwrap_or(0)));
+                            }
+                        }
+                    }
+                }
+
+                matches.extend(item_matches);
             }
             matches
         }

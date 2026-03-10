@@ -441,7 +441,17 @@ def test_compact_discussion_thread_digest_drilldown():
 
     # Grep the middle segment for the keyword
     grep_result = cache.retrieve("org/repo", 100, "comments_middle", grep="FINDME")
+    parsed_grep = json.loads(grep_result)
     assert "FINDME" in grep_result
+
+    # Grep matches should include comment metadata for chronological context
+    matches = parsed_grep["matches"]
+    assert len(matches) > 0
+    hit = matches[0]
+    assert hit["author"] == "user_40", "grep match should include author"
+    assert "created_at" in hit, "grep match should include date"
+    assert hit["comment_index"] == 40, "grep match should include comment index"
+    assert hit["element_id"] == "comment_40", "grep match should include element_id for drill-down"
 
     # Access individual cached comment
     c40 = cache.retrieve("org/repo", 100, "comment_40")
