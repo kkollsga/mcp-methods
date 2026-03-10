@@ -5,6 +5,7 @@
 - **`lines` on array elements** — `lines="1-20"` on `comments_middle` now returns structured comment objects by index range (with `items_shown`, `total_items`) instead of raw JSON text. Enables clean pagination through digested threads.
 - **`_index` on highlights** — maintainer highlights in thread digests include `_index` for seamless drill-down to neighbours.
 - **Grep metadata on comments** — grep matches on comment segments include `author`, `created_at`, `comment_index`, and `element_id` for chronological context.
+- **Comment TOC** — bare `element_id="comments_middle"` returns a lightweight table of contents (`_index`, `author`, `created_at`, 80-char snippet) instead of dumping raw JSON. Navigate directly to interesting sections, then use `lines` to paginate or `grep` to search.
 
 ## 0.3.7
 

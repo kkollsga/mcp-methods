@@ -249,6 +249,40 @@ impl ElementCache {
             return serde_json::to_string_pretty(&Value::Object(result)).unwrap_or_default();
         }
 
+        // Comment segments: return a TOC (index + author + date + snippet) instead
+        // of dumping the full content. Use lines="1-20" to paginate.
+        let elem_type = elem_data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if elem_type == "comment_segment" {
+            if let Some(Value::Array(arr)) = content_val {
+                let toc: Vec<Value> = arr
+                    .iter()
+                    .map(|c| {
+                        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                        let snippet: String = body
+                            .chars()
+                            .filter(|ch| !ch.is_control())
+                            .take(80)
+                            .collect();
+                        serde_json::json!({
+                            "_index": c.get("_index"),
+                            "author": c.get("author"),
+                            "created_at": c.get("created_at"),
+                            "author_association": c.get("author_association"),
+                            "snippet": snippet,
+                        })
+                    })
+                    .collect();
+                let result = serde_json::json!({
+                    "element_id": element_id,
+                    "type": elem_type,
+                    "total_comments": arr.len(),
+                    "hint": "Use lines='1-20' to paginate, or grep='pattern' to search.",
+                    "comments": toc,
+                });
+                return serde_json::to_string_pretty(&result).unwrap_or_default();
+            }
+        }
+
         // Full content
         serde_json::to_string_pretty(elem_data).unwrap_or_default()
     }

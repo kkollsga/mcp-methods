@@ -520,6 +520,40 @@ def test_compact_discussion_highlight_index():
         assert isinstance(h["_index"], int)
 
 
+def test_comments_middle_toc():
+    """Bare comments_middle retrieval returns a TOC, not raw JSON."""
+    comments = []
+    for i in range(80):
+        comments.append(
+            {
+                "author": f"user_{i}",
+                "author_association": "NONE",
+                "created_at": f"2024-01-{(i % 28) + 1:02d}T12:00:00Z",
+                "body": f"Comment {i} body text here.",
+            }
+        )
+    discussion = {"body": "Issue body", "comments": comments}
+
+    cache = ElementCache()
+    cache.compact_and_store("org/repo", 300, json.dumps(discussion))
+
+    result = cache.retrieve("org/repo", 300, "comments_middle")
+    parsed = json.loads(result)
+
+    assert parsed["type"] == "comment_segment"
+    assert parsed["total_comments"] == 70  # 80 - 5 head - 5 tail
+    assert "hint" in parsed
+    # Each entry should be a lightweight summary, not the full comment
+    first = parsed["comments"][0]
+    assert "_index" in first
+    assert "author" in first
+    assert "created_at" in first
+    assert "snippet" in first
+    assert len(first["snippet"]) <= 80
+    # Should NOT contain the full body
+    assert "body" not in first
+
+
 # ---------------------------------------------------------------------------
 # ripgrep_lines
 # ---------------------------------------------------------------------------
