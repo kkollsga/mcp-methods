@@ -51,4 +51,4 @@ jobs:
       - name: Test import
         run: |
           source .venv/bin/activate
-          python -c "from mcp_methods import git_issue, git_api, ripgrep_files, read_file, ElementCache; print('Import successful')"
+          python -c "from mcp_methods import github_discussions, git_diff, git_api, ripgrep_files, read_file, list_dir, ElementCache; print('Import successful')"

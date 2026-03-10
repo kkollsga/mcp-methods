@@ -124,7 +124,7 @@ impl ElementCache {
                 if !available.is_empty() {
                     msg.push_str(&format!("\nAvailable: {}", available.join(", ")));
                 } else {
-                    msg.push_str("\nNo cached elements. Call git_issue first.");
+                    msg.push_str("\nNo cached elements. Call fetch_discussion first.");
                 }
                 return msg;
             }
