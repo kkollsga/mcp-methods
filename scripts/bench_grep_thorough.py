@@ -1,9 +1,9 @@
-"""Thorough benchmark of ripgrep-powered grep_files across real codebases."""
+"""Thorough benchmark of ripgrep-powered ripgrep_files across real codebases."""
 
 import statistics
 import time
 
-from mcp_methods import grep_files
+from mcp_methods import ripgrep_files
 
 KGLITE = "/Volumes/EksternalHome/Koding/Rust/KGLite"
 SCRAPED = "/Volumes/EksternalHome/Koding/Python/Scraping/processed"
@@ -12,10 +12,10 @@ SCRAPED = "/Volumes/EksternalHome/Koding/Python/Scraping/processed"
 def warmup():
     """Pre-warm filesystem cache to avoid cold-cache noise in timings."""
     print("Warming filesystem cache...")
-    grep_files([KGLITE], "warmup_pass_xyz", max_results=1)
-    grep_files([SCRAPED], "warmup_pass_xyz", max_results=1)
+    ripgrep_files([KGLITE], "warmup_pass_xyz", max_results=1)
+    ripgrep_files([SCRAPED], "warmup_pass_xyz", max_results=1)
     # Full scan warmup for the HTML corpus (most affected by cold cache)
-    grep_files([SCRAPED], "WARMUP_FULL_SCAN_XYZ")
+    ripgrep_files([SCRAPED], "WARMUP_FULL_SCAN_XYZ")
     print("Cache warm.\n")
 
 
@@ -40,7 +40,7 @@ def bench(label, fn, runs=3):
 
 def main():
     print("=" * 90)
-    print("RIPGREP BENCHMARK — grep_files (all features)")
+    print("RIPGREP BENCHMARK — ripgrep_files (all features)")
     print("=" * 90)
 
     warmup()
@@ -55,36 +55,37 @@ def main():
     print("\n[1] Basic search — common pattern across all files")
     bench(
         "grep 'fn ' (all files, gitignore ON)",
-        lambda: grep_files([KGLITE], r"fn \w+", max_results=50),
+        lambda: ripgrep_files([KGLITE], r"fn \w+", max_results=50),
     )
 
     print("\n[2] Basic search — gitignore OFF (scans build artifacts)")
     bench(
         "grep 'fn ' (all files, gitignore OFF)",
-        lambda: grep_files([KGLITE], r"fn \w+", respect_gitignore=False, max_results=50),
+        lambda: ripgrep_files([KGLITE], r"fn \w+", respect_gitignore=False, max_results=50),
     )
 
     print("\n[3] Type filter — only Rust files")
     bench(
         "grep 'struct' type=rust",
-        lambda: grep_files([KGLITE], r"struct \w+", type_filter="rust", max_results=50),
+        lambda: ripgrep_files([KGLITE], r"struct \w+", type_filter="rust", max_results=50),
     )
 
     print("\n[4] Type filter — only Python files")
     bench(
         "grep 'def ' type=py",
-        lambda: grep_files([KGLITE], r"def \w+", type_filter="py", max_results=50),
+        lambda: ripgrep_files([KGLITE], r"def \w+", type_filter="py", max_results=50),
     )
 
     print("\n[5] Glob filter — *.rs files only")
     bench(
-        "grep 'impl' glob=*.rs", lambda: grep_files([KGLITE], r"impl ", glob="*.rs", max_results=50)
+        "grep 'impl' glob=*.rs",
+        lambda: ripgrep_files([KGLITE], r"impl ", glob="*.rs", max_results=50),
     )
 
     print("\n[6] Case-insensitive search")
     bench(
         "grep 'error' case_insensitive",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], "error", case_insensitive=True, type_filter="rust", max_results=50
         ),
     )
@@ -92,13 +93,13 @@ def main():
     print("\n[7] Context lines (-C 3)")
     bench(
         "grep 'panic!' context=3, type=rust",
-        lambda: grep_files([KGLITE], r"panic!", context=3, type_filter="rust", max_results=20),
+        lambda: ripgrep_files([KGLITE], r"panic!", context=3, type_filter="rust", max_results=20),
     )
 
     print("\n[8] Context before/after (-B 2, -A 5)")
     bench(
         "grep 'unsafe' -B2 -A5, type=rust",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE],
             r"unsafe",
             context_before=2,
@@ -111,7 +112,7 @@ def main():
     print("\n[9] Output mode: files_with_matches")
     bench(
         "grep 'TODO' mode=files_with_matches",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], "TODO", output_mode="files_with_matches", type_filter="rust", max_results=50
         ),
     )
@@ -119,7 +120,7 @@ def main():
     print("\n[10] Output mode: count")
     bench(
         "grep 'use ' mode=count, type=rust",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], r"use ", output_mode="count", type_filter="rust", max_results=50
         ),
     )
@@ -127,7 +128,7 @@ def main():
     print("\n[11] Multiline pattern")
     bench(
         "grep 'struct.*\\n.*pub' multiline",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], r"struct \w+.*\n.*pub", multiline=True, type_filter="rust", max_results=20
         ),
     )
@@ -135,13 +136,13 @@ def main():
     print("\n[12] head_limit + offset (pagination)")
     bench(
         "grep 'let' head_limit=10 offset=5",
-        lambda: grep_files([KGLITE], r"let ", head_limit=10, offset=5, type_filter="rust"),
+        lambda: ripgrep_files([KGLITE], r"let ", head_limit=10, offset=5, type_filter="rust"),
     )
 
     print("\n[13] No line numbers")
     bench(
         "grep 'fn' line_numbers=False",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], r"fn ", line_numbers=False, type_filter="rust", max_results=50
         ),
     )
@@ -149,25 +150,27 @@ def main():
     print("\n[14] Custom skip_dirs")
     bench(
         "grep 'fn' skip_dirs=['target','venv']",
-        lambda: grep_files([KGLITE], r"fn ", skip_dirs=["target", "venv", ".git"], max_results=50),
+        lambda: ripgrep_files(
+            [KGLITE], r"fn ", skip_dirs=["target", "venv", ".git"], max_results=50
+        ),
     )
 
     print("\n[15] No match (rare pattern)")
     bench(
         "grep 'XYZZY_NONEXISTENT_42'",
-        lambda: grep_files([KGLITE], "XYZZY_NONEXISTENT_42", type_filter="rust"),
+        lambda: ripgrep_files([KGLITE], "XYZZY_NONEXISTENT_42", type_filter="rust"),
     )
 
     print("\n[16] Complex regex")
     bench(
         "grep 'fn\\s+\\w+<[^>]+>' (generics)",
-        lambda: grep_files([KGLITE], r"fn\s+\w+<[^>]+>", type_filter="rust", max_results=50),
+        lambda: ripgrep_files([KGLITE], r"fn\s+\w+<[^>]+>", type_filter="rust", max_results=50),
     )
 
     print("\n[17] Transform callback (forces sequential)")
     bench(
         "grep 'fn' with transform (seq)",
-        lambda: grep_files(
+        lambda: ripgrep_files(
             [KGLITE], r"fn ", type_filter="rust", max_results=20, transform=lambda t: t.lower()
         ),
     )
@@ -175,7 +178,7 @@ def main():
     print("\n[18] max_results cap test")
     bench(
         "grep 'let' max_results=500",
-        lambda: grep_files([KGLITE], r"let ", type_filter="rust", max_results=500),
+        lambda: ripgrep_files([KGLITE], r"let ", type_filter="rust", max_results=500),
     )
 
     # -------------------------------------------------------------------------
@@ -187,54 +190,58 @@ def main():
 
     print("\n[19] Basic search — HTML content")
     bench(
-        "grep '<title>' in HTML corpus", lambda: grep_files([SCRAPED], r"<title>", max_results=50)
+        "grep '<title>' in HTML corpus",
+        lambda: ripgrep_files([SCRAPED], r"<title>", max_results=50),
     )
 
     print("\n[20] Glob filter — *.html")
     bench(
         "grep 'href=' glob=*.html",
-        lambda: grep_files([SCRAPED], r"href=", glob="*.html", max_results=50),
+        lambda: ripgrep_files([SCRAPED], r"href=", glob="*.html", max_results=50),
     )
 
     print("\n[21] Case-insensitive HTML tags")
     bench(
         "grep '<div' case_insensitive",
-        lambda: grep_files([SCRAPED], r"<div", case_insensitive=True, max_results=50),
+        lambda: ripgrep_files([SCRAPED], r"<div", case_insensitive=True, max_results=50),
     )
 
     print("\n[22] files_with_matches on HTML")
     bench(
         "grep '<table' mode=files_with_matches",
-        lambda: grep_files([SCRAPED], r"<table", output_mode="files_with_matches", max_results=100),
+        lambda: ripgrep_files(
+            [SCRAPED], r"<table", output_mode="files_with_matches", max_results=100
+        ),
     )
 
     print("\n[23] Count mode on HTML")
     bench(
         "grep '<a ' mode=count",
-        lambda: grep_files([SCRAPED], r"<a ", output_mode="count", max_results=100),
+        lambda: ripgrep_files([SCRAPED], r"<a ", output_mode="count", max_results=100),
     )
 
     print("\n[24] Context in HTML")
     bench(
-        "grep '<h1>' context=2", lambda: grep_files([SCRAPED], r"<h1>", context=2, max_results=20)
+        "grep '<h1>' context=2",
+        lambda: ripgrep_files([SCRAPED], r"<h1>", context=2, max_results=20),
     )
 
     print("\n[25] Complex regex in HTML")
     bench(
         'grep \'class="[^"]*nav[^"]*"\'',
-        lambda: grep_files([SCRAPED], r'class="[^"]*nav[^"]*"', max_results=50),
+        lambda: ripgrep_files([SCRAPED], r'class="[^"]*nav[^"]*"', max_results=50),
     )
 
     print("\n[26] No match in HTML")
-    bench("grep 'XYZZY_NONEXISTENT_42'", lambda: grep_files([SCRAPED], "XYZZY_NONEXISTENT_42"))
+    bench("grep 'XYZZY_NONEXISTENT_42'", lambda: ripgrep_files([SCRAPED], "XYZZY_NONEXISTENT_42"))
 
     print("\n[27] max_results=500 on HTML")
-    bench("grep '<div' max_results=500", lambda: grep_files([SCRAPED], r"<div", max_results=500))
+    bench("grep '<div' max_results=500", lambda: ripgrep_files([SCRAPED], r"<div", max_results=500))
 
     print("\n[28] Multiline HTML pattern")
     bench(
         "grep '<head>.*\\n.*<title' multiline",
-        lambda: grep_files([SCRAPED], r"<head>.*\n.*<title", multiline=True, max_results=20),
+        lambda: ripgrep_files([SCRAPED], r"<head>.*\n.*<title", multiline=True, max_results=20),
     )
 
     # -------------------------------------------------------------------------
@@ -247,13 +254,13 @@ def main():
     print("\n[29] Multi-dir search")
     bench(
         "grep 'import' in both dirs",
-        lambda: grep_files([KGLITE, SCRAPED], r"import", max_results=50),
+        lambda: ripgrep_files([KGLITE, SCRAPED], r"import", max_results=50),
     )
 
     print("\n[30] Multi-dir with type filter")
     bench(
         "grep 'def ' type=py in both dirs",
-        lambda: grep_files([KGLITE, SCRAPED], r"def ", type_filter="py", max_results=50),
+        lambda: ripgrep_files([KGLITE, SCRAPED], r"def ", type_filter="py", max_results=50),
     )
 
 

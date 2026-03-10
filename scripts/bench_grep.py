@@ -1,8 +1,8 @@
-"""Benchmark grep_files against a real codebase."""
+"""Benchmark ripgrep_files against a real codebase."""
 
 import time
 
-from mcp_methods import grep_files
+from mcp_methods import ripgrep_files
 
 SOURCE_DIR = "/Volumes/EksternalHome/Koding/Rust/KGLite"
 
@@ -18,12 +18,14 @@ CASES = [
 
 def main():
     print("=" * 70)
-    print(f"grep_files benchmark — source: {SOURCE_DIR}")
+    print(f"ripgrep_files benchmark — source: {SOURCE_DIR}")
     print("=" * 70)
 
     for label, pattern, glob, ci in CASES:
         t0 = time.perf_counter()
-        result = grep_files([SOURCE_DIR], pattern, glob=glob, case_insensitive=ci, max_results=100)
+        result = ripgrep_files(
+            [SOURCE_DIR], pattern, glob=glob, case_insensitive=ci, max_results=100
+        )
         dt = time.perf_counter() - t0
 
         lines = result.strip().split("\n")

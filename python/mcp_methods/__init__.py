@@ -11,17 +11,17 @@ from mcp_methods._mcp_methods import (
     extract_github_refs,
     git_api,
     git_issue,
-    grep_files,
-    grep_json_fields,
-    grep_lines,
     has_git_token,
     read_file,
+    ripgrep_files,
+    ripgrep_json_fields,
+    ripgrep_lines,
     validate_repo,
 )
 from mcp_methods._utils import load_env, timed
 
 
-def grep(
+def ripgrep(
     pattern: str,
     *,
     path: str = ".",
@@ -37,7 +37,7 @@ def grep(
     head_limit: int = 0,
     offset: int = 0,
 ) -> str:
-    """Grep tool matching the Claude Code Grep interface.
+    """Ripgrep tool matching the Claude Code Grep interface.
 
     Drop-in replacement for Claude's built-in Grep tool — same parameter
     names, same defaults, same output format. Powered by ripgrep crates.
@@ -58,7 +58,7 @@ def grep(
         head_limit      Limit output entries (0 = unlimited)
         offset          Skip first N entries
     """
-    return grep_files(
+    return ripgrep_files(
         [path],
         pattern,
         glob=glob,
@@ -77,13 +77,13 @@ def grep(
 
 __all__ = [
     # Rust-powered
-    "grep",
-    "grep_files",
+    "ripgrep",
+    "ripgrep_files",
+    "ripgrep_lines",
+    "ripgrep_json_fields",
     "read_file",
     "validate_repo",
     "extract_github_refs",
-    "grep_lines",
-    "grep_json_fields",
     "collapse_code_blocks",
     "compact_text",
     "compact_discussion",

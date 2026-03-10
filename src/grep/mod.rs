@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use types::{FileMatch, OutputMode};
 
 // ---------------------------------------------------------------------------
-// grep_files — ripgrep-powered file search
+// ripgrep_files — ripgrep-powered file search
 // ---------------------------------------------------------------------------
 
 /// Search for a regex pattern across files using ripgrep's engine.
@@ -40,7 +40,7 @@ use types::{FileMatch, OutputMode};
     transform = None,
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn grep_files(
+pub fn ripgrep_files(
     py: Python<'_>,
     source_dirs: Vec<String>,
     pattern: &str,
@@ -354,14 +354,14 @@ fn format_count(
 }
 
 // ---------------------------------------------------------------------------
-// grep_lines — search through a list of text lines with context
+// ripgrep_lines — search through a list of text lines with context
 // ---------------------------------------------------------------------------
 
 /// Grep through lines with context, merging overlapping windows.
 /// Returns a list of dicts with keys: lines, context_start, context_end, content.
 #[pyfunction]
 #[pyo3(signature = (text_lines, pattern, context))]
-pub fn grep_lines(
+pub fn ripgrep_lines(
     py: Python<'_>,
     text_lines: Vec<String>,
     pattern: &str,

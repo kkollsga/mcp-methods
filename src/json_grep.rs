@@ -7,7 +7,7 @@ use serde_json::Value;
 /// Returns a list of match dicts with field, lines, context_start, context_end, content.
 #[pyfunction]
 #[pyo3(signature = (json_str, pattern, context))]
-pub fn grep_json_fields(
+pub fn ripgrep_json_fields(
     py: Python<'_>,
     json_str: &str,
     pattern: &str,

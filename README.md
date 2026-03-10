@@ -18,14 +18,14 @@ pip install -e ".[dev]"
 
 | Function | Purpose |
 |---|---|
-| `grep_files` | Ripgrep-powered file search with parallel walking, early termination, context lines, and multiple output modes |
-| `grep` | Drop-in replacement for the Claude Code Grep tool interface |
+| `ripgrep_files` | Ripgrep-powered file search with parallel walking, early termination, context lines, and multiple output modes |
+| `ripgrep` | Drop-in replacement for the Claude Code Grep tool interface |
 | `read_file` | Safe file reading with path traversal protection and line range support |
 | `git_issue` | Fetch GitHub issues/PRs with smart compaction (collapses code blocks, filters bots, truncates) |
 | `git_api` | GitHub REST API wrapper with token auth |
 | `ElementCache` | Drill-down cache for collapsed elements in GitHub discussions |
-| `grep_lines` | Search through text lines with context window merging |
-| `grep_json_fields` | Extract fields from JSON text |
+| `ripgrep_lines` | Search through text lines with context window merging |
+| `ripgrep_json_fields` | Extract fields from JSON text |
 | `compact_discussion` / `compact_text` / `collapse_code_blocks` | Text compaction utilities |
 | `extract_github_refs` | Parse GitHub issue/PR references from text |
 | `detect_git_repo` / `validate_repo` | Git repository detection and validation |
@@ -33,10 +33,10 @@ pip install -e ".[dev]"
 ## Usage in an MCP server
 
 ```python
-from mcp_methods import grep_files, read_file, git_issue, ElementCache
+from mcp_methods import ripgrep_files, read_file, git_issue, ElementCache
 
 # File search — returns formatted string ready for LLM consumption
-results = grep_files(
+results = ripgrep_files(
     ["/path/to/project"],
     r"def \w+",
     type_filter="py",

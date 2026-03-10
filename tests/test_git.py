@@ -12,8 +12,8 @@ from mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
-    grep_lines,
     has_git_token,
+    ripgrep_lines,
     validate_repo,
 )
 
@@ -222,21 +222,21 @@ def test_compact_discussion_expand_all():
 
 
 # ---------------------------------------------------------------------------
-# grep_lines
+# ripgrep_lines
 # ---------------------------------------------------------------------------
 
 
-def test_grep_lines_basic():
+def test_ripgrep_lines_basic():
     lines = ["alpha", "beta", "gamma", "delta", "alpha again"]
-    matches = grep_lines(lines, "alpha", 1)
+    matches = ripgrep_lines(lines, "alpha", 1)
     assert len(matches) == 2
     assert 1 in matches[0]["lines"]
     assert 5 in matches[1]["lines"]
 
 
-def test_grep_lines_overlapping_context():
+def test_ripgrep_lines_overlapping_context():
     lines = ["a", "b", "match1", "c", "match2", "d", "e"]
-    matches = grep_lines(lines, "match", 1)
+    matches = ripgrep_lines(lines, "match", 1)
     # The two matches are close enough that their context windows merge
     assert len(matches) == 1
     assert 3 in matches[0]["lines"]

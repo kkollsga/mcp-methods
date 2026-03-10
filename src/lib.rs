@@ -14,8 +14,8 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(git_refs::validate_repo, m)?)?;
     m.add_function(wrap_pyfunction!(git_refs::extract_github_refs, m)?)?;
     // grep
-    m.add_function(wrap_pyfunction!(grep::grep_files, m)?)?;
-    m.add_function(wrap_pyfunction!(grep::grep_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(grep::ripgrep_files, m)?)?;
+    m.add_function(wrap_pyfunction!(grep::ripgrep_lines, m)?)?;
     // files
     m.add_function(wrap_pyfunction!(files::read_file, m)?)?;
     // compact
@@ -23,7 +23,7 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compact::compact_text, m)?)?;
     m.add_function(wrap_pyfunction!(compact::compact_discussion, m)?)?;
     // json_grep
-    m.add_function(wrap_pyfunction!(json_grep::grep_json_fields, m)?)?;
+    m.add_function(wrap_pyfunction!(json_grep::ripgrep_json_fields, m)?)?;
     // github
     m.add_function(wrap_pyfunction!(github::has_git_token, m)?)?;
     m.add_function(wrap_pyfunction!(github::detect_git_repo, m)?)?;
