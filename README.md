@@ -23,7 +23,7 @@ pip install -e ".[dev]"
 | `ripgrep` | Drop-in replacement for the Claude Code Grep tool interface |
 | `read_file` | Safe file reading with path traversal protection and line range support |
 | `github_discussions` | Fetch a single issue/PR with smart compaction, or list issues/PRs with filters |
-| `git_diff` | Compare two commits/branches — full diff or stat-only summary |
+| `git_diff` | Compare two commits/branches — local git with GitHub API fallback for shallow clones |
 | `git_api` | GitHub REST API wrapper with token auth |
 | `ElementCache` | Drill-down cache for collapsed elements in GitHub discussions |
 | `ripgrep_lines` | Search through text lines with context window merging |
@@ -107,14 +107,14 @@ issue = cache.fetch_discussion("owner/repo", 123)
 element = cache.retrieve("owner/repo", 123, "cb_1")
 ```
 
-### `git_diff(base, head, *, repo_path=".", stat_only=False, path_filter=None, context=3)`
+### `git_diff(base, head, *, repo_path=".", repo=None, stat_only=False, path_filter=None, context=3)`
 
-Compare two commits or branches.
+Compare two commits or branches. Tries local `git diff` first; falls back to GitHub compare API when refs are missing (common in shallow clones).
 
 ```python
 from mcp_methods import git_diff
 
-# Full diff
+# Full diff (local git)
 diff = git_diff("main", "feature-branch")
 
 # Stat summary only
@@ -122,6 +122,12 @@ stat = git_diff("main", "feature-branch", stat_only=True)
 
 # Filter to specific files
 diff = git_diff("v1.0", "v2.0", path_filter="*.py", context=5)
+
+# Shallow clone: local diff fails → auto-detects repo and uses GitHub API
+diff = git_diff("v1.0", "v2.0")
+
+# Explicit repo for API fallback
+diff = git_diff("v1.0", "v2.0", repo="owner/repo")
 ```
 
 ### `read_file(path, allowed_dirs, *, offset=0, limit=0, max_chars=0, transform=None)`

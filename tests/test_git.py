@@ -226,6 +226,25 @@ def test_git_diff_invalid_refs():
     assert "error" in result.lower() or "unknown revision" in result.lower()
 
 
+def test_git_diff_with_repo_param():
+    """Explicit repo param is accepted (used for API fallback)."""
+    result = git_diff("HEAD~1", "HEAD", repo="owner/repo")
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+def test_git_diff_path_filter():
+    result = git_diff("HEAD~1", "HEAD", path_filter="*.py")
+    assert isinstance(result, str)
+
+
+def test_git_diff_fallback_invalid_refs_no_repo():
+    """Invalid refs without repo: returns local error (no API fallback possible)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = git_diff("nonexistent-abc", "HEAD", repo_path=tmpdir)
+        assert "error" in result.lower()
+
+
 # ---------------------------------------------------------------------------
 # collapse_code_blocks
 # ---------------------------------------------------------------------------
