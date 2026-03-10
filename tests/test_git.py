@@ -372,6 +372,83 @@ def test_compact_discussion_patch_drilldown():
     assert "content" in parsed
 
 
+def test_compact_discussion_thread_digest():
+    """Large threads (>50 comments) get digested: head + maintainer highlights + tail."""
+    # Build a discussion with 80 comments
+    comments = []
+    for i in range(80):
+        assoc = "MEMBER" if i % 10 == 0 else "NONE"
+        comments.append(
+            {
+                "author": f"user_{i}",
+                "author_association": assoc,
+                "created_at": f"2024-01-{(i % 28) + 1:02d}T12:00:00Z",
+                "body": f"Comment number {i} with some content about the topic at hand.",
+            }
+        )
+    discussion = {"body": "Issue body", "comments": comments, "comment_count": 80}
+
+    compacted_json, cache_json = compact_discussion(json.dumps(discussion), json.dumps({"_n": 0}))
+    data = json.loads(compacted_json)
+    out_comments = data["comments"]
+
+    # Should have head + system note + maintainer highlights + system note + tail
+    # Head: 5, Tail: 5, Maintainer highlights from middle (indices 10,20,30,40,50,60 = 6)
+    system_notes = [c for c in out_comments if c.get("author") == "[system]"]
+    assert len(system_notes) >= 1, "Should have at least one system note"
+
+    # First 5 should be the original head comments
+    assert out_comments[0]["author"] == "user_0"
+    assert out_comments[4]["author"] == "user_4"
+
+    # Last 5 should be the tail
+    assert out_comments[-1]["author"] == "user_79"
+    assert out_comments[-5]["author"] == "user_75"
+
+    # Maintainer highlights should have element IDs
+    highlights = [c for c in out_comments if c.get("_element_id")]
+    assert len(highlights) > 0, "Should have maintainer highlights with element IDs"
+
+    # Verify cache has individual comment IDs
+    if cache_json:
+        cache_data = json.loads(cache_json)
+        comment_keys = [k for k in cache_data if k.startswith("comment_")]
+        assert len(comment_keys) > 0, "Should cache individual middle comments"
+        # Check comments_middle segment exists
+        assert "comments_middle" in cache_data
+
+    # Verify _compaction mentions thread digest
+    assert "thread digest" in data.get("_compaction", "")
+
+
+def test_compact_discussion_thread_digest_drilldown():
+    """Cached middle comments are searchable via grep."""
+    comments = []
+    for i in range(80):
+        keyword = "FINDME" if i == 40 else "normal"
+        comments.append(
+            {
+                "author": f"user_{i}",
+                "author_association": "NONE",
+                "created_at": f"2024-01-{(i % 28) + 1:02d}T12:00:00Z",
+                "body": f"Comment {i}: {keyword} content here.",
+            }
+        )
+    discussion = {"body": "Issue body", "comments": comments}
+
+    cache = ElementCache()
+    cache.compact_and_store("org/repo", 100, json.dumps(discussion))
+
+    # Grep the middle segment for the keyword
+    grep_result = cache.retrieve("org/repo", 100, "comments_middle", grep="FINDME")
+    assert "FINDME" in grep_result
+
+    # Access individual cached comment
+    c40 = cache.retrieve("org/repo", 100, "comment_40")
+    parsed = json.loads(c40)
+    assert "FINDME" in parsed["content"]["body"]
+
+
 # ---------------------------------------------------------------------------
 # ripgrep_lines
 # ---------------------------------------------------------------------------

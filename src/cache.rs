@@ -130,11 +130,26 @@ impl ElementCache {
             }
         };
 
-        let content = elem_data
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let content_lines: Vec<&str> = content.split('\n').collect();
+        // Content can be a string or a structured JSON value (array/object)
+        let content_val = elem_data.get("content");
+        let content_str: String;
+        let content_is_structured;
+
+        match content_val {
+            Some(Value::String(s)) => {
+                content_str = s.clone();
+                content_is_structured = false;
+            }
+            Some(val) => {
+                content_str = serde_json::to_string_pretty(val).unwrap_or_default();
+                content_is_structured = true;
+            }
+            None => {
+                content_str = String::new();
+                content_is_structured = false;
+            }
+        }
+        let content_lines: Vec<&str> = content_str.split('\n').collect();
 
         // Grep mode
         if let Some(grep_pattern) = grep {
@@ -143,19 +158,21 @@ impl ElementCache {
                 Err(e) => return format!("Invalid grep pattern: {}", e),
             };
 
-            // Overflow elements: field-aware grep through parsed JSON values
-            if elem_data.get("type").and_then(|v| v.as_str()) == Some("overflow") {
-                if let Ok(data) = serde_json::from_str::<Value>(content) {
-                    let matches = grep_json_value(&data, &regex, context, "");
-                    if !matches.is_empty() {
-                        let result = serde_json::json!({
-                            "element_id": element_id,
-                            "type": "overflow",
-                            "grep": grep_pattern,
-                            "matches": matches,
-                        });
-                        return serde_json::to_string_pretty(&result).unwrap_or_default();
-                    }
+            // Structured content (overflow, comment segments): field-aware grep
+            if content_is_structured {
+                if let Some(data) = content_val {
+                    let matches = grep_json_value(data, &regex, context, "");
+                    let elem_type = elem_data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let result = serde_json::json!({
+                        "element_id": element_id,
+                        "type": elem_type,
+                        "grep": grep_pattern,
+                        "matches": matches,
+                    });
+                    return serde_json::to_string_pretty(&result).unwrap_or_default();
                 }
             }
 
@@ -307,7 +324,8 @@ impl ElementCache {
                 number,
                 &serde_json::to_string(&overflow).unwrap_or_default(),
             );
-            let mut preview = text[..github::OVERFLOW_PREVIEW.min(text.len())].to_string();
+            let safe_end = compact::safe_byte_index(&text, github::OVERFLOW_PREVIEW);
+            let mut preview = text[..safe_end].to_string();
             if let Some(last_nl) = preview.rfind('\n') {
                 if last_nl > 0 {
                     preview.truncate(last_nl);

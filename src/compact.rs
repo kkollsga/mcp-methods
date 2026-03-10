@@ -6,6 +6,22 @@ use std::sync::LazyLock;
 static SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</?summary[^>]*>").unwrap());
 static LANG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^```(\w*)").unwrap());
 
+/// Case-insensitive ASCII prefix check that is safe for multi-byte UTF-8 strings.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Find the largest valid char boundary <= `pos` in `s`.
+pub fn safe_byte_index(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    // Walk backwards to find a char boundary
+    let mut i = pos;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 // ---------------------------------------------------------------------------
 // Compaction constants
 // ---------------------------------------------------------------------------
@@ -37,6 +53,13 @@ const TIER9_BODY_LIMIT: usize = 2_000;
 const TIER9_COMMENT_LIMIT: usize = 200;
 const TIER9_REVIEW_CHARS: usize = 150;
 
+// Thread digest constants (for huge discussions)
+const HUGE_THREAD_THRESHOLD: usize = 50;
+const DIGEST_HEAD: usize = 5;
+const DIGEST_TAIL: usize = 5;
+const DIGEST_MAINTAINER_MAX: usize = 15;
+const DIGEST_MAINTAINER_CHARS: usize = 300;
+
 // ---------------------------------------------------------------------------
 // Size estimation (mirrors github.rs estimate_json_size)
 // ---------------------------------------------------------------------------
@@ -63,15 +86,15 @@ pub fn collapse_code_blocks_mut(text: &str, cache: &mut Option<Value>) -> String
         let stripped = lines[i].trim();
 
         // Collapse <details> blocks
-        if stripped.len() >= 8 && stripped[..8].eq_ignore_ascii_case("<details") {
+        if starts_with_ignore_ascii_case(stripped, "<details") {
             let mut j = i + 1;
             let mut summary = String::new();
             while j < lines.len() {
                 let s = lines[j].trim();
-                if summary.is_empty() && s.len() >= 8 && s[..8].eq_ignore_ascii_case("<summary") {
+                if summary.is_empty() && starts_with_ignore_ascii_case(s, "<summary") {
                     summary = SUMMARY_RE.replace_all(s, "").trim().to_string();
                 }
-                if s.len() >= 9 && s[..9].eq_ignore_ascii_case("</details") {
+                if starts_with_ignore_ascii_case(s, "</details") {
                     break;
                 }
                 j += 1;
@@ -186,7 +209,10 @@ pub fn compact_text_mut(text: &str, limit: usize, cache: &mut Option<Value>) -> 
     }
     let collapsed = collapse_code_blocks_mut(text, cache);
     if collapsed.len() > limit {
-        let truncated = format!("{}…[truncated]", &collapsed[..limit]);
+        let truncated = format!(
+            "{}…[truncated]",
+            &collapsed[..safe_byte_index(&collapsed, limit)]
+        );
         (truncated, true)
     } else {
         (collapsed, false)
@@ -229,29 +255,7 @@ fn collapse_body_code_blocks(result: &mut Value, cache: &mut Option<Value>) {
     }
 }
 
-/// Tier 1a: Compact related discussions to title/state/author summaries.
-fn compact_related_to_summaries(result: &mut Value) {
-    if let Some(related) = result
-        .get_mut("related_discussions")
-        .and_then(|v| v.as_array_mut())
-    {
-        for disc in related.iter_mut() {
-            if let Some(obj) = disc.as_object_mut() {
-                let summary = serde_json::json!({
-                    "type": obj.get("type").cloned().unwrap_or(Value::Null),
-                    "number": obj.get("number").cloned().unwrap_or(Value::Null),
-                    "repo": obj.get("repo").cloned().unwrap_or(Value::Null),
-                    "title": obj.get("title").cloned().unwrap_or(Value::Null),
-                    "state": obj.get("state").cloned().unwrap_or(Value::Null),
-                    "author": obj.get("author").cloned().unwrap_or(Value::Null),
-                });
-                *disc = summary;
-            }
-        }
-    }
-}
-
-/// Tier 1b: Collapse code blocks in all comment bodies.
+/// Tier 1: Collapse code blocks in all comment bodies.
 fn collapse_comment_code_blocks(result: &mut Value, cache: &mut Option<Value>) {
     if let Some(comments) = result.get_mut("comments").and_then(|v| v.as_array_mut()) {
         for c in comments.iter_mut() {
@@ -676,6 +680,147 @@ fn compact_single_review_comment(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Thread digest for huge discussions
+// ---------------------------------------------------------------------------
+
+/// For discussions with many comments, replace the flat array with a digest:
+/// first N + maintainer highlights from middle + last M, caching the full middle.
+fn build_thread_digest(result: &mut Value, cache: &mut Option<Value>) -> String {
+    let comments = match result.get_mut("comments").and_then(|v| v.as_array_mut()) {
+        Some(c) => c,
+        None => return String::new(),
+    };
+
+    let total = comments.len();
+    let head = DIGEST_HEAD.min(total);
+    let tail = DIGEST_TAIL.min(total.saturating_sub(head));
+    let middle_start = head;
+    let middle_end = total.saturating_sub(tail);
+
+    if middle_start >= middle_end {
+        return String::new(); // not enough comments for a meaningful digest
+    }
+
+    // Clone the full middle for caching before we mutate
+    let middle_comments: Vec<Value> = comments[middle_start..middle_end].to_vec();
+    let middle_count = middle_comments.len();
+
+    // Cache individual middle comments and extract maintainer highlights
+    let mut maintainer_highlights: Vec<Value> = Vec::new();
+    let mut maintainer_total = 0usize;
+    for (i, c) in middle_comments.iter().enumerate() {
+        let eid = format!("comment_{}", middle_start + i);
+
+        // Cache the full comment for drill-down
+        if let Some(ref mut cache_obj) = cache {
+            if let Some(obj) = cache_obj.as_object_mut() {
+                let mut cached = c.clone();
+                cached["_index"] = Value::Number((middle_start + i).into());
+                obj.insert(
+                    eid.clone(),
+                    serde_json::json!({
+                        "type": "comment",
+                        "content": cached,
+                    }),
+                );
+            }
+        }
+
+        let assoc = c
+            .get("author_association")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if MAINTAINER_ROLES.contains(&assoc) {
+            maintainer_total += 1;
+            if maintainer_highlights.len() < DIGEST_MAINTAINER_MAX {
+                let mut highlight = c.clone();
+                // Truncate body for the inline preview
+                if let Some(body) = highlight.get("body").and_then(|v| v.as_str()) {
+                    if body.len() > DIGEST_MAINTAINER_CHARS {
+                        let cut = safe_byte_index(body, DIGEST_MAINTAINER_CHARS);
+                        highlight["body"] = Value::String(format!("{}…", &body[..cut]));
+                    }
+                }
+                highlight["_element_id"] = Value::String(eid);
+                maintainer_highlights.push(highlight);
+            }
+        }
+    }
+
+    // Date range for the middle
+    let first_date = middle_comments
+        .first()
+        .and_then(|c| c.get("created_at"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let last_date = middle_comments
+        .last()
+        .and_then(|c| c.get("created_at"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    // Build the replacement array
+    let head_comments: Vec<Value> = comments[..head].to_vec();
+    let tail_comments: Vec<Value> = comments[total - tail..].to_vec();
+
+    let mut digest: Vec<Value> = Vec::new();
+    digest.extend(head_comments);
+
+    // System note about the gap
+    let gap_msg = format!(
+        "--- {middle_count} comments omitted ({maintainer_total} from maintainers). \
+         Date range: {first_date} to {last_date}. \
+         Use element_id='comments_middle' with grep='pattern' to search. ---"
+    );
+    digest.push(serde_json::json!({
+        "author": "[system]",
+        "body": gap_msg,
+    }));
+
+    // Maintainer highlights
+    if !maintainer_highlights.is_empty() {
+        digest.extend(maintainer_highlights);
+        digest.push(serde_json::json!({
+            "author": "[system]",
+            "body": "--- end maintainer highlights, recent comments follow ---",
+        }));
+    }
+
+    digest.extend(tail_comments);
+
+    // Cache the full middle for drill-down
+    if let Some(ref mut cache_obj) = cache {
+        if let Some(obj) = cache_obj.as_object_mut() {
+            obj.insert(
+                "comments_middle".to_string(),
+                serde_json::json!({
+                    "type": "comment_segment",
+                    "label": "middle",
+                    "comment_count": middle_count,
+                    "content": Value::Array(middle_comments),
+                }),
+            );
+        }
+    }
+
+    // Replace comments array
+    *comments = digest;
+
+    let comment_count = result
+        .get("comment_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(total as u64);
+
+    format!(
+        "thread digest ({} total comments, {} shown inline, {} maintainer highlights)",
+        comment_count,
+        head + tail,
+        maintainer_total.min(DIGEST_MAINTAINER_MAX),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Main adaptive compaction function
 // ---------------------------------------------------------------------------
 
@@ -703,6 +848,20 @@ fn compact_discussion_internal(
     // 0b: Collapse <details> blocks in body
     collapse_body_code_blocks(result, cache);
 
+    // --- Thread digest for huge discussions (proactive, before budget check) ---
+    let comment_count = result
+        .get("comments")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    if comment_count > HUGE_THREAD_THRESHOLD {
+        let digest_desc = build_thread_digest(result, cache);
+        if !digest_desc.is_empty() {
+            compacted_sections.push(digest_desc);
+        }
+    }
+
     // --- Per-item budget enforcement (pre-pass) ---
     let item_actions = enforce_per_item_limits(result, item_budget, cache);
     compacted_sections.extend(item_actions);
@@ -714,7 +873,7 @@ fn compact_discussion_internal(
         cache_all_patches(result, cache);
         if !compacted_sections.is_empty() {
             result["_compaction"] = Value::String(format!(
-                "Per-item limits applied. {}. Use element_id to drill down.",
+                "{}. Use element_id to drill down.",
                 compacted_sections.join("; ")
             ));
         }
@@ -724,12 +883,11 @@ fn compact_discussion_internal(
     // --- Iterative tier compaction ---
     let mut tier_reached: u8 = 0;
 
-    // Tier 1: Related discussions + code blocks in comments
+    // Tier 1: Code blocks in comments
     if size > effective_budget {
         tier_reached = 1;
         collapse_comment_code_blocks(result, cache);
-        compact_related_to_summaries(result);
-        compacted_sections.push("related discussions summarized, code blocks collapsed".into());
+        compacted_sections.push("code blocks collapsed".into());
         size = estimate_size(result);
     }
 
@@ -789,7 +947,7 @@ fn compact_discussion_internal(
         size = estimate_size(result);
     }
 
-    // Tier 9: Aggressive last resort
+    // Tier 9: Aggressive truncation
     if size > effective_budget {
         tier_reached = 9;
         truncate_body(result, TIER9_BODY_LIMIT, cache);
@@ -797,7 +955,7 @@ fn compact_discussion_internal(
         truncate_maintainer_comments(result, TIER9_COMMENT_LIMIT, cache);
         compact_reviews(result, 1, TIER9_REVIEW_CHARS, cache);
         compacted_sections.push("aggressive compaction applied".into());
-        let _ = size;
+        let _ = estimate_size(result);
     }
 
     // Cache any patches still inline (they survived compaction)

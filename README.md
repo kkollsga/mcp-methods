@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 | `read_file` | Safe file reading with path traversal protection and line range support |
 | `github_discussions` | Fetch a single issue/PR with smart compaction, or list issues/PRs with filters |
 | `git_api` | GitHub REST API wrapper with token auth |
-| `ElementCache` | Drill-down cache for collapsed elements (code blocks, comments, patches) in GitHub discussions |
+| `ElementCache` | Drill-down cache for collapsed elements (code blocks, comments, patches, thread segments) in GitHub discussions |
 | `ripgrep_lines` | Search through text lines with context window merging |
 | `ripgrep_json_fields` | Extract fields from JSON text |
 | `compact_discussion` / `compact_text` / `collapse_code_blocks` | Text compaction utilities |
@@ -134,6 +134,8 @@ ids = cache.available("owner/repo", 123)
 ```
 
 PR diffs are automatically collapsed into `patch_N` elements in the compact view. Each patch stores the filename, additions/deletions, and full diff text — supporting grep and line-range drill-down.
+
+Large discussions (50+ comments) are automatically digested: first 5 + maintainer highlights + last 5 comments shown inline, with the full middle cached as individual `comment_N` elements and a searchable `comments_middle` segment.
 
 ### `git_api(repo, path, *, truncate_at=80000)`
 

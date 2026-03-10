@@ -17,6 +17,12 @@ const GITHUB_API: &str = "https://api.github.com";
 pub const OVERFLOW_LIMIT: usize = 100_000;
 pub const OVERFLOW_PREVIEW: usize = 40_000;
 const MAX_RELATED: usize = 10;
+/// Comment pages: first 5 + last 5 (30 per page → 300 comments max, skipping middle).
+const COMMENT_HEAD_PAGES: usize = 5;
+const COMMENT_TAIL_PAGES: usize = 5;
+/// Timeline pages: first 3 + last 2 (enough for cross-refs + recent activity).
+const TIMELINE_HEAD_PAGES: usize = 3;
+const TIMELINE_TAIL_PAGES: usize = 2;
 
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^https://github\.com/([^/]+/[^/]+)/").unwrap());
@@ -145,9 +151,10 @@ fn gh_get(endpoint: &str) -> Result<Value, String> {
     }
 }
 
-fn parse_link_next(link: &str) -> Option<String> {
+fn parse_link_rel(link: &str, rel: &str) -> Option<String> {
+    let tag = format!("rel=\"{}\"", rel);
     for part in link.split(',') {
-        if part.contains("rel=\"next\"") {
+        if part.contains(&tag) {
             let start = part.find('<')? + 1;
             let end = part.find('>')?;
             return Some(part[start..end].to_string());
@@ -156,9 +163,62 @@ fn parse_link_next(link: &str) -> Option<String> {
     None
 }
 
+fn parse_link_next(link: &str) -> Option<String> {
+    parse_link_rel(link, "next")
+}
+
+/// Extract the last page number from a Link header URL (?page=N or &page=N).
+fn parse_last_page(link: &str) -> Option<usize> {
+    let url = parse_link_rel(link, "last")?;
+    // Find page=N in query string
+    url.split('?').nth(1)?.split('&').find_map(|param| {
+        let (k, v) = param.split_once('=')?;
+        if k == "page" {
+            v.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
+    gh_get_paginated_bookends(endpoint, 0, 0)
+}
+
+/// Fetch a single page by URL (used for tail pages).
+fn gh_get_page(url: &str) -> Result<Vec<Value>, String> {
+    let mut req = AGENT
+        .get(url)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "mcp-methods");
+    if let Some(token) = auth_token() {
+        req = req.set("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = req.call().map_err(|e| format!("GitHub API error: {}", e))?;
+    let items: Value = resp
+        .into_json()
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+    match items {
+        Value::Array(arr) => Ok(arr),
+        _ => Ok(vec![]),
+    }
+}
+
+/// Fetch paginated results: first `head` pages + last `tail` pages.
+/// If head=0 and tail=0, fetch all pages (unlimited).
+/// When total pages <= head+tail, all pages are fetched (no gap).
+fn gh_get_paginated_bookends(
+    endpoint: &str,
+    head: usize,
+    tail: usize,
+) -> Result<Vec<Value>, String> {
     let mut url = format!("{}/{}", GITHUB_API, endpoint);
     let mut all_items: Vec<Value> = Vec::new();
+    let mut pages_fetched: usize = 0;
+    let unlimited = head == 0 && tail == 0;
+    let max_head = if unlimited { usize::MAX } else { head };
+    let mut last_page: Option<usize> = None;
+    let mut skipped = false;
 
     loop {
         let mut req = AGENT
@@ -185,7 +245,6 @@ fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
             Err(e) => return Err(format!("GitHub API error: {}", e)),
         };
 
-        // Extract next URL before consuming response body
         let link_header: Option<String> = resp.header("link").map(String::from);
         let items: Value = resp
             .into_json()
@@ -195,10 +254,45 @@ fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
             all_items.extend(arr);
         }
 
+        pages_fetched += 1;
+
+        // On first page, discover total page count
+        if pages_fetched == 1 && last_page.is_none() {
+            last_page = link_header.as_deref().and_then(parse_last_page);
+        }
+
+        if pages_fetched >= max_head {
+            break;
+        }
+
         match link_header.as_deref().and_then(parse_link_next) {
             Some(u) => url = u,
             None => break,
         }
+    }
+
+    // Fetch tail pages if there's a gap
+    if !unlimited && tail > 0 {
+        if let Some(total) = last_page {
+            let tail_start = (head + 1).max(total.saturating_sub(tail) + 1);
+            if tail_start <= total {
+                skipped = tail_start > head + 1;
+                // Build URLs for tail pages
+                let base = format!("{}/{}", GITHUB_API, endpoint);
+                let sep = if base.contains('?') { '&' } else { '?' };
+                for page_num in tail_start..=total {
+                    let page_url = format!("{}{}page={}", base, sep, page_num);
+                    if let Ok(items) = gh_get_page(&page_url) {
+                        all_items.extend(items);
+                    }
+                }
+            }
+        }
+    }
+
+    if skipped {
+        // Insert a marker so callers know comments were skipped
+        all_items.push(json!({"_skipped_middle": true}));
     }
 
     Ok(all_items)
@@ -419,16 +513,26 @@ fn fetch_single_discussion(
                 .collect::<Vec<_>>())
             .unwrap_or_default(),
         "body": json_body(&issue),
+        "comment_count": issue.get("comments").and_then(|v| v.as_u64()).unwrap_or(0),
     });
 
     // Fire all remaining requests in parallel
     std::thread::scope(|s| {
-        let comments_h =
-            s.spawn(|| gh_get_paginated(&format!("repos/{}/issues/{}/comments", repo, number)));
-        let timeline_h = if include_timeline {
-            Some(
-                s.spawn(|| gh_get_paginated(&format!("repos/{}/issues/{}/timeline", repo, number))),
+        let comments_h = s.spawn(|| {
+            gh_get_paginated_bookends(
+                &format!("repos/{}/issues/{}/comments", repo, number),
+                COMMENT_HEAD_PAGES,
+                COMMENT_TAIL_PAGES,
             )
+        });
+        let timeline_h = if include_timeline {
+            Some(s.spawn(|| {
+                gh_get_paginated_bookends(
+                    &format!("repos/{}/issues/{}/timeline", repo, number),
+                    TIMELINE_HEAD_PAGES,
+                    TIMELINE_TAIL_PAGES,
+                )
+            }))
         } else {
             None
         };
@@ -459,6 +563,12 @@ fn fetch_single_discussion(
             comments
                 .iter()
                 .map(|c| {
+                    if c.get("_skipped_middle").is_some() {
+                        return json!({
+                            "author": "[system]",
+                            "body": "--- older comments omitted (middle pages skipped) ---",
+                        });
+                    }
                     json!({
                         "author": json_author(c),
                         "author_association": json_str(c, "author_association"),
@@ -658,79 +768,12 @@ pub fn fetch_issue_internal(repo: &str, number: u64) -> Result<(String, Option<S
     refs.truncate(MAX_RELATED);
 
     if !refs.is_empty() {
-        let parent_size = estimate_json_size(&parent);
-
-        if parent_size < 30_000 && refs.len() <= 5 {
-            // Fetch full related discussions in parallel
-            let related: Vec<Value> = std::thread::scope(|s| {
-                let handles: Vec<_> = refs
-                    .iter()
-                    .map(|(ref_repo, ref_num)| {
-                        let rr = ref_repo.clone();
-                        let rn = *ref_num;
-                        s.spawn(move || fetch_single_discussion(&rr, rn, false, false))
-                    })
-                    .collect();
-                let mut results = Vec::new();
-                for h in handles {
-                    if let Ok(Ok(disc)) = h.join() {
-                        if let Ok(disc_json) = serde_json::to_string(&disc) {
-                            let cache_json = serde_json::to_string(&json!({"_n": 0})).unwrap();
-                            if let Ok((compacted, _)) = compact::compact_discussion(
-                                &disc_json,
-                                Some(&cache_json),
-                                None,
-                                None,
-                            ) {
-                                if let Ok(val) = serde_json::from_str(&compacted) {
-                                    results.push(val);
-                                }
-                            }
-                        }
-                    }
-                }
-                results
-            });
-            if !related.is_empty() {
-                parent["related_discussions"] = Value::Array(related);
-            }
-        } else {
-            // Fetch just summaries in parallel
-            let summaries: Vec<Value> = std::thread::scope(|s| {
-                let handles: Vec<_> = refs
-                    .iter()
-                    .map(|(ref_repo, ref_num)| {
-                        let rr = ref_repo.clone();
-                        let rn = *ref_num;
-                        s.spawn(move || gh_get(&format!("repos/{}/issues/{}", rr, rn)))
-                    })
-                    .collect();
-                let mut results = Vec::new();
-                for (i, h) in handles.into_iter().enumerate() {
-                    if let Ok(Ok(issue_data)) = h.join() {
-                        let (ref_repo, ref_num) = &refs[i];
-                        let is_pr = issue_data.get("pull_request").is_some();
-                        results.push(json!({
-                            "type": if is_pr { "pull_request" } else { "issue" },
-                            "number": ref_num,
-                            "repo": ref_repo,
-                            "title": json_str(&issue_data, "title"),
-                            "state": json_str(&issue_data, "state"),
-                            "author": json_author(&issue_data),
-                        }));
-                    }
-                }
-                results
-            });
-            if !summaries.is_empty() {
-                parent["related_discussions"] = Value::Array(summaries);
-                parent["_note"] = Value::String(
-                    "Related discussions shown as summaries. \
-                     Call fetch_issue(repo, number) to read any in full."
-                        .to_string(),
-                );
-            }
-        }
+        // List refs for the agent to dive into on demand — no extra fetches
+        let ref_list: Vec<Value> = refs
+            .iter()
+            .map(|(r, n)| json!({"repo": r, "number": n}))
+            .collect();
+        parent["related_refs"] = Value::Array(ref_list);
     }
 
     // Compact
@@ -772,7 +815,7 @@ pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
             if text.len() > truncate_at {
                 format!(
                     "{}\n\n... (truncated, refine your query)",
-                    &text[..truncate_at]
+                    &text[..compact::safe_byte_index(&text, truncate_at)]
                 )
             } else {
                 text
