@@ -1,28 +1,6 @@
 # mcp-methods feedback — from MCP server integration
 
-Version: 0.3.1
-
-## `git_diff` and shallow clones
-
-The open-source MCP server clones repos with `git clone --depth 1`. This means only the latest commit exists locally. `git_diff(base, head)` will fail for most useful comparisons:
-
-- `diff("main", "v2.0")` — tag doesn't exist in shallow clone
-- `diff("abc123", "HEAD")` — old commit not available
-- `diff("main~5", "main")` — no history
-
-The only diff that works reliably is `diff("HEAD~0", "HEAD")` — effectively nothing.
-
-### Options
-
-1. **Library-side**: `git_diff` could detect a shallow clone and auto-fetch the missing refs before diffing. `git fetch --depth=N origin base head` would pull just enough history.
-
-2. **Library-side**: Add a `fetch_depth` parameter to `git_diff` that fetches the needed commits on demand: `git_diff("v2.0", "v2.1", fetch_depth=100)`.
-
-3. **Server-side**: The MCP server could unshallow on demand. But this defeats the purpose of shallow clones (fast, small).
-
-4. **GitHub API fallback**: For comparing tags/branches, `github_api("compare/v2.0...v2.1")` works without any local clone. `git_diff` could fall back to this when the local refs aren't available.
-
-Option 4 is probably the most pragmatic — try local git diff first, fall back to GitHub compare API if refs are missing. No need to unshallow.
+Version: 0.3.3
 
 ## `github_discussions` — unified listing + fetch
 
@@ -31,6 +9,14 @@ Works well as a unified interface. The MCP server exposes it as `github_discussi
 - `github_discussion(number=N)` — single fetch with compaction via `ElementCache`
 
 The `kind` parameter ("issue", "pr", "all") is clear for listing. The `expand` / `element_id` / `grep` parameters activate in fetch mode. Docstring examples make the dual-mode intuitive.
+
+## PR diffs as collapsed elements — 0.3.3
+
+PR patches are now collapsed into `patch_N` cache elements in the compact view. The agent drills into specific files with `element_id="patch_3"`, searches within patches with `grep="pattern"`, or slices with `lines="10-30"`. This replaces the standalone `git_diff` function — for tag/branch comparisons outside PR context, use `git_api("compare/v1.0...v2.0")`.
+
+## `fetch_discussion` caching with refresh
+
+`fetch_discussion` now returns a cached summary on subsequent calls (no re-fetch). Pass `refresh=True` to force a fresh fetch when the discussion has changed.
 
 ## Shipped and working well
 

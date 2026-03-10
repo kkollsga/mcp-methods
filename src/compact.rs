@@ -292,12 +292,37 @@ pub fn compact_discussion(
         }
     }
 
-    // Strip patches from files
+    // Collapse patches into cache elements
     if !expand_set.contains("patches") {
         if let Some(files) = result.get_mut("files").and_then(|v| v.as_array_mut()) {
             for f in files.iter_mut() {
                 if let Some(obj) = f.as_object_mut() {
-                    obj.remove("patch");
+                    let patch = obj.remove("patch");
+                    if let Some(ref mut c) = cache {
+                        if let Some(Value::String(patch_text)) = patch {
+                            if !patch_text.is_empty() {
+                                let n = c.get("_n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                                c["_n"] = Value::from(n);
+                                let eid = format!("patch_{}", n);
+                                let filename =
+                                    obj.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                                let additions =
+                                    obj.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let deletions =
+                                    obj.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let total_lines = patch_text.matches('\n').count() + 1;
+                                c[&eid] = serde_json::json!({
+                                    "type": "patch",
+                                    "filename": filename,
+                                    "additions": additions,
+                                    "deletions": deletions,
+                                    "total_lines": total_lines,
+                                    "content": patch_text,
+                                });
+                                obj.insert("patch_id".to_string(), Value::String(eid));
+                            }
+                        }
+                    }
                 }
             }
         }

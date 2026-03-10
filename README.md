@@ -23,9 +23,8 @@ pip install -e ".[dev]"
 | `ripgrep` | Drop-in replacement for the Claude Code Grep tool interface |
 | `read_file` | Safe file reading with path traversal protection and line range support |
 | `github_discussions` | Fetch a single issue/PR with smart compaction, or list issues/PRs with filters |
-| `git_diff` | Compare two commits/branches — local git with GitHub API fallback for shallow clones |
 | `git_api` | GitHub REST API wrapper with token auth |
-| `ElementCache` | Drill-down cache for collapsed elements in GitHub discussions |
+| `ElementCache` | Drill-down cache for collapsed elements (code blocks, comments, patches) in GitHub discussions |
 | `ripgrep_lines` | Search through text lines with context window merging |
 | `ripgrep_json_fields` | Extract fields from JSON text |
 | `compact_discussion` / `compact_text` / `collapse_code_blocks` | Text compaction utilities |
@@ -100,34 +99,54 @@ prs = github_discussions(repo="owner/repo", kind="pr", limit=10)
 
 # Fetch a single issue/PR with smart compaction
 issue = github_discussions(repo="owner/repo", number=123)
-
-# With caching for drill-down into collapsed elements
-cache = ElementCache()
-issue = cache.fetch_discussion("owner/repo", 123)
-element = cache.retrieve("owner/repo", 123, "cb_1")
 ```
 
-### `git_diff(base, head, *, repo_path=".", repo=None, stat_only=False, path_filter=None, context=3)`
+### `ElementCache` — progressive disclosure for GitHub discussions
 
-Compare two commits or branches. Tries local `git diff` first; falls back to GitHub compare API when refs are missing (common in shallow clones).
+Cache for drill-down into collapsed elements. Fetches a discussion once, then lets you explore code blocks, comments, and PR diffs without re-fetching.
 
 ```python
-from mcp_methods import git_diff
+from mcp_methods import ElementCache
 
-# Full diff (local git)
-diff = git_diff("main", "feature-branch")
+cache = ElementCache()
 
-# Stat summary only
-stat = git_diff("main", "feature-branch", stat_only=True)
+# First call fetches from GitHub API, compacts, and caches elements
+text = cache.fetch_discussion("owner/repo", 123)
 
-# Filter to specific files
-diff = git_diff("v1.0", "v2.0", path_filter="*.py", context=5)
+# Subsequent calls return cached summary (no network)
+summary = cache.fetch_discussion("owner/repo", 123)
+# → "Cached owner/repo#123 — 5 elements available: cb_1, comment_2, patch_1, patch_2, patch_3"
 
-# Shallow clone: local diff fails → auto-detects repo and uses GitHub API
-diff = git_diff("v1.0", "v2.0")
+# Force re-fetch when discussion has changed
+text = cache.fetch_discussion("owner/repo", 123, refresh=True)
 
-# Explicit repo for API fallback
-diff = git_diff("v1.0", "v2.0", repo="owner/repo")
+# Drill into a collapsed code block
+code = cache.retrieve("owner/repo", 123, "cb_1")
+
+# Drill into a PR patch with grep
+result = cache.retrieve("owner/repo", 123, "patch_1", grep="error_handler")
+
+# Drill into a patch with line range
+result = cache.retrieve("owner/repo", 123, "patch_2", lines="10-30")
+
+# List available elements
+ids = cache.available("owner/repo", 123)
+```
+
+PR diffs are automatically collapsed into `patch_N` elements in the compact view. Each patch stores the filename, additions/deletions, and full diff text — supporting grep and line-range drill-down.
+
+### `git_api(repo, path, *, truncate_at=80000)`
+
+GitHub REST API wrapper. For comparing branches/tags, use `compare`:
+
+```python
+from mcp_methods import git_api
+
+# Compare two refs
+diff = git_api("owner/repo", "compare/main...feature-branch")
+
+# List commits
+commits = git_api("owner/repo", "commits?per_page=10")
 ```
 
 ### `read_file(path, allowed_dirs, *, offset=0, limit=0, max_chars=0, transform=None)`
@@ -145,7 +164,7 @@ content = read_file("src/main.py", ["/project"])
 All heavy lifting is in Rust (PyO3/maturin), compiled to a native Python extension:
 
 - **grep**: Uses `grep-regex`, `grep-searcher`, and `ignore` crates directly (not a ripgrep subprocess). Parallel file walking with per-thread searcher reuse, mmap, SIMD literal optimization, and `.gitignore` support.
-- **GitHub**: HTTP via `ureq`, JSON processing via `serde_json`, text compaction in Rust.
+- **GitHub**: HTTP via `ureq`, JSON processing via `serde_json`, text compaction in Rust. PR diffs are collapsed into cacheable elements for progressive disclosure.
 - **File I/O**: Path validation and traversal protection in Rust.
 
 ## License

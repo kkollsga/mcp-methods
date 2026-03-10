@@ -12,7 +12,6 @@ from mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
-    git_diff,
     github_discussions,
     has_git_token,
     ripgrep_lines,
@@ -161,6 +160,27 @@ def test_element_cache_fetch_discussion_no_token():
         assert "token" in result.lower()
 
 
+def test_element_cache_refresh_returns_cached():
+    """When cache has entries and refresh=False, returns summary instead of re-fetching."""
+    cache = ElementCache()
+    cache.store_elements("org/repo", 1, json.dumps({"cb_1": {"content": "x"}}))
+    result = cache.fetch_discussion("org/repo", 1)
+    assert "Cached" in result
+    assert "cb_1" in result
+    assert "refresh=True" in result
+
+
+def test_element_cache_refresh_empty_fetches():
+    """When cache is empty, fetch_discussion attempts network fetch (fails without token)."""
+    cache = ElementCache()
+    env = os.environ.copy()
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    with patch.dict(os.environ, env, clear=True):
+        result = cache.fetch_discussion("org/repo", 1)
+        assert "token" in result.lower()  # no cache, tried to fetch
+
+
 # ---------------------------------------------------------------------------
 # github_discussions
 # ---------------------------------------------------------------------------
@@ -194,55 +214,6 @@ def test_github_discussions_auto_detect_repo():
     # Either lists results or returns an error about token/rate limit
     assert isinstance(result, str)
     assert len(result) > 0
-
-
-# ---------------------------------------------------------------------------
-# git_diff
-# ---------------------------------------------------------------------------
-
-
-def test_git_diff_basic():
-    # Use real git repo — diff between HEAD~1 and HEAD
-    result = git_diff("HEAD~1", "HEAD")
-    assert isinstance(result, str)
-    # Should contain diff output or "No differences"
-    assert len(result) > 0
-
-
-def test_git_diff_stat_only():
-    result = git_diff("HEAD~1", "HEAD", stat_only=True)
-    assert isinstance(result, str)
-    assert len(result) > 0
-
-
-def test_git_diff_not_a_repo():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        result = git_diff("main", "HEAD", repo_path=tmpdir)
-        assert "error" in result.lower()
-
-
-def test_git_diff_invalid_refs():
-    result = git_diff("nonexistent-branch-abc123", "HEAD")
-    assert "error" in result.lower() or "unknown revision" in result.lower()
-
-
-def test_git_diff_with_repo_param():
-    """Explicit repo param is accepted (used for API fallback)."""
-    result = git_diff("HEAD~1", "HEAD", repo="owner/repo")
-    assert isinstance(result, str)
-    assert len(result) > 0
-
-
-def test_git_diff_path_filter():
-    result = git_diff("HEAD~1", "HEAD", path_filter="*.py")
-    assert isinstance(result, str)
-
-
-def test_git_diff_fallback_invalid_refs_no_repo():
-    """Invalid refs without repo: returns local error (no API fallback possible)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        result = git_diff("nonexistent-abc", "HEAD", repo_path=tmpdir)
-        assert "error" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +276,102 @@ def test_compact_discussion_expand_all():
     result_json, _ = compact_discussion(json.dumps(discussion), ["all"])
     result = json.loads(result_json)
     assert len(result["comments"]) == 1  # bot kept
+
+
+def test_compact_discussion_patches_collapsed():
+    """Patches are collapsed into cache elements with patch_id references."""
+    discussion = {
+        "body": "Fix bug",
+        "files": [
+            {
+                "filename": "src/main.py",
+                "status": "modified",
+                "additions": 10,
+                "deletions": 3,
+                "patch": "@@ -1,5 +1,12 @@\n+import os\n def main():\n     pass",
+            },
+            {
+                "filename": "tests/test_main.py",
+                "status": "added",
+                "additions": 20,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,20 @@\n+def test_main():\n+    assert True",
+            },
+        ],
+    }
+    cache_json = json.dumps({"_n": 0})
+    result_json, new_cache_json = compact_discussion(json.dumps(discussion), [], cache_json)
+    result = json.loads(result_json)
+    cache = json.loads(new_cache_json)
+
+    # Files should have patch_id instead of raw patch
+    for f in result["files"]:
+        assert "patch" not in f
+        assert "patch_id" in f
+
+    # Cache should contain patch elements
+    assert "patch_1" in cache
+    assert cache["patch_1"]["type"] == "patch"
+    assert cache["patch_1"]["filename"] == "src/main.py"
+    assert cache["patch_1"]["additions"] == 10
+    assert cache["patch_1"]["deletions"] == 3
+    assert "@@ -1,5" in cache["patch_1"]["content"]
+
+    assert "patch_2" in cache
+    assert cache["patch_2"]["filename"] == "tests/test_main.py"
+
+
+def test_compact_discussion_patches_expanded():
+    """With expand=['patches'], raw patches are kept inline."""
+    discussion = {
+        "body": "Fix bug",
+        "files": [
+            {
+                "filename": "src/main.py",
+                "status": "modified",
+                "additions": 5,
+                "deletions": 2,
+                "patch": "@@ -1,3 +1,6 @@\n+import os",
+            },
+        ],
+    }
+    result_json, _ = compact_discussion(json.dumps(discussion), ["patches"])
+    result = json.loads(result_json)
+    # Patches kept inline
+    assert result["files"][0]["patch"] == "@@ -1,3 +1,6 @@\n+import os"
+    assert "patch_id" not in result["files"][0]
+
+
+def test_compact_discussion_patch_drilldown():
+    """Cached patches work with ElementCache retrieve (grep/lines)."""
+    discussion = {
+        "body": "Fix bug",
+        "files": [
+            {
+                "filename": "src/main.py",
+                "status": "modified",
+                "additions": 5,
+                "deletions": 2,
+                "patch": "@@ -1,3 +1,6 @@\n+import os\n def main():\n-    pass\n+    print('hello')",
+            },
+        ],
+    }
+    cache = ElementCache()
+    cache.compact_and_store("org/repo", 42, json.dumps(discussion), [])
+
+    # Verify patch was cached
+    available = cache.available("org/repo", 42)
+    patch_ids = [eid for eid in available if eid.startswith("patch_")]
+    assert len(patch_ids) == 1
+
+    # Drill into patch with grep
+    grep_result = cache.retrieve("org/repo", 42, patch_ids[0], grep="import")
+    assert "import os" in grep_result
+
+    # Drill into patch with lines
+    lines_result = cache.retrieve("org/repo", 42, patch_ids[0], lines="1-2")
+    parsed = json.loads(lines_result)
+    assert "content" in parsed
 
 
 # ---------------------------------------------------------------------------

@@ -237,7 +237,7 @@ impl ElementCache {
     ///
     /// Releases the GIL during all HTTP and computation. This is the primary
     /// entry point for fetching discussions with caching.
-    #[pyo3(signature = (repo, number, *, expand=None, element_id=None, lines=None, grep=None, context=3))]
+    #[pyo3(signature = (repo, number, *, expand=None, element_id=None, lines=None, grep=None, context=3, refresh=false))]
     #[allow(clippy::too_many_arguments)]
     pub fn fetch_discussion(
         &mut self,
@@ -248,6 +248,7 @@ impl ElementCache {
         lines: Option<&str>,
         grep: Option<&str>,
         context: usize,
+        refresh: bool,
     ) -> PyResult<String> {
         // Element retrieval — no network, fast
         if let Some(eid) = element_id {
@@ -257,6 +258,28 @@ impl ElementCache {
         // Validate repo
         if let Some(err) = crate::git_refs::validate_repo(repo) {
             return Ok(err);
+        }
+
+        // If cached and not refreshing, return summary of available elements
+        let key = (repo.to_string(), number);
+        if !refresh {
+            if let Some(elements) = self.store.get(&key) {
+                if !elements.is_empty() {
+                    let mut ids: Vec<&String> = elements.keys().collect();
+                    ids.sort();
+                    return Ok(format!(
+                        "Cached {}#{} — {} elements available: {}\n\
+                         Use element_id='...' to drill down, or refresh=True to re-fetch.",
+                        repo,
+                        number,
+                        ids.len(),
+                        ids.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
         }
 
         // All HTTP + computation runs in Rust; parallel requests use std::thread::scope
