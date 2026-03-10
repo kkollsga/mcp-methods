@@ -12,6 +12,7 @@ build/
 wheels/
 *.so
 *.dylib
+*.dSYM/
 *.pyd
 
 # Virtual environments
