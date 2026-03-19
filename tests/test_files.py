@@ -333,3 +333,97 @@ def test_read_file_line_numbers():
         result = read_file("src/main.py", [tmp])
         assert "    1  import os" in result
         assert "    2  print" in result
+
+
+# ---------------------------------------------------------------------------
+# read_file — section parameter
+# ---------------------------------------------------------------------------
+
+HTML_DOC = (
+    "<html><body>"
+    '<div class="chapter" id="ch1"><h2>Chapter 1</h2><p>Intro</p></div>'
+    '<section id="part-2"><h2>Part 2</h2>'
+    '<div id="nested">inner</div>'
+    "</section>"
+    '<article id="post_3"><p>Post content</p></article>'
+    "</body></html>"
+)
+
+
+def test_read_file_section_basic():
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "doc.html").write_text(HTML_DOC)
+        result = read_file("doc.html", [tmp], section="ch1")
+        assert result.startswith('<div class="chapter" id="ch1">')
+        assert result.endswith("</div>")
+        assert "Chapter 1" in result
+        # No line numbers or header
+        assert "lines" not in result
+
+
+def test_read_file_section_different_tags():
+    """section works for <section> and <article>, not just <div>."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "doc.html").write_text(HTML_DOC)
+        result = read_file("doc.html", [tmp], section="part-2")
+        assert result.startswith('<section id="part-2">')
+        assert result.endswith("</section>")
+        assert "nested" in result
+
+        result2 = read_file("doc.html", [tmp], section="post_3")
+        assert result2.startswith('<article id="post_3">')
+        assert result2.endswith("</article>")
+
+
+def test_read_file_section_nested():
+    """Nested tags of the same type are balanced correctly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = '<div id="outer"><div id="inner">deep</div></div><div id="after">next</div>'
+        (Path(tmp) / "nested.html").write_text(html)
+        result = read_file("nested.html", [tmp], section="outer")
+        assert result == '<div id="outer"><div id="inner">deep</div></div>'
+
+
+def test_read_file_section_not_found():
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "doc.html").write_text(HTML_DOC)
+        result = read_file("doc.html", [tmp], section="nonexistent")
+        assert "Error: section 'nonexistent' not found" in result
+
+
+def test_read_file_section_max_chars():
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "doc.html").write_text(HTML_DOC)
+        result = read_file("doc.html", [tmp], section="ch1", max_chars=20)
+        assert "truncated" in result
+        assert len(result.split("\n\n[... truncated")[0]) <= 20
+
+
+def test_read_file_section_with_transform():
+    """transform is applied before section extraction."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # The raw file has an encoded id; transform decodes it before extraction
+        encoded = '<div id="sec_1">&lt;em&gt;Hello&lt;/em&gt;</div>'
+        (Path(tmp) / "doc.html").write_text(encoded)
+        result = read_file(
+            "doc.html",
+            [tmp],
+            section="sec_1",
+            transform=lambda t: t.replace("&lt;", "<").replace("&gt;", ">"),
+        )
+        assert "<em>Hello</em>" in result
+
+
+def test_read_file_section_single_line():
+    """Section extraction works on single-line HTML (the main use case)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        single_line = (
+            "<html>"
+            + '<div id="s1">content1</div>' * 100
+            + '<div id="s50">target</div>'
+            + '<div id="s99">end</div>'
+            + "</html>"
+        )
+        (Path(tmp) / "big.html").write_text(single_line)
+        result = read_file("big.html", [tmp], section="s50")
+        assert result == '<div id="s50">target</div>'

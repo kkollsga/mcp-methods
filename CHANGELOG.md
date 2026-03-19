@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.11
+
+- **`section` parameter for `read_file`** — extract an HTML element by its `id` attribute. Solves single-line HTML navigation: instead of getting 127KB on line 96, request `section="PARAGRAF_4-7"` to get just that element. Infers tag name from the matched opening tag, handles nested elements of the same type, works with `transform` and `max_chars`.
+
 ## 0.3.10
 
 - **Comment TOC** — bare `element_id="comments_middle"` returns a lightweight table of contents (`_index`, `author`, `created_at`, 80-char snippet) instead of dumping raw JSON.

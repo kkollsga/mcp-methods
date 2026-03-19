@@ -1,6 +1,60 @@
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
+/// Extract an HTML element by its `id` attribute, returning the full element
+/// from opening tag to its balanced closing tag.
+///
+/// Returns `None` if no element with the given id is found.
+fn extract_section(html: &str, section_id: &str) -> Option<String> {
+    // Build pattern: <tagname ... id="section_id" ...>
+    // We need to find an opening tag containing id="section_id"
+    let id_attr = format!("id=\"{}\"", section_id);
+    let pos = html.find(&id_attr)?;
+
+    // Walk backwards to find the '<' that opens this tag
+    let tag_start = html[..pos].rfind('<')?;
+
+    // Extract the tag name (first word after '<')
+    let after_lt = &html[tag_start + 1..];
+    let tag_name: String = after_lt
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if tag_name.is_empty() {
+        return None;
+    }
+
+    let open_tag = format!("<{}", tag_name);
+    let close_tag = format!("</{}>", tag_name);
+
+    // Track depth from tag_start to find the balanced closing tag
+    let mut depth: usize = 0;
+    let mut i = tag_start;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        if i + open_tag.len() <= len
+            && html[i..i + open_tag.len()] == *open_tag
+            && (i + open_tag.len() == len || !bytes[i + open_tag.len()].is_ascii_alphanumeric())
+        {
+            depth += 1;
+            i += open_tag.len();
+        } else if i + close_tag.len() <= len && html[i..i + close_tag.len()] == *close_tag {
+            depth -= 1;
+            if depth == 0 {
+                return Some(html[tag_start..i + close_tag.len()].to_string());
+            }
+            i += close_tag.len();
+        } else {
+            i += 1;
+        }
+    }
+
+    // Unclosed tag — return from opening tag to end
+    Some(html[tag_start..].to_string())
+}
+
 /// Read a file with path-traversal protection.
 ///
 /// Returns the file content as a formatted string with line numbers.
@@ -9,6 +63,7 @@ use std::path::PathBuf;
     file_path,
     allowed_dirs,
     *,
+    section = None,
     start_line = None,
     end_line = None,
     rows = None,
@@ -20,6 +75,7 @@ pub fn read_file(
     py: Python<'_>,
     file_path: &str,
     allowed_dirs: Vec<String>,
+    section: Option<String>,
     start_line: Option<usize>,
     end_line: Option<usize>,
     rows: Option<Vec<usize>>,
@@ -83,6 +139,25 @@ pub fn read_file(
     } else {
         raw
     };
+
+    // HTML section extraction by id
+    if let Some(ref sid) = section {
+        return match extract_section(&raw, sid) {
+            Some(mut fragment) => {
+                if let Some(mc) = max_chars {
+                    if fragment.len() > mc {
+                        fragment.truncate(mc);
+                        fragment.push_str(&format!("\n\n[... truncated at {} chars]", mc));
+                    }
+                }
+                Ok(fragment)
+            }
+            None => Ok(format!(
+                "Error: section '{}' not found in {}",
+                sid, file_path
+            )),
+        };
+    }
 
     // CSV row slicing
     if let Some(ref row_range) = rows {
