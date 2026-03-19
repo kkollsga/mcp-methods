@@ -33,19 +33,22 @@ fn extract_section(html: &str, section_id: &str) -> Option<String> {
     let bytes = html.as_bytes();
     let len = bytes.len();
 
+    let open_bytes = open_tag.as_bytes();
+    let close_bytes = close_tag.as_bytes();
+
     while i < len {
-        if i + open_tag.len() <= len
-            && html[i..i + open_tag.len()] == *open_tag
-            && (i + open_tag.len() == len || !bytes[i + open_tag.len()].is_ascii_alphanumeric())
+        if i + open_bytes.len() <= len
+            && &bytes[i..i + open_bytes.len()] == open_bytes
+            && (i + open_bytes.len() == len || !bytes[i + open_bytes.len()].is_ascii_alphanumeric())
         {
             depth += 1;
-            i += open_tag.len();
-        } else if i + close_tag.len() <= len && html[i..i + close_tag.len()] == *close_tag {
+            i += open_bytes.len();
+        } else if i + close_bytes.len() <= len && &bytes[i..i + close_bytes.len()] == close_bytes {
             depth -= 1;
             if depth == 0 {
-                return Some(html[tag_start..i + close_tag.len()].to_string());
+                return Some(html[tag_start..i + close_bytes.len()].to_string());
             }
-            i += close_tag.len();
+            i += close_bytes.len();
         } else {
             i += 1;
         }
@@ -146,7 +149,11 @@ pub fn read_file(
             Some(mut fragment) => {
                 if let Some(mc) = max_chars {
                     if fragment.len() > mc {
-                        fragment.truncate(mc);
+                        let mut end = mc;
+                        while end > 0 && !fragment.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        fragment.truncate(end);
                         fragment.push_str(&format!("\n\n[... truncated at {} chars]", mc));
                     }
                 }
@@ -182,7 +189,11 @@ pub fn read_file(
             ));
             if let Some(mc) = max_chars {
                 if text.len() > mc {
-                    text.truncate(mc);
+                    let mut end = mc;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
                     text.push_str(&format!("\n\n[... truncated at {} chars]", mc));
                 }
             }
@@ -228,7 +239,11 @@ pub fn read_file(
 
     if let Some(mc) = max_chars {
         if text.len() > mc {
-            text.truncate(mc);
+            let mut end = mc;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
             text.push_str(&format!(
                 "\n\n[... truncated at {} chars — {} total]",
                 mc,

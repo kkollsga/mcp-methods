@@ -414,6 +414,30 @@ def test_read_file_section_with_transform():
         assert "<em>Hello</em>" in result
 
 
+def test_read_file_section_utf8():
+    """Section extraction handles multi-byte UTF-8 characters without panicking."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = '<div id="PARAGRAF_4-7"><h3>§ 4-7. Særlige regler — æøå</h3><p>Résumé über Ölfeld</p></div>'
+        (Path(tmp) / "law.html").write_text(html, encoding="utf-8")
+        result = read_file("law.html", [tmp], section="PARAGRAF_4-7")
+        assert result.startswith("<div")
+        assert "§ 4-7" in result
+        assert "æøå" in result
+        assert result.endswith("</div>")
+
+
+def test_read_file_section_utf8_max_chars():
+    """max_chars truncation doesn't split multi-byte characters."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = '<div id="s1">§§§§§§§§§§</div>'
+        (Path(tmp) / "doc.html").write_text(html, encoding="utf-8")
+        # § is 2 bytes; truncate at a boundary that would split one
+        result = read_file("doc.html", [tmp], section="s1", max_chars=16)
+        assert "truncated" in result
+        # The pre-truncation part must be valid UTF-8 (no panic = pass)
+        result.encode("utf-8")
+
+
 def test_read_file_section_single_line():
     """Section extraction works on single-line HTML (the main use case)."""
     with tempfile.TemporaryDirectory() as tmp:

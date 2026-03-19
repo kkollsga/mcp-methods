@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.12
+
+- **UTF-8 fix for `section` extraction** — the byte-stepping loop panicked on multi-byte characters (§, æ, ø, å, é, etc.) inside extracted sections. Now advances by full UTF-8 codepoints. Also hardened all `max_chars` truncation sites to avoid splitting multi-byte characters.
+
 ## 0.3.11
 
 - **`section` parameter for `read_file`** — extract an HTML element by its `id` attribute. Solves single-line HTML navigation: instead of getting 127KB on line 96, request `section="PARAGRAF_4-7"` to get just that element. Infers tag name from the matched opening tag, handles nested elements of the same type, works with `transform` and `max_chars`.
