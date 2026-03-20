@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.13
+
+- **`grep` parameter for `read_file`** — search within a single file and return only matching lines with context. Avoids reading entire large documents into context when only specific passages are needed. Supports `grep_context` (default 2) for surrounding lines, merges overlapping context windows, works with `section`, `start_line`/`end_line`, `transform`, and `max_chars`. Uses `--` separators between non-contiguous match groups, consistent with ripgrep output.
+
 ## 0.3.12
 
 - **UTF-8 fix for `section` extraction** — the byte-stepping loop panicked on multi-byte characters (§, æ, ø, å, é, etc.) inside extracted sections. Now advances by full UTF-8 codepoints. Also hardened all `max_chars` truncation sites to avoid splitting multi-byte characters.

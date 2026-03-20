@@ -451,3 +451,141 @@ def test_read_file_section_single_line():
         (Path(tmp) / "big.html").write_text(single_line)
         result = read_file("big.html", [tmp], section="s50")
         assert result == '<div id="s50">target</div>'
+
+
+# ---------------------------------------------------------------------------
+# read_file — grep parameter
+# ---------------------------------------------------------------------------
+
+
+def test_read_file_grep_basic():
+    """grep returns matching lines with context."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line 10")
+        assert "1 matches in 20 lines" in result
+        assert "   10  line 10" in result
+        # Default context=2
+        assert "    8  line 8" in result
+        assert "   12  line 12" in result
+
+
+def test_read_file_grep_multiple_matches_merged():
+    """Multiple matches with overlapping context are merged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        # Matches on lines 5 and 7 — context windows overlap with default ctx=2
+        result = read_file("data.txt", [tmp], grep="line (5|7)$")
+        assert "2 matches in 20 lines" in result
+        # Overlapping context should be merged (no separator)
+        assert "--" not in result
+
+
+def test_read_file_grep_separated_groups():
+    """Non-contiguous matches produce -- separator."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        # Matches on lines 3 and 15 — far apart, should have separator
+        result = read_file("data.txt", [tmp], grep="line (3|15)$")
+        assert "2 matches" in result
+        assert "\n--\n" in result
+
+
+def test_read_file_grep_no_matches():
+    """No matches returns header only."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("hello\nworld\n")
+        result = read_file("data.txt", [tmp], grep="nonexistent")
+        assert "0 matches in 2 lines" in result
+        # No numbered lines in output
+        assert "    1" not in result
+
+
+def test_read_file_grep_context_zero():
+    """grep_context=0 returns only matching lines."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line 10", grep_context=0)
+        assert "   10  line 10" in result
+        assert "line 9" not in result
+        assert "line 11" not in result
+
+
+def test_read_file_grep_with_line_range():
+    """grep operates within start_line/end_line range with absolute line numbers."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line 10", start_line=8, end_line=15)
+        assert "1 matches in 20 lines" in result
+        assert "   10  line 10" in result
+
+
+def test_read_file_grep_with_line_range_no_match():
+    """grep within a range that excludes the match returns 0 matches."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line 10", start_line=1, end_line=5)
+        assert "0 matches" in result
+
+
+def test_read_file_grep_with_section():
+    """grep within an HTML section."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = '<div id="s1"><p>alpha</p>\n<p>beta match</p>\n<p>gamma</p></div>'
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file("doc.html", [tmp], section="s1", grep="match")
+        assert "section 's1'" in result
+        assert "1 matches" in result
+        assert "beta match" in result
+
+
+def test_read_file_grep_with_transform():
+    """transform runs before grep."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("hello\nworld\n")
+        result = read_file("data.txt", [tmp], transform=lambda t: t.upper(), grep="WORLD")
+        assert "1 matches" in result
+        assert "WORLD" in result
+
+
+def test_read_file_grep_with_max_chars():
+    """max_chars truncates grep output."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i} with some padding text" for i in range(1, 101))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line", max_chars=200)
+        assert "truncated" in result
+
+
+def test_read_file_grep_invalid_regex():
+    """Invalid regex returns error message, not exception."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("hello\n")
+        result = read_file("data.txt", [tmp], grep="[invalid")
+        assert "Error" in result
+        assert "grep pattern" in result
+
+
+def test_read_file_grep_case_insensitive():
+    """Case insensitive grep using inline flag."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("Hello World\ngoodbye\n")
+        result = read_file("data.txt", [tmp], grep="(?i)hello")
+        assert "1 matches" in result
+        assert "Hello World" in result
+
+
+def test_read_file_grep_rows_ignored():
+    """grep is ignored when rows is set (CSV mode)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.csv").write_text("name,value\nalpha,1\nbeta,2\n")
+        result = read_file("data.csv", [tmp], rows=[0, 1], grep="alpha")
+        # Should return CSV output, not grep output
+        assert "rows 0-1" in result
+        assert "matches" not in result
