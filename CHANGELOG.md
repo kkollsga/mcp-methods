@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.14
+
+- **`max_matches` parameter for `read_file` grep** — limit the number of matches returned when grepping within a file. When a dense document has 125 hits, `max_matches=20` returns the first 20 with context, and the header changes to "showing 20 of 125 matches". The ripgrep module already had `max_results`/`match_limit`; this brings the same control to single-file grep. Also improved truncation footers: when `max_chars` cuts grep output, the footer now includes the total match count (e.g., "125 matches, 279865 chars total") so you know whether to refine the pattern or increase the limit.
+
 ## 0.3.13
 
 - **`grep` parameter for `read_file`** — search within a single file and return only matching lines with context. Avoids reading entire large documents into context when only specific passages are needed. Supports `grep_context` (default 2) for surrounding lines, merges overlapping context windows, works with `section`, `start_line`/`end_line`, `transform`, and `max_chars`. Uses `--` separators between non-contiguous match groups, consistent with ripgrep output.

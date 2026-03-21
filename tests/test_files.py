@@ -589,3 +589,76 @@ def test_read_file_grep_rows_ignored():
         # Should return CSV output, not grep output
         assert "rows 0-1" in result
         assert "matches" not in result
+
+
+def test_read_file_grep_max_matches():
+    """max_matches limits how many matches are included."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 51))
+        (Path(tmp) / "data.txt").write_text(content)
+        # All 50 lines match "line", limit to 5
+        result = read_file("data.txt", [tmp], grep="line", max_matches=5)
+        assert "showing 5 of 50 matches" in result
+        # First 5 matches present (lines 1-5)
+        assert "    1  line 1" in result
+        assert "    5  line 5" in result
+        # Line 10 should NOT be present
+        assert "line 10" not in result
+
+
+def test_read_file_grep_max_matches_larger_than_total():
+    """max_matches larger than total matches shows normal header."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i}" for i in range(1, 21))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line 1$", max_matches=100)
+        assert "1 matches in 20 lines" in result
+        assert "showing" not in result
+
+
+def test_read_file_grep_max_matches_with_context():
+    """max_matches works with grep_context."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # Lines 1-30, matches on 5, 15, 25 — well separated
+        content = "\n".join(f"line {i}" for i in range(1, 31))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file(
+            "data.txt",
+            [tmp],
+            grep="line (5|15|25)$",
+            grep_context=1,
+            max_matches=2,
+        )
+        assert "showing 2 of 3 matches" in result
+        # First two matches with context
+        assert "line 5" in result
+        assert "line 15" in result
+        # Third match excluded
+        assert "line 25" not in result
+
+
+def test_read_file_grep_max_matches_with_section():
+    """max_matches works within HTML section grep."""
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = "\n".join(f"<p>item {i}</p>" for i in range(1, 11))
+        html = f'<div id="s1">\n{lines}\n</div>'
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file(
+            "doc.html",
+            [tmp],
+            section="s1",
+            grep="item",
+            max_matches=3,
+        )
+        assert "showing 3 of 10 matches" in result
+        assert "section 's1'" in result
+
+
+def test_read_file_grep_max_chars_shows_match_count():
+    """max_chars truncation footer includes total match count."""
+    with tempfile.TemporaryDirectory() as tmp:
+        content = "\n".join(f"line {i} with some padding text" for i in range(1, 101))
+        (Path(tmp) / "data.txt").write_text(content)
+        result = read_file("data.txt", [tmp], grep="line", max_chars=200)
+        assert "truncated" in result
+        assert "100 matches" in result

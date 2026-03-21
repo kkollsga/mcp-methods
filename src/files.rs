@@ -2,12 +2,19 @@ use pyo3::prelude::*;
 use regex::Regex;
 use std::path::PathBuf;
 
-/// Grep within a set of lines, returning formatted output with context and separators.
-///
-/// `lines` is a slice of `(line_number, content)` pairs where `line_number` is 1-based.
-/// Returns `(match_count, formatted_lines)` where formatted lines include
-/// `--` separators between non-contiguous context windows.
-fn grep_lines(lines: &[(usize, &str)], re: &Regex, context: usize) -> (usize, Vec<String>) {
+/// Return type for grep_lines: total matches found, matches shown, formatted lines.
+struct GrepResult {
+    total: usize,
+    shown: usize,
+    lines: Vec<String>,
+}
+
+fn grep_lines(
+    lines: &[(usize, &str)],
+    re: &Regex,
+    context: usize,
+    max_matches: Option<usize>,
+) -> GrepResult {
     // Find matching indices within the slice
     let match_indices: Vec<usize> = lines
         .iter()
@@ -16,13 +23,26 @@ fn grep_lines(lines: &[(usize, &str)], re: &Regex, context: usize) -> (usize, Ve
         .map(|(i, _)| i)
         .collect();
 
+    let total = match_indices.len();
+
     if match_indices.is_empty() {
-        return (0, Vec::new());
+        return GrepResult {
+            total: 0,
+            shown: 0,
+            lines: Vec::new(),
+        };
     }
+
+    // Apply max_matches limit
+    let used = match max_matches {
+        Some(limit) => &match_indices[..limit.min(total)],
+        None => &match_indices[..],
+    };
+    let shown = used.len();
 
     // Expand each match ±context, merge overlapping windows
     let mut windows: Vec<(usize, usize)> = Vec::new();
-    for &mi in &match_indices {
+    for &mi in used {
         let start = mi.saturating_sub(context);
         let end = (mi + context + 1).min(lines.len());
         if let Some(last) = windows.last_mut() {
@@ -45,7 +65,11 @@ fn grep_lines(lines: &[(usize, &str)], re: &Regex, context: usize) -> (usize, Ve
         }
     }
 
-    (match_indices.len(), output)
+    GrepResult {
+        total,
+        shown,
+        lines: output,
+    }
 }
 
 /// Extract an HTML element by its `id` attribute, returning the full element
@@ -121,6 +145,7 @@ fn extract_section(html: &str, section_id: &str) -> Option<String> {
     transform = None,
     grep = None,
     grep_context = None,
+    max_matches = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn read_file(
@@ -135,6 +160,7 @@ pub fn read_file(
     transform: Option<Py<PyAny>>,
     grep: Option<String>,
     grep_context: Option<usize>,
+    max_matches: Option<usize>,
 ) -> PyResult<String> {
     // Pre-canonicalize allowed directories once, reuse across both loops.
     let canon_dirs: Vec<PathBuf> = allowed_dirs
@@ -213,18 +239,23 @@ pub fn read_file(
                         .map(|(i, line)| (i + 1, *line))
                         .collect();
 
-                    let (match_count, formatted) = grep_lines(&numbered, &re, ctx);
+                    let gr = grep_lines(&numbered, &re, ctx, max_matches);
 
+                    let match_label = if gr.shown < gr.total {
+                        format!("showing {} of {} matches", gr.shown, gr.total)
+                    } else {
+                        format!("{} matches", gr.total)
+                    };
                     let header = format!(
-                        "{}  section '{}'  ({} matches in {} lines)",
-                        file_path, sid, match_count, section_total
+                        "{}  section '{}'  ({} in {} lines)",
+                        file_path, sid, match_label, section_total
                     );
 
-                    if formatted.is_empty() {
+                    if gr.lines.is_empty() {
                         return Ok(header);
                     }
 
-                    let mut text = format!("{}\n{}", header, formatted.join("\n"));
+                    let mut text = format!("{}\n{}", header, gr.lines.join("\n"));
 
                     if let Some(mc) = max_chars {
                         if text.len() > mc {
@@ -233,7 +264,10 @@ pub fn read_file(
                                 end -= 1;
                             }
                             text.truncate(end);
-                            text.push_str(&format!("\n\n[... truncated at {} chars]", mc));
+                            text.push_str(&format!(
+                                "\n\n[... truncated at {} chars — {} matches total]",
+                                mc, gr.total
+                            ));
                         }
                     }
 
@@ -326,18 +360,20 @@ pub fn read_file(
             .map(|(i, line)| (s + i, *line))
             .collect();
 
-        let (match_count, formatted) = grep_lines(&numbered_lines, &re, ctx);
+        let gr = grep_lines(&numbered_lines, &re, ctx, max_matches);
 
-        let header = format!(
-            "{}  ({} matches in {} lines)",
-            file_path, match_count, total
-        );
+        let match_label = if gr.shown < gr.total {
+            format!("showing {} of {} matches", gr.shown, gr.total)
+        } else {
+            format!("{} matches", gr.total)
+        };
+        let header = format!("{}  ({} in {} lines)", file_path, match_label, total);
 
-        if formatted.is_empty() {
+        if gr.lines.is_empty() {
             return Ok(header);
         }
 
-        let mut text = format!("{}\n{}", header, formatted.join("\n"));
+        let mut text = format!("{}\n{}", header, gr.lines.join("\n"));
 
         if let Some(mc) = max_chars {
             if text.len() > mc {
@@ -347,8 +383,9 @@ pub fn read_file(
                 }
                 text.truncate(end);
                 text.push_str(&format!(
-                    "\n\n[... truncated at {} chars — {} total]",
+                    "\n\n[... truncated at {} chars — {} matches, {} chars total]",
                     mc,
+                    gr.total,
                     raw.len()
                 ));
             }
