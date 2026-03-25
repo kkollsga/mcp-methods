@@ -1050,7 +1050,14 @@ pub fn fetch_issue_internal(repo: &str, number: u64) -> Result<(String, Option<S
     let mut parent = match fetch_single_discussion(repo, number, true, true) {
         Ok(val) => val,
         Err(e) if e.starts_with("Not found:") => {
-            return fetch_gh_discussion_internal(repo, number);
+            // REST 404 — might be a Discussion. Try GraphQL.
+            return match fetch_gh_discussion_internal(repo, number) {
+                Ok(result) => Ok(result),
+                Err(_) => Err(format!(
+                    "#{} not found in {} (checked Issues, PRs, and Discussions).",
+                    number, repo
+                )),
+            };
         }
         Err(e) => return Err(e),
     };
@@ -1438,8 +1445,20 @@ fn search_issues_dispatch(
         "discussion" => search_discussions_graphql(repo, query, state, sort, limit, labels),
         "issue" | "pr" => search_issues_internal(repo, query, kind, state, sort, limit, labels),
         _ => {
-            // kind="all": run both REST (issues+PRs) and GraphQL (Discussions)
-            let rest = search_issues_internal(repo, query, "all", state, sort, limit, labels);
+            // kind="all": run REST for issues + PRs, and GraphQL for Discussions.
+            // GitHub's search/issues endpoint requires a type qualifier, so we run
+            // two separate REST searches and merge the results.
+            let issues = search_issues_internal(repo, query, "issue", state, sort, limit, labels);
+            let prs = search_issues_internal(repo, query, "pr", state, sort, limit, labels);
+            let rest = match (
+                issues.starts_with("No results"),
+                prs.starts_with("No results"),
+            ) {
+                (true, true) => issues, // both empty — return the "No results" message
+                (true, false) => prs,
+                (false, true) => issues,
+                (false, false) => format!("{}\n\n{}", issues, prs),
+            };
             let gql = search_discussions_graphql(repo, query, state, sort, limit, labels);
             if gql.starts_with("No discussion") {
                 rest

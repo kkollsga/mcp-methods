@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.17
+
+- **Neutral error for non-existent items** — fetching a number that doesn't exist as an Issue, PR, or Discussion now returns `#N not found in repo (checked Issues, PRs, and Discussions)` instead of leaking the GraphQL fallback error (`"Could not resolve to a Discussion"`).
+
 ## 0.3.16
 
 - **Renamed `github_discussions` → `github_issues`** — one tool, three modes: FETCH (by number), SEARCH (by query), LIST (default). `github_discussions` remains as a backward-compat alias.
