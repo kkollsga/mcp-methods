@@ -10,7 +10,7 @@ from mcp_methods._mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
-    github_discussions,
+    github_issues,
     has_git_token,
     list_dir,
     read_file,
@@ -20,6 +20,9 @@ from mcp_methods._mcp_methods import (
     validate_repo,
 )
 from mcp_methods._utils import load_env, timed
+
+# Backward compat alias
+github_discussions = github_issues
 
 
 def ripgrep(
@@ -93,6 +96,7 @@ __all__ = [
     "compact_text",
     "compact_discussion",
     "git_api",
+    "github_issues",
     "github_discussions",
     "has_git_token",
     "detect_git_repo",

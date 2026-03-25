@@ -124,7 +124,7 @@ impl ElementCache {
                 if !available.is_empty() {
                     msg.push_str(&format!("\nAvailable: {}", available.join(", ")));
                 } else {
-                    msg.push_str("\nNo cached elements. Call fetch_discussion first.");
+                    msg.push_str("\nNo cached elements. Call fetch_issue first.");
                 }
                 return msg;
             }
@@ -316,7 +316,7 @@ impl ElementCache {
     /// entry point for fetching discussions with caching.
     #[pyo3(signature = (repo, number, *, element_id=None, lines=None, grep=None, context=3, refresh=false))]
     #[allow(clippy::too_many_arguments)]
-    pub fn fetch_discussion(
+    pub fn fetch_issue(
         &mut self,
         repo: &str,
         number: u64,

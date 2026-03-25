@@ -12,7 +12,7 @@ from mcp_methods import (
     detect_git_repo,
     extract_github_refs,
     git_api,
-    github_discussions,
+    github_issues,
     has_git_token,
     ripgrep_lines,
     validate_repo,
@@ -150,13 +150,13 @@ def test_element_cache_retrieve():
     assert "not found" in result.lower()
 
 
-def test_element_cache_fetch_discussion_no_token():
+def test_element_cache_fetch_issue_no_token():
     cache = ElementCache()
     env = os.environ.copy()
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
     with patch.dict(os.environ, env, clear=True):
-        result = cache.fetch_discussion("org/repo", 1)
+        result = cache.fetch_issue("org/repo", 1)
         assert "token" in result.lower()
 
 
@@ -164,7 +164,7 @@ def test_element_cache_refresh_returns_cached():
     """When cache has entries and refresh=False, returns summary instead of re-fetching."""
     cache = ElementCache()
     cache.store_elements("org/repo", 1, json.dumps({"cb_1": {"content": "x"}}))
-    result = cache.fetch_discussion("org/repo", 1)
+    result = cache.fetch_issue("org/repo", 1)
     assert "Cached" in result
     assert "cb_1" in result
     assert "refresh=True" in result
@@ -177,40 +177,40 @@ def test_element_cache_refresh_empty_fetches():
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
     with patch.dict(os.environ, env, clear=True):
-        result = cache.fetch_discussion("org/repo", 1)
+        result = cache.fetch_issue("org/repo", 1)
         assert "token" in result.lower()  # no cache, tried to fetch
 
 
 # ---------------------------------------------------------------------------
-# github_discussions
+# github_issues
 # ---------------------------------------------------------------------------
 
 
-def test_github_discussions_invalid_repo():
-    result = github_discussions(repo="bad-repo", number=1)
+def test_github_issues_invalid_repo():
+    result = github_issues(repo="bad-repo", number=1)
     assert "Invalid repo" in result
 
 
-def test_github_discussions_no_token():
+def test_github_issues_no_token():
     env = os.environ.copy()
     env.pop("GITHUB_TOKEN", None)
     env.pop("GH_TOKEN", None)
     with patch.dict(os.environ, env, clear=True):
         try:
-            result = github_discussions(repo="org/repo", number=1)
+            result = github_issues(repo="org/repo", number=1)
             assert "token" in result.lower()
         except RuntimeError as e:
             assert "token" in str(e).lower()
 
 
-def test_github_discussions_list_invalid_repo():
-    result = github_discussions(repo="bad-repo", kind="issue")
+def test_github_issues_list_invalid_repo():
+    result = github_issues(repo="bad-repo", kind="issue")
     assert "Invalid repo" in result
 
 
-def test_github_discussions_auto_detect_repo():
+def test_github_issues_auto_detect_repo():
     # In our git repo, with no number, should attempt listing (may fail without token)
-    result = github_discussions(kind="issue", limit=1)
+    result = github_issues(kind="issue", limit=1)
     # Either lists results or returns an error about token/rate limit
     assert isinstance(result, str)
     assert len(result) > 0
@@ -584,3 +584,28 @@ def test_ripgrep_lines_overlapping_context():
 def test_git_api_invalid_repo():
     result = git_api("bad-repo", "pulls")
     assert "Invalid repo" in result
+
+
+# ---------------------------------------------------------------------------
+# github_issues search mode
+# ---------------------------------------------------------------------------
+
+
+def test_github_issues_search_invalid_repo():
+    result = github_issues(repo="bad-repo", query="test")
+    assert "Invalid repo" in result
+
+
+def test_github_issues_search_no_token():
+    env = os.environ.copy()
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    with patch.dict(os.environ, env, clear=True):
+        result = github_issues(repo="org/repo", query="test")
+        assert "token" in result.lower()
+
+
+def test_github_issues_backward_compat_alias():
+    from mcp_methods import github_discussions
+
+    assert github_discussions is github_issues

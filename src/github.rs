@@ -1131,31 +1131,35 @@ pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> S
     git_api_internal(repo, path, truncate_at)
 }
 
-/// Fetch or list GitHub issues/PRs.
+/// Fetch, search, or list GitHub issues/PRs/Discussions.
 ///
-/// When `number` is given, fetches a single discussion (same as old `git_issue`).
-/// When `number` is None, lists discussions matching the given filters.
+/// Mode determined by parameters:
+/// - `number` given → FETCH a single issue/PR/Discussion
+/// - `query` given → SEARCH via GitHub search API
+/// - neither → LIST recent items
 #[pyfunction]
 #[pyo3(signature = (
     *,
     repo = None,
     number = None,
+    query = None,
     kind = "all",
     state = "open",
-    sort = "created",
+    sort = None,
     limit = 20,
     labels = None,
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn github_discussions(
+pub fn github_issues(
     _py: Python<'_>,
     repo: Option<&str>,
     number: Option<u64>,
+    query: Option<&str>,
     kind: &str,
     state: &str,
-    sort: &str,
+    sort: Option<&str>,
     limit: usize,
-    labels: Option<Vec<String>>,
+    labels: Option<&str>,
 ) -> PyResult<String> {
     // Resolve repo: explicit or auto-detect from cwd
     let repo_str = match repo {
@@ -1173,29 +1177,325 @@ pub fn github_discussions(
         return Ok(err);
     }
 
-    match number {
-        Some(num) => {
-            // Single discussion mode
+    match (number, query) {
+        (Some(num), _) => {
+            // FETCH mode
             let (text, _cache) = fetch_issue_internal(&repo_str, num)
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             Ok(text)
         }
-        None => {
-            // Listing mode
-            Ok(list_discussions_internal(
+        (None, Some(q)) => {
+            // SEARCH mode
+            Ok(search_issues_dispatch(
+                &repo_str, q, kind, state, sort, limit, labels,
+            ))
+        }
+        (None, None) => {
+            // LIST mode
+            Ok(list_issues_internal(
                 &repo_str,
                 kind,
                 state,
-                sort,
+                sort.unwrap_or("created"),
                 limit,
-                labels.as_deref(),
+                labels,
             ))
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Discussion listing
+// Search
+// ---------------------------------------------------------------------------
+
+/// Build GitHub search qualifier string from structured parameters.
+fn build_search_qualifiers(repo: &str, kind: &str, state: &str, labels: Option<&str>) -> String {
+    let mut q = format!(" repo:{}", repo);
+    match kind {
+        "issue" => q.push_str(" type:issue"),
+        "pr" => q.push_str(" type:pr"),
+        _ => {} // "all" / "discussion" — no type qualifier
+    }
+    match state {
+        "open" => q.push_str(" state:open"),
+        "closed" => q.push_str(" state:closed"),
+        _ => {} // "all"
+    }
+    if let Some(lbls) = labels {
+        for label in lbls.split(',') {
+            let label = label.trim();
+            if !label.is_empty() {
+                if label.contains(' ') {
+                    q.push_str(&format!(" label:\"{}\"", label));
+                } else {
+                    q.push_str(&format!(" label:{}", label));
+                }
+            }
+        }
+    }
+    q
+}
+
+/// SEARCH mode: issues + PRs via REST search/issues API.
+fn search_issues_internal(
+    repo: &str,
+    user_query: &str,
+    kind: &str,
+    state: &str,
+    sort: Option<&str>,
+    limit: usize,
+    labels: Option<&str>,
+) -> String {
+    let q = format!(
+        "{}{}",
+        user_query,
+        build_search_qualifiers(repo, kind, state, labels)
+    );
+    let per_page = limit.min(100);
+
+    let mut req = AGENT
+        .get(&format!("{}/search/issues", GITHUB_API))
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "mcp-methods")
+        .query("q", &q)
+        .query("per_page", &per_page.to_string());
+
+    if let Some(s) = sort {
+        req = req.query("sort", s);
+    }
+    // When sort is None, GitHub defaults to "best match" (relevance)
+
+    if let Some(token) = auth_token() {
+        req = req.set("Authorization", &format!("Bearer {}", token));
+    }
+
+    match req.call() {
+        Ok(resp) => {
+            let data: Value = match resp.into_json() {
+                Ok(v) => v,
+                Err(e) => return format!("JSON parse error: {}", e),
+            };
+            format_search_results(repo, user_query, &data)
+        }
+        Err(ureq::Error::Status(422, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            format!("GitHub search validation error: {}", body)
+        }
+        Err(ureq::Error::Status(403, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            if body.to_lowercase().contains("rate limit") {
+                "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN for higher limits."
+                    .to_string()
+            } else {
+                format!("GitHub API forbidden: {}", body)
+            }
+        }
+        Err(e) => format!("GitHub search error: {}", e),
+    }
+}
+
+/// SEARCH mode: Discussions via GraphQL search(type: DISCUSSION).
+fn search_discussions_graphql(
+    repo: &str,
+    user_query: &str,
+    state: &str,
+    sort: Option<&str>,
+    limit: usize,
+    labels: Option<&str>,
+) -> String {
+    let qualifiers = build_search_qualifiers(repo, "discussion", state, labels);
+    let q = format!("{}{}", user_query, qualifiers);
+    let per_page = limit.min(100);
+
+    // GraphQL search doesn't support sort directly in the query — the search
+    // endpoint always returns by relevance. sort is ignored for Discussions.
+    let _ = sort;
+
+    let query = r#"query($q: String!, $first: Int!) {
+  search(type: DISCUSSION, query: $q, first: $first) {
+    discussionCount
+    nodes {
+      ... on Discussion {
+        number
+        title
+        author { login }
+        createdAt
+        closed
+        comments { totalCount }
+        category { name }
+        labels(first: 5) { nodes { name } }
+        answer { id }
+      }
+    }
+  }
+}"#;
+
+    let vars = json!({"q": q, "first": per_page as i64});
+
+    let data = match gh_graphql(query, vars) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+
+    let total = data
+        .get("search")
+        .and_then(|s| s.get("discussionCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let nodes = match data
+        .get("search")
+        .and_then(|s| s.get("nodes"))
+        .and_then(|v| v.as_array())
+    {
+        Some(n) if !n.is_empty() => n,
+        _ => return format!("No discussion results for \"{}\" in {}.", user_query, repo),
+    };
+
+    let mut out = format!(
+        "{} discussion{} (of {}) for \"{}\" in {}:\n",
+        nodes.len(),
+        if nodes.len() == 1 { "" } else { "s" },
+        total,
+        user_query,
+        repo,
+    );
+
+    for d in nodes {
+        let number = d.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        if number == 0 {
+            continue; // skip non-Discussion nodes in union result
+        }
+        let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let author = gql_author(d);
+        let date = d
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.get(..10))
+            .unwrap_or("");
+        let comment_count = d
+            .get("comments")
+            .and_then(|c| c.get("totalCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let comments = if comment_count > 0 {
+            format!(
+                ", {} comment{}",
+                comment_count,
+                if comment_count == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let category = d
+            .get("category")
+            .and_then(|c| c.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let cat_tag = if category.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", category)
+        };
+        let label_str: String = d
+            .get("labels")
+            .and_then(|l| l.get("nodes"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" [{}]", s))
+            .unwrap_or_default();
+        let answered = if d.get("answer").map(|v| !v.is_null()).unwrap_or(false) {
+            " [answered]"
+        } else {
+            ""
+        };
+
+        out.push_str(&format!(
+            "  #{}{}{}{} {} — {} ({}{})\n",
+            number, cat_tag, label_str, answered, title, author, date, comments
+        ));
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Route SEARCH mode to the right backend based on `kind`.
+fn search_issues_dispatch(
+    repo: &str,
+    query: &str,
+    kind: &str,
+    state: &str,
+    sort: Option<&str>,
+    limit: usize,
+    labels: Option<&str>,
+) -> String {
+    match kind {
+        "discussion" => search_discussions_graphql(repo, query, state, sort, limit, labels),
+        "issue" | "pr" => search_issues_internal(repo, query, kind, state, sort, limit, labels),
+        _ => {
+            // kind="all": run both REST (issues+PRs) and GraphQL (Discussions)
+            let rest = search_issues_internal(repo, query, "all", state, sort, limit, labels);
+            let gql = search_discussions_graphql(repo, query, state, sort, limit, labels);
+            if gql.starts_with("No discussion") {
+                rest
+            } else if rest.starts_with("No results") {
+                gql
+            } else {
+                format!("{}\n\n{}", rest, gql)
+            }
+        }
+    }
+}
+
+/// Format REST search/issues results.
+fn format_search_results(repo: &str, user_query: &str, data: &Value) -> String {
+    let total = data
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let items = match data.get("items").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return format!("No results for \"{}\" in {}.", user_query, repo),
+    };
+
+    let mut out = format!(
+        "{} result{} (of {}) for \"{}\" in {}:\n",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" },
+        total,
+        user_query,
+        repo,
+    );
+
+    for item in items {
+        let is_pr = item.get("pull_request").is_some();
+        if is_pr {
+            let number = item.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+            let title = json_str(item, "title");
+            let author = json_author(item);
+            let labels = format_label_tags(item);
+            let date = format_date(item, "created_at");
+            let comments = format_comments(item);
+            out.push_str(&format!(
+                "  #{}{} [PR] {} — {} ({}{})\n",
+                number, labels, title, author, date, comments
+            ));
+        } else {
+            out.push_str(&format_issue_line(item));
+            out.push('\n');
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Listing
 // ---------------------------------------------------------------------------
 
 fn list_discussions_graphql(repo: &str, state: &str, sort: &str, per_page: usize) -> String {
@@ -1330,13 +1630,13 @@ fn list_discussions_graphql(repo: &str, state: &str, sort: &str, per_page: usize
     out.trim_end().to_string()
 }
 
-fn list_discussions_internal(
+fn list_issues_internal(
     repo: &str,
     kind: &str,
     state: &str,
     sort: &str,
     limit: usize,
-    labels: Option<&[String]>,
+    labels: Option<&str>,
 ) -> String {
     let per_page = limit.min(100);
     let direction = "desc";
@@ -1367,7 +1667,7 @@ fn list_issues_only(
     sort: &str,
     direction: &str,
     per_page: usize,
-    labels: Option<&[String]>,
+    labels: Option<&str>,
 ) -> String {
     let mut path = format!(
         "repos/{}/issues?state={}&sort={}&direction={}&per_page={}",
@@ -1375,7 +1675,7 @@ fn list_issues_only(
     );
     if let Some(lbls) = labels {
         if !lbls.is_empty() {
-            path.push_str(&format!("&labels={}", lbls.join(",")));
+            path.push_str(&format!("&labels={}", lbls));
         }
     }
     match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
@@ -1398,7 +1698,7 @@ fn list_all(
     sort: &str,
     direction: &str,
     per_page: usize,
-    labels: Option<&[String]>,
+    labels: Option<&str>,
 ) -> String {
     let mut path = format!(
         "repos/{}/issues?state={}&sort={}&direction={}&per_page={}",
@@ -1406,7 +1706,7 @@ fn list_all(
     );
     if let Some(lbls) = labels {
         if !lbls.is_empty() {
-            path.push_str(&format!("&labels={}", lbls.join(",")));
+            path.push_str(&format!("&labels={}", lbls));
         }
     }
     match gh_get(&format!("{}/{}", GITHUB_API, &path)) {

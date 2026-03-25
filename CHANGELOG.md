@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.16
+
+- **Renamed `github_discussions` → `github_issues`** — one tool, three modes: FETCH (by number), SEARCH (by query), LIST (default). `github_discussions` remains as a backward-compat alias.
+- **Search mode** — `query="datatree coordinates"` searches via REST `search/issues` for issues+PRs, and GraphQL `search(type: DISCUSSION)` for Discussions. `kind` routes to the right API; `kind="all"` runs both and concatenates results. Sort defaults to relevance for search, `"created"` for listing.
+- **Renamed `ElementCache.fetch_discussion` → `fetch_issue`**.
+- **`labels` parameter simplified** — now a comma-separated string (`"bug,P0"`) instead of `Vec<String>`.
+- **`sort` parameter now optional** — defaults depend on mode: `None` (relevance) for search, `"created"` for listing.
+
 ## 0.3.15
 
 - **GitHub Discussions support (GraphQL)** — `fetch_discussion` and `github_discussions` now transparently handle GitHub Discussions, not just Issues and PRs. When a REST lookup returns 404, the library falls back to the GraphQL API to fetch the Discussion with full threaded comments (top-level + nested replies), category, and answered status. Listing mode supports `kind="discussion"` to query Discussions via GraphQL with state and sort filtering. Ref collection also extracts GitHub references from threaded reply bodies.
