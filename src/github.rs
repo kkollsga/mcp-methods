@@ -151,6 +151,54 @@ fn gh_get(endpoint: &str) -> Result<Value, String> {
     }
 }
 
+fn gh_graphql(query: &str, variables: Value) -> Result<Value, String> {
+    let token = auth_token().ok_or(
+        "GitHub token required for Discussions (GraphQL API). \
+         Set GITHUB_TOKEN or GH_TOKEN.",
+    )?;
+
+    let body = json!({
+        "query": query,
+        "variables": variables,
+    });
+
+    let resp = AGENT
+        .post("https://api.github.com/graphql")
+        .set("Authorization", &format!("Bearer {}", token))
+        .set("User-Agent", "mcp-methods")
+        .send_json(&body)
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) => {
+                "GitHub token is invalid or expired. Check GITHUB_TOKEN / GH_TOKEN.".to_string()
+            }
+            ureq::Error::Status(code, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                format!("GitHub GraphQL error ({}): {}", code, body)
+            }
+            other => format!("GitHub GraphQL error: {}", other),
+        })?;
+
+    let result: Value = resp
+        .into_json()
+        .map_err(|e| format!("GraphQL JSON parse error: {}", e))?;
+
+    // GraphQL returns errors in {"errors": [...]} even on HTTP 200
+    if let Some(errors) = result.get("errors").and_then(|v| v.as_array()) {
+        if let Some(first) = errors.first() {
+            let msg = first
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown GraphQL error");
+            return Err(format!("GitHub GraphQL error: {}", msg));
+        }
+    }
+
+    result
+        .get("data")
+        .cloned()
+        .ok_or_else(|| "GitHub GraphQL: no 'data' in response".to_string())
+}
+
 fn parse_link_rel(link: &str, rel: &str) -> Option<String> {
     let tag = format!("rel=\"{}\"", rel);
     for part in link.split(',') {
@@ -482,7 +530,238 @@ fn build_reviews(reviews_raw: &[Value], review_comments_raw: &[Value]) -> Vec<Va
 }
 
 // ---------------------------------------------------------------------------
-// Discussion fetching (parallel HTTP, no GIL)
+// GitHub Discussions (GraphQL)
+// ---------------------------------------------------------------------------
+
+const DISCUSSION_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    discussion(number: $number) {
+      number
+      title
+      body
+      author { login }
+      authorAssociation
+      createdAt
+      updatedAt
+      url
+      closed
+      locked
+      answer { id }
+      labels(first: 20) { nodes { name } }
+      category { name }
+      comments(first: 100) {
+        totalCount
+        nodes {
+          author { login }
+          authorAssociation
+          createdAt
+          body
+          isAnswer
+          replies(first: 100) {
+            nodes {
+              author { login }
+              authorAssociation
+              createdAt
+              body
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+fn gql_author(val: &Value) -> String {
+    val.get("author")
+        .and_then(|u| u.get("login"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(deleted)")
+        .to_string()
+}
+
+fn gql_body(val: &Value) -> Value {
+    match val.get("body").and_then(|v| v.as_str()) {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Value::Null
+            } else {
+                Value::String(trimmed.to_string())
+            }
+        }
+        None => Value::Null,
+    }
+}
+
+fn fetch_discussion_graphql(repo: &str, number: u64) -> Result<Value, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| "Invalid repo format for GraphQL".to_string())?;
+
+    let data = gh_graphql(
+        DISCUSSION_QUERY,
+        json!({"owner": owner, "repo": name, "number": number as i64}),
+    )?;
+
+    let disc = data
+        .get("repository")
+        .and_then(|r| r.get("discussion"))
+        .ok_or_else(|| format!("Discussion #{} not found in {}", number, repo))?;
+
+    if disc.is_null() {
+        return Err(format!("Discussion #{} not found in {}", number, repo));
+    }
+
+    let closed = disc
+        .get("closed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_answer = disc.get("answer").map(|v| !v.is_null()).unwrap_or(false);
+
+    let labels: Vec<Value> = disc
+        .get("labels")
+        .and_then(|l| l.get("nodes"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    l.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| Value::String(s.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let category = disc
+        .get("category")
+        .and_then(|c| c.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let comment_count = disc
+        .get("comments")
+        .and_then(|c| c.get("totalCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // Build threaded comments
+    let comments: Vec<Value> = disc
+        .get("comments")
+        .and_then(|c| c.get("nodes"))
+        .and_then(|v| v.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|c| {
+                    let replies: Vec<Value> = c
+                        .get("replies")
+                        .and_then(|r| r.get("nodes"))
+                        .and_then(|v| v.as_array())
+                        .map(|rps| {
+                            rps.iter()
+                                .map(|rp| {
+                                    json!({
+                                        "author": gql_author(rp),
+                                        "author_association": rp.get("authorAssociation")
+                                            .and_then(|v| v.as_str()).unwrap_or(""),
+                                        "created_at": rp.get("createdAt")
+                                            .and_then(|v| v.as_str()).unwrap_or(""),
+                                        "body": gql_body(rp),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let is_answer = c.get("isAnswer").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    let mut comment = json!({
+                        "author": gql_author(c),
+                        "author_association": c.get("authorAssociation")
+                            .and_then(|v| v.as_str()).unwrap_or(""),
+                        "created_at": c.get("createdAt")
+                            .and_then(|v| v.as_str()).unwrap_or(""),
+                        "body": gql_body(c),
+                    });
+
+                    if is_answer {
+                        comment["is_answer"] = Value::Bool(true);
+                    }
+                    if !replies.is_empty() {
+                        comment["replies"] = Value::Array(replies);
+                    }
+
+                    comment
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut result = json!({
+        "type": "discussion",
+        "number": number,
+        "repo": repo,
+        "title": disc.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+        "state": if closed { "closed" } else { "open" },
+        "author": gql_author(disc),
+        "author_association": disc.get("authorAssociation")
+            .and_then(|v| v.as_str()).unwrap_or(""),
+        "created_at": disc.get("createdAt").and_then(|v| v.as_str()).unwrap_or(""),
+        "updated_at": disc.get("updatedAt").and_then(|v| v.as_str()).unwrap_or(""),
+        "url": disc.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+        "labels": labels,
+        "body": gql_body(disc),
+        "comment_count": comment_count,
+        "comments": comments,
+    });
+
+    if !category.is_empty() {
+        result["category"] = Value::String(category);
+    }
+    if has_answer {
+        result["answered"] = Value::Bool(true);
+    }
+
+    Ok(result)
+}
+
+/// Fetch a GitHub Discussion via GraphQL, collect refs, compact.
+/// Parallel to `fetch_issue_internal` but for Discussions.
+fn fetch_gh_discussion_internal(
+    repo: &str,
+    number: u64,
+) -> Result<(String, Option<String>), String> {
+    let mut parent = fetch_discussion_graphql(repo, number)?;
+
+    // Collect GitHub refs
+    let seen: HashSet<(String, u64)> = [(repo.to_string(), number)].into();
+    let all_refs = collect_refs_from_discussion(&parent, repo);
+    let mut refs: Vec<(String, u64)> = all_refs.difference(&seen).cloned().collect();
+    refs.sort();
+    refs.truncate(MAX_RELATED);
+
+    if !refs.is_empty() {
+        let ref_list: Vec<Value> = refs
+            .iter()
+            .map(|(r, n)| json!({"repo": r, "number": n}))
+            .collect();
+        parent["related_refs"] = Value::Array(ref_list);
+    }
+
+    // Compact
+    let parent_json = serde_json::to_string(&parent).map_err(|e| format!("JSON error: {}", e))?;
+    let cache_json = serde_json::to_string(&json!({"_n": 0})).unwrap();
+    let (compacted, cache_out) =
+        compact::compact_discussion(&parent_json, Some(&cache_json), None, None)
+            .map_err(|e| format!("Compaction error: {}", e))?;
+
+    Ok((compacted, cache_out))
+}
+
+// ---------------------------------------------------------------------------
+// Issue/PR fetching (parallel HTTP, no GIL)
 // ---------------------------------------------------------------------------
 
 fn fetch_single_discussion(
@@ -686,6 +965,16 @@ fn iter_discussion_texts(result: &Value) -> Vec<&str> {
                         texts.push(body);
                     }
                 }
+                // Direct replies on comments (Discussions — threaded)
+                if let Some(replies) = item.get("replies").and_then(|v| v.as_array()) {
+                    for rp in replies {
+                        if let Some(body) = rp.get("body").and_then(|v| v.as_str()) {
+                            if !body.is_empty() {
+                                texts.push(body);
+                            }
+                        }
+                    }
+                }
                 // Inline comments (reviews only)
                 if let Some(inlines) = item.get("inline_comments").and_then(|v| v.as_array()) {
                     for ic in inlines {
@@ -757,8 +1046,14 @@ pub fn fetch_issue_internal(repo: &str, number: u64) -> Result<(String, Option<S
         );
     }
 
-    // Fetch parent discussion
-    let mut parent = fetch_single_discussion(repo, number, true, true)?;
+    // Fetch parent: try REST (issue/PR) first; fall back to GraphQL (Discussion) on 404
+    let mut parent = match fetch_single_discussion(repo, number, true, true) {
+        Ok(val) => val,
+        Err(e) if e.starts_with("Not found:") => {
+            return fetch_gh_discussion_internal(repo, number);
+        }
+        Err(e) => return Err(e),
+    };
 
     // Collect GitHub refs
     let seen: HashSet<(String, u64)> = [(repo.to_string(), number)].into();
@@ -903,6 +1198,138 @@ pub fn github_discussions(
 // Discussion listing
 // ---------------------------------------------------------------------------
 
+fn list_discussions_graphql(repo: &str, state: &str, sort: &str, per_page: usize) -> String {
+    let (owner, name) = match repo.split_once('/') {
+        Some(pair) => pair,
+        None => return format!("Invalid repo format: {}", repo),
+    };
+
+    let order_field = match sort {
+        "updated" => "UPDATED_AT",
+        _ => "CREATED_AT",
+    };
+
+    let states: Value = match state {
+        "open" => json!(["OPEN"]),
+        "closed" => json!(["CLOSED"]),
+        _ => Value::Null,
+    };
+
+    // orderBy uses an enum value, so interpolate it into the query string
+    let query = format!(
+        r#"query($owner: String!, $repo: String!, $first: Int!, $states: [DiscussionState!]) {{
+  repository(owner: $owner, name: $repo) {{
+    discussions(first: $first, states: $states, orderBy: {{field: {}, direction: DESC}}) {{
+      nodes {{
+        number
+        title
+        author {{ login }}
+        createdAt
+        closed
+        comments {{ totalCount }}
+        category {{ name }}
+        labels(first: 5) {{ nodes {{ name }} }}
+        answer {{ id }}
+      }}
+    }}
+  }}
+}}"#,
+        order_field
+    );
+
+    let vars = json!({
+        "owner": owner,
+        "repo": name,
+        "first": per_page.min(100) as i64,
+        "states": states,
+    });
+
+    let data = match gh_graphql(&query, vars) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+
+    let nodes = match data
+        .get("repository")
+        .and_then(|r| r.get("discussions"))
+        .and_then(|d| d.get("nodes"))
+        .and_then(|v| v.as_array())
+    {
+        Some(n) if !n.is_empty() => n,
+        _ => return format!("No {} discussions in {}.", state, repo),
+    };
+
+    let mut out = format!(
+        "{} discussion{} in {} ({}):\n",
+        nodes.len(),
+        if nodes.len() == 1 { "" } else { "s" },
+        repo,
+        state
+    );
+
+    for d in nodes {
+        let number = d.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let author = gql_author(d);
+        let date = d
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.get(..10))
+            .unwrap_or("");
+        let comment_count = d
+            .get("comments")
+            .and_then(|c| c.get("totalCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let comments = if comment_count > 0 {
+            format!(
+                ", {} comment{}",
+                comment_count,
+                if comment_count == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let category = d
+            .get("category")
+            .and_then(|c| c.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let cat_tag = if category.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", category)
+        };
+        let label_str: String = d
+            .get("labels")
+            .and_then(|l| l.get("nodes"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" [{}]", s))
+            .unwrap_or_default();
+        let answered = if d.get("answer").map(|v| !v.is_null()).unwrap_or(false) {
+            " [answered]"
+        } else {
+            ""
+        };
+        let is_closed = d.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let state_tag = if is_closed { " [closed]" } else { "" };
+
+        out.push_str(&format!(
+            "  #{}{}{}{}{} {} — {} ({}{})\n",
+            number, cat_tag, label_str, answered, state_tag, title, author, date, comments
+        ));
+    }
+
+    out.trim_end().to_string()
+}
+
 fn list_discussions_internal(
     repo: &str,
     kind: &str,
@@ -917,6 +1344,7 @@ fn list_discussions_internal(
     match kind {
         "pr" => list_pulls(repo, state, sort, direction, per_page),
         "issue" => list_issues_only(repo, state, sort, direction, per_page, labels),
+        "discussion" => list_discussions_graphql(repo, state, sort, per_page),
         _ => list_all(repo, state, sort, direction, per_page, labels),
     }
 }
