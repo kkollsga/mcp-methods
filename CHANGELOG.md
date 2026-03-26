@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.19
+
+- **Built-in `html_to_text` function** — converts HTML to clean, readable text optimized for LLM consumption. Strips `<head>`, `<script>`, `<style>`, and comments. Converts headings to markdown `#` prefixes, list items to `- ` bullets, bold/strong to `**text**`, images to `[image: alt]`, tables to tab-separated text, and links to plain text. Decodes 75+ named HTML entities (including Scandinavian æøå) plus numeric/hex references. Available as a standalone function (`from mcp_methods import html_to_text`) and as a string-based transform on `read_file` (`transform="html"`).
+- **String-based `transform` on `read_file`** — `transform` now accepts `"html"` in addition to callables. The built-in html transform runs *after* section extraction (so `id` attributes remain available) but *before* grep (so patterns match clean text, not raw tags). Callable transforms preserve existing behaviour.
+
 ## 0.3.17
 
 - **Neutral error for non-existent items** — fetching a number that doesn't exist as an Issue, PR, or Discussion now returns `#N not found in repo (checked Issues, PRs, and Discussions)` instead of leaking the GraphQL fallback error (`"Could not resolve to a Discussion"`).

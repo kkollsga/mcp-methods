@@ -212,10 +212,32 @@ pub fn read_file(
         Err(e) => return Ok(format!("Error reading file: {}", e)),
     };
 
-    // Apply transform
-    let raw = if let Some(ref tf) = transform {
-        let result: String = tf.call1(py, (raw,))?.extract(py)?;
-        result
+    // Determine transform type: string name → built-in, callable → user function
+    let html_transform = if let Some(ref tf) = transform {
+        match tf.extract::<String>(py) {
+            Ok(name) => match name.as_str() {
+                "html" => true,
+                other => {
+                    return Ok(format!(
+                        "Error: unknown transform '{}'. Available: html",
+                        other
+                    ))
+                }
+            },
+            Err(_) => false, // not a string → treat as callable below
+        }
+    } else {
+        false
+    };
+
+    // Apply callable transform (before section extraction, preserving existing behaviour)
+    let raw = if !html_transform {
+        if let Some(ref tf) = transform {
+            let result: String = tf.call1(py, (raw,))?.extract(py)?;
+            result
+        } else {
+            raw
+        }
     } else {
         raw
     };
@@ -224,6 +246,13 @@ pub fn read_file(
     if let Some(ref sid) = section {
         return match extract_section(&raw, sid) {
             Some(fragment) => {
+                // Apply html transform after section extraction (ids still present in raw HTML)
+                let fragment = if html_transform {
+                    crate::html::html_to_text_impl(&fragment)
+                } else {
+                    fragment
+                };
+
                 // If grep is active, search within the section content
                 if let Some(ref pattern) = grep {
                     let re = match Regex::new(pattern) {
@@ -329,6 +358,13 @@ pub fn read_file(
             return Ok(text);
         }
     }
+
+    // Apply html transform for non-section, non-CSV path
+    let raw = if html_transform {
+        crate::html::html_to_text_impl(&raw)
+    } else {
+        raw
+    };
 
     let all_lines: Vec<&str> = raw.lines().collect();
     let total = all_lines.len();

@@ -3,7 +3,7 @@
 import tempfile
 from pathlib import Path
 
-from mcp_methods import read_file, ripgrep, ripgrep_files
+from mcp_methods import html_to_text, read_file, ripgrep, ripgrep_files
 
 
 def _make_tree(tmp: Path) -> None:
@@ -662,3 +662,205 @@ def test_read_file_grep_max_chars_shows_match_count():
         result = read_file("data.txt", [tmp], grep="line", max_chars=200)
         assert "truncated" in result
         assert "100 matches" in result
+
+
+# ---------------------------------------------------------------------------
+# html_to_text — standalone function
+# ---------------------------------------------------------------------------
+
+
+def test_html_to_text_strips_head():
+    html = "<html><head><title>T</title><style>body{}</style></head><body>Hello</body></html>"
+    assert html_to_text(html) == "Hello"
+
+
+def test_html_to_text_headings():
+    html = "<h1>Title</h1><h3>Sub</h3><p>Text</p>"
+    result = html_to_text(html)
+    assert "# Title" in result
+    assert "### Sub" in result
+    assert "Text" in result
+
+
+def test_html_to_text_list_items():
+    html = "<ul><li>Alpha</li><li>Beta</li></ul>"
+    result = html_to_text(html)
+    assert "- Alpha" in result
+    assert "- Beta" in result
+
+
+def test_html_to_text_bold():
+    html = "<p>Hello <strong>world</strong> and <b>rust</b></p>"
+    result = html_to_text(html)
+    assert "**world**" in result
+    assert "**rust**" in result
+
+
+def test_html_to_text_images():
+    html = '<img alt="logo" src="logo.png"><img src="spacer.gif">'
+    result = html_to_text(html)
+    assert "[image: logo]" in result
+    assert "spacer" not in result
+
+
+def test_html_to_text_tables():
+    html = "<table><tr><th>Name</th><th>Age</th></tr><tr><td>Alice</td><td>30</td></tr></table>"
+    result = html_to_text(html)
+    assert "Name" in result
+    assert "Alice" in result
+    assert "30" in result
+
+
+def test_html_to_text_entities():
+    html = "<p>&lt;tag&gt; &amp; &quot;quotes&quot; &#169; &#x00A7;</p>"
+    result = html_to_text(html)
+    assert "<tag>" in result
+    assert '& "quotes"' in result
+    assert "\u00a9" in result  # ©
+    assert "\u00a7" in result  # §
+
+
+def test_html_to_text_double_encoded_entities():
+    """&amp;lt; should become literal &lt;, not <"""
+    html = "<p>&amp;lt; test</p>"
+    result = html_to_text(html)
+    assert "&lt;" in result
+    assert "< test" not in result
+
+
+def test_html_to_text_scripts_removed():
+    html = "<p>A</p><script>alert('x')</script><style>.a{}</style><p>B</p>"
+    result = html_to_text(html)
+    assert "A" in result
+    assert "B" in result
+    assert "alert" not in result
+
+
+def test_html_to_text_links_stripped():
+    html = '<a href="https://example.com">click here</a>'
+    result = html_to_text(html)
+    assert "click here" in result
+    assert "https://" not in result
+
+
+def test_html_to_text_whitespace():
+    html = "<p>  lots   of   spaces  </p>\n\n\n\n<p>after gap</p>"
+    result = html_to_text(html)
+    assert "   " not in result
+    assert "\n\n\n" not in result
+
+
+def test_html_to_text_br_tags():
+    html = "line1<br>line2<br/>line3<br />line4"
+    result = html_to_text(html)
+    assert "line1\nline2" in result
+    assert "line3" in result
+
+
+def test_html_to_text_comments():
+    html = "<p>A<!-- hidden -->B</p>"
+    result = html_to_text(html)
+    assert "hidden" not in result
+
+
+def test_html_to_text_complex_legal_doc():
+    """Realistic legal HTML document."""
+    html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>§ 4-7</title>
+<style>body{font-family:serif}</style></head>
+<body>
+<h1>Lov om aksjeselskaper</h1>
+<section id="PARAGRAF_4-7">
+  <h2>&sect; 4-7. S&aelig;rlige regler</h2>
+  <p>F&oslash;lgende regler gjelder for <strong>overdragelse</strong> av aksjer:</p>
+  <ul>
+    <li>Styret kan nekte samtykke</li>
+    <li>Frist p&aring; <b>to m&aring;neder</b></li>
+  </ul>
+  <p>Se ogs&aring; <a href="/lov/1997-06-13-44/§4-8">§ 4-8</a>.</p>
+</section>
+</body></html>"""
+    result = html_to_text(html)
+    assert "# Lov om aksjeselskaper" in result
+    assert "## § 4-7. Særlige regler" in result
+    assert "**overdragelse**" in result
+    assert "- Styret kan nekte samtykke" in result
+    assert "**to måneder**" in result
+    assert "§ 4-8" in result
+    assert "href" not in result
+    assert "<" not in result or "&lt;" in html  # no stray tags
+
+
+# ---------------------------------------------------------------------------
+# read_file — transform="html"
+# ---------------------------------------------------------------------------
+
+
+def test_read_file_transform_html_basic():
+    """transform='html' converts HTML to clean text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = "<html><head><title>T</title></head><body><h1>Hello</h1><p>World</p></body></html>"
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file("doc.html", [tmp], transform="html")
+        assert "# Hello" in result
+        assert "World" in result
+        assert "<head>" not in result
+        assert "<title>" not in result
+
+
+def test_read_file_transform_html_with_section():
+    """transform='html' is applied after section extraction."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = (
+            '<div id="s1"><h2>Title</h2><p>Hello <strong>world</strong></p></div>'
+            '<div id="s2"><p>Other</p></div>'
+        )
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file("doc.html", [tmp], section="s1", transform="html")
+        assert "## Title" in result
+        assert "**world**" in result
+        assert "Other" not in result
+        # Section extraction works because ids are still in raw HTML
+        assert "<div" not in result
+
+
+def test_read_file_transform_html_with_grep():
+    """grep matches against clean text, not raw HTML."""
+    with tempfile.TemporaryDirectory() as tmp:
+        html = "<p>line one</p>\n<p>line two</p>\n<p>line three</p>"
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file("doc.html", [tmp], transform="html", grep="two")
+        assert "1 matches" in result
+        assert "two" in result
+        # Should NOT match HTML tags
+        result2 = read_file("doc.html", [tmp], transform="html", grep="<p>")
+        assert "0 matches" in result2
+
+
+def test_read_file_transform_html_section_grep():
+    """Section extraction + html transform + grep all work together."""
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = "\n".join(f"<p>item {i}</p>" for i in range(1, 11))
+        html = f'<div id="s1">\n{lines}\n</div>'
+        (Path(tmp) / "doc.html").write_text(html)
+        result = read_file("doc.html", [tmp], section="s1", transform="html", grep="item 5")
+        assert "1 matches" in result
+        assert "item 5" in result
+
+
+def test_read_file_transform_unknown():
+    """Unknown transform name returns error."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("hello")
+        result = read_file("data.txt", [tmp], transform="xml")
+        assert "Error" in result
+        assert "unknown transform" in result
+
+
+def test_read_file_transform_callable_still_works():
+    """Callable transform still works as before."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data.txt").write_text("hello\nworld\n")
+        result = read_file("data.txt", [tmp], transform=lambda t: t.upper())
+        assert "HELLO" in result
+        assert "WORLD" in result
