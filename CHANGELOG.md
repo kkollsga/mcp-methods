@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Added — `mcp-server` crate (Rust-native MCP server framework + binary)
+
+A new sibling crate at `crates/mcp-server/` providing a Rust-native MCP
+server built on the official `rmcp` SDK (v1.6) with a stdio transport.
+Designed to replace the Python `kglite.mcp_server` over the next few
+phases. The new binary is `mcp-server`.
+
+**Phase 1 (this release)** — bootstrap. Boots a working MCP server with
+the framework wired end-to-end, plus the manifest schema parsed and
+validated. No real tools yet — that's phase 2+.
+
+- Cargo workspace conversion of `mcp-methods` (root crate unchanged;
+  `crates/mcp-server/` added as a sibling member).
+- YAML manifest parser at `crates/mcp-server/src/manifest.rs` — direct
+  port of the Python `kglite.mcp_server.manifest` schema. Same keys
+  (`name`, `instructions`, `overview_prefix`, `source_root(s)`,
+  `trust.{allow_python_tools, allow_embedder}`, `tools`, `embedder`,
+  `builtins.{save_graph, temp_cleanup}`), same validation messages,
+  same auto-detection of sibling (`<basename>_mcp.yaml`) and
+  workspace-level (`workspace_mcp.yaml`) manifests.
+- `clap`-based CLI matching the Python flags: `--graph` /
+  `--workspace` / `--watch` (mutually exclusive), `--mcp-config`,
+  `--embedder`, `--name`, `--trust-tools`, `--stale-after-days`.
+- rmcp `ServerHandler` impl with one `ping` tool to verify the
+  framework dispatch is wired. End-to-end stdio handshake confirmed
+  (initialize → tools/list → tools/call).
+- 25 unit tests covering manifest parsing edge cases and CLI mode
+  picking.
+
 ## 0.3.19
 
 - **Built-in `html_to_text` function** — converts HTML to clean, readable text optimized for LLM consumption. Strips `<head>`, `<script>`, `<style>`, and comments. Converts headings to markdown `#` prefixes, list items to `- ` bullets, bold/strong to `**text**`, images to `[image: alt]`, tables to tab-separated text, and links to plain text. Decodes 75+ named HTML entities (including Scandinavian æøå) plus numeric/hex references. Available as a standalone function (`from mcp_methods import html_to_text`) and as a string-based transform on `read_file` (`transform="html"`).
