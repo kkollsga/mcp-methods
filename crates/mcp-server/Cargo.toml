@@ -32,5 +32,12 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Source-tool primitives: ripgrep crates + parallel walker
+regex = "1"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+
 [dev-dependencies]
 tempfile = "3"

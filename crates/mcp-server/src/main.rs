@@ -24,6 +24,7 @@ use tracing_subscriber::EnvFilter;
 
 mod manifest;
 mod server;
+mod source;
 
 use crate::manifest::{find_sibling_manifest, find_workspace_manifest, Manifest, ManifestError};
 use crate::server::{McpServer, ServerOptions};
@@ -142,6 +143,43 @@ fn fallback_name(mode: &Mode) -> &'static str {
     }
 }
 
+/// Resolve manifest-declared source_roots relative to the yaml directory.
+///
+/// Each entry must canonicalize to an existing directory; failures bubble
+/// as a [`ManifestError`] so a typo lands on stderr at boot rather than
+/// surfacing later as a path-traversal rejection.
+fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, ManifestError> {
+    let base = manifest
+        .yaml_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut resolved: Vec<String> = Vec::new();
+    for raw in &manifest.source_roots {
+        let candidate = base.join(raw);
+        let canon = candidate.canonicalize().map_err(|_| {
+            ManifestError::at(
+                &manifest.yaml_path,
+                format!(
+                    "source root {raw:?} resolves to {:?} which is not an existing directory",
+                    candidate.display()
+                ),
+            )
+        })?;
+        if !canon.is_dir() {
+            return Err(ManifestError::at(
+                &manifest.yaml_path,
+                format!(
+                    "source root {raw:?} resolves to {:?} which is not a directory",
+                    canon.display()
+                ),
+            ));
+        }
+        resolved.push(canon.to_string_lossy().into_owned());
+    }
+    Ok(resolved)
+}
+
 fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>) {
     let mode_label = match mode {
         Mode::SingleGraph { graph } => format!("single-graph [{}]", graph.display()),
@@ -179,6 +217,12 @@ async fn main() -> Result<()> {
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
     if cli.name.is_some() {
         options.name = cli.name.clone();
+    }
+    if let Some(m) = manifest.as_ref() {
+        if !m.source_roots.is_empty() {
+            let resolved = resolve_source_roots(m).context("source root resolution failed")?;
+            options = options.with_static_source_roots(resolved);
+        }
     }
     print_boot_summary(&mode, manifest.as_ref());
 

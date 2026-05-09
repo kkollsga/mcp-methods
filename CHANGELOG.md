@@ -9,9 +9,21 @@ server built on the official `rmcp` SDK (v1.6) with a stdio transport.
 Designed to replace the Python `kglite.mcp_server` over the next few
 phases. The new binary is `mcp-server`.
 
-**Phase 1 (this release)** — bootstrap. Boots a working MCP server with
-the framework wired end-to-end, plus the manifest schema parsed and
-validated. No real tools yet — that's phase 2+.
+**Phase 2** — source tools (`read_source`, `grep`, `list_source`)
+registered on the rmcp server. Each tool is gated on the server having
+an active source-roots provider (static or dynamic); when none is
+configured, the tool returns a friendly "configure source_root in your
+manifest" error rather than crashing. Implementation lives in
+`crates/mcp-server/src/source.rs` and uses the same `ignore` +
+`grep-matcher`/`grep-regex`/`grep-searcher` crates as the existing
+mcp-methods primitives. `ServerOptions` gains `with_static_source_roots`
++ `with_dynamic_source_roots`. Manifest `source_root(s)` are now
+canonicalised at boot and wired into the server. 15 new unit tests
+covering read/grep/list semantics, glob filtering, traversal blocking.
+
+**Phase 1** — bootstrap. Boots a working MCP server with the framework
+wired end-to-end, plus the manifest schema parsed and validated. No
+real tools yet — that's phase 2+.
 
 - Cargo workspace conversion of `mcp-methods` (root crate unchanged;
   `crates/mcp-server/` added as a sibling member).
