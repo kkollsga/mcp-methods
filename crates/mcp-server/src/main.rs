@@ -1,18 +1,33 @@
-//! `mcp-server` binary — Rust-native MCP server framework.
+//! `mcp-server` binary — generic Rust-native MCP server framework.
 //!
-//! Phase 1 capabilities:
-//! - Loads + validates a YAML manifest (auto-detected sibling, or via `--mcp-config`).
-//! - Boots an rmcp stdio server and registers a single `ping` tool.
-//! - CLI surface and operating modes (`--graph`, `--workspace`, `--watch`)
-//!   are accepted; only the boot path is wired so far. Tool registration
-//!   per-mode lands in subsequent phases (source tools, github tools,
-//!   python extension layer, watch mode, workspace mode).
+//! Boots a Model Context Protocol server over stdio and registers a
+//! configurable set of MCP tools driven by a YAML manifest. Domain-
+//! agnostic by design: the binary in the mcp-methods workspace ships
+//! the *generic* tool surface (source navigation, GitHub access,
+//! python extensions, file watching, workspace clone-and-track),
+//! plus a hookable graph-build callback. Domain-specific binaries
+//! (e.g. kglite's `kglite-mcp-server`) layer on top by calling
+//! [`McpServer::new`] with their own pre-registered tools and an
+//! active-graph provider.
 //!
-//! The intent is that a manifest written for the legacy
-//! `kglite-mcp-server` Python CLI boots unchanged on this binary —
-//! same keys, same semantics. Graph-specific tool registration is
-//! deferred to a downstream binary (kglite's own server crate) that
-//! depends on this crate.
+//! Operating modes:
+//! - **bare** (no flag): framework only — `ping` plus any
+//!   manifest-declared tools. Useful for testing the protocol layer.
+//! - **`--source-root DIR`** *(or via manifest)*: file-tree mode.
+//!   Source tools (`read_source`, `grep`, `list_source`) operate
+//!   against the configured directory.
+//! - **`--workspace DIR`** *(phase 6)*: clone-and-track mode.
+//!   `repo_management` clones GitHub repos into the workspace,
+//!   maintains an inventory, and points the source tools at the
+//!   active repo.
+//! - **`--watch DIR`** *(phase 5)*: file-watcher mode. Source roots
+//!   stay pinned to the directory; downstream consumers register a
+//!   rebuild callback on file changes.
+//!
+//! The manifest schema mirrors the legacy `kglite-mcp-server` Python
+//! CLI 1:1, so a YAML written for that CLI boots unchanged here.
+//! Auto-detected paths: `<workspace>/workspace_mcp.yaml` in workspace
+//! and watch modes; otherwise pass `--mcp-config PATH` explicitly.
 
 use std::path::PathBuf;
 
@@ -26,61 +41,63 @@ mod manifest;
 mod server;
 mod source;
 
-use crate::manifest::{find_sibling_manifest, find_workspace_manifest, Manifest, ManifestError};
+use crate::manifest::{find_workspace_manifest, Manifest, ManifestError};
 use crate::server::{McpServer, ServerOptions};
 
 /// Operating mode picked from the CLI flags.
 #[derive(Debug, Clone)]
 enum Mode {
-    /// Single-graph mode — load one .kgl file and serve cypher/source tools.
-    SingleGraph { graph: PathBuf },
-    /// Workspace mode — clone-and-build flow, idle-sweep inventory.
+    /// Source-root mode — single fixed directory bound to the source tools.
+    SourceRoot { dir: PathBuf },
+    /// Workspace mode — clone-and-track flow, idle-sweep inventory.
     Workspace { dir: PathBuf },
-    /// Watch mode — auto-rebuild a code graph from a local directory.
+    /// Watch mode — auto-rebuild trigger on file changes.
     Watch { dir: PathBuf },
-    /// Framework only — no graph or source binding. Useful for testing
-    /// the protocol layer in isolation.
+    /// Framework only — no source binding. Useful for testing the
+    /// protocol layer in isolation, or as a base for downstream
+    /// binaries that register their own tools.
     Bare,
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "mcp-server",
-    about = "Rust-native MCP server framework + binary",
+    about = "Rust-native MCP server framework — source navigation + GitHub + python tools",
     long_about = "\
-Boot a Model Context Protocol server over stdio. Accepts the same YAML \
-manifest schema as the legacy kglite-mcp-server Python CLI.
+Boot a Model Context Protocol server over stdio. Generic by design: ships \
+folder navigation (read_source / grep / list_source), GitHub access \
+(github_issues / github_api), and a manifest-driven tool surface. \
+Graph-specific tools (e.g. cypher_query) are layered on top by domain \
+binaries like kglite-mcp-server.
 
 Modes:
-  (none)                  Bare framework — registers a ping tool only.
-  --graph X.kgl           Single-graph mode (graph tool surface coming in a later phase).
-  --workspace DIR         Workspace mode (clone+build via repo_management).
-  --watch DIR             Watch mode (rebuild code graph on file changes).
+  (none)                  Bare framework — ping tool plus any manifest tools.
+  --source-root DIR       Bind the source tools to a fixed directory.
+  --workspace DIR         Clone-and-track GitHub repos in DIR (phase 6).
+  --watch DIR             Watch DIR for changes; rebuild downstream artifacts (phase 5).
 
-The manifest is auto-detected: ``<basename>_mcp.yaml`` next to the graph in \
-single-graph mode, ``<workspace>/workspace_mcp.yaml`` in workspace mode. \
-Override with --mcp-config PATH."
+The manifest is auto-detected: <workspace>/workspace_mcp.yaml in workspace \
+and watch modes. Override with --mcp-config PATH. The manifest's source_root \
+declaration is the manifest-driven equivalent of --source-root.\
+"
 )]
 struct Cli {
-    /// Path to .kgl file (single-graph mode). Mutually exclusive with --workspace and --watch.
-    #[arg(long, conflicts_with_all = ["workspace", "watch"])]
-    graph: Option<PathBuf>,
+    /// Bind source tools (read_source / grep / list_source) to this directory.
+    /// Equivalent to setting `source_root: DIR` in the manifest.
+    #[arg(long = "source-root", conflicts_with_all = ["workspace", "watch"])]
+    source_root: Option<PathBuf>,
 
-    /// Workspace directory (multi-graph clone-and-build mode).
-    #[arg(long, conflicts_with_all = ["graph", "watch"])]
+    /// Workspace directory (clone-and-track GitHub repos; phase 6).
+    #[arg(long, conflicts_with_all = ["source_root", "watch"])]
     workspace: Option<PathBuf>,
 
-    /// Local directory to watch (auto-rebuild a code-tree graph on changes).
-    #[arg(long, conflicts_with_all = ["graph", "workspace"])]
+    /// Local directory to watch for file changes (phase 5).
+    #[arg(long, conflicts_with_all = ["source_root", "workspace"])]
     watch: Option<PathBuf>,
 
-    /// Optional manifest YAML path. Defaults to the auto-detected sibling/workspace yaml.
+    /// Optional manifest YAML path. Defaults to the auto-detected workspace yaml.
     #[arg(long = "mcp-config")]
     mcp_config: Option<PathBuf>,
-
-    /// Sentence-transformers model shortcut (only effective when manifest doesn't override).
-    #[arg(long)]
-    embedder: Option<String>,
 
     /// Override the server display name (otherwise manifest.name or default).
     #[arg(long)]
@@ -98,8 +115,8 @@ struct Cli {
 }
 
 fn pick_mode(cli: &Cli) -> Mode {
-    match (&cli.graph, &cli.workspace, &cli.watch) {
-        (Some(g), _, _) => Mode::SingleGraph { graph: g.clone() },
+    match (&cli.source_root, &cli.workspace, &cli.watch) {
+        (Some(d), _, _) => Mode::SourceRoot { dir: d.clone() },
         (_, Some(w), _) => Mode::Workspace { dir: w.clone() },
         (_, _, Some(w)) => Mode::Watch { dir: w.clone() },
         _ => Mode::Bare,
@@ -108,7 +125,7 @@ fn pick_mode(cli: &Cli) -> Mode {
 
 fn default_manifest_path(mode: &Mode) -> Option<PathBuf> {
     match mode {
-        Mode::SingleGraph { graph } => find_sibling_manifest(graph),
+        Mode::SourceRoot { .. } => None,
         Mode::Workspace { dir } => find_workspace_manifest(dir),
         Mode::Watch { dir } => find_workspace_manifest(dir),
         Mode::Bare => None,
@@ -136,7 +153,7 @@ fn load_manifest(cli: &Cli, mode: &Mode) -> Result<Option<Manifest>, ManifestErr
 
 fn fallback_name(mode: &Mode) -> &'static str {
     match mode {
-        Mode::SingleGraph { .. } => "MCP Server (single-graph)",
+        Mode::SourceRoot { .. } => "MCP Server (source-root)",
         Mode::Workspace { .. } => "MCP Server (workspace)",
         Mode::Watch { .. } => "MCP Server (watch)",
         Mode::Bare => "MCP Server",
@@ -180,9 +197,9 @@ fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, ManifestErro
     Ok(resolved)
 }
 
-fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>) {
+fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>, source_roots: &[String]) {
     let mode_label = match mode {
-        Mode::SingleGraph { graph } => format!("single-graph [{}]", graph.display()),
+        Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
         Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
         Mode::Watch { dir } => format!("watch [{}]", dir.display()),
         Mode::Bare => "bare framework".to_string(),
@@ -193,9 +210,9 @@ fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>) {
         if !m.tools.is_empty() {
             parts.push(format!("{} manifest tool(s)", m.tools.len()));
         }
-        if !m.source_roots.is_empty() {
-            parts.push(format!("source roots: {:?}", m.source_roots));
-        }
+    }
+    if !source_roots.is_empty() {
+        parts.push(format!("source roots: {source_roots:?}"));
     }
     eprintln!("mcp-server: {}", parts.join("; "));
 }
@@ -207,9 +224,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = pick_mode(&cli);
 
-    if let Mode::SingleGraph { graph } = &mode {
-        if !graph.exists() {
-            anyhow::bail!("--graph path does not exist: {}", graph.display());
+    if let Mode::SourceRoot { dir } = &mode {
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "--source-root path does not exist or is not a directory: {}",
+                dir.display()
+            );
         }
     }
 
@@ -218,13 +238,23 @@ async fn main() -> Result<()> {
     if cli.name.is_some() {
         options.name = cli.name.clone();
     }
-    if let Some(m) = manifest.as_ref() {
+
+    // Wire source roots: --source-root flag takes precedence over manifest declaration.
+    let mut source_roots: Vec<String> = Vec::new();
+    if let Mode::SourceRoot { dir } = &mode {
+        let canon = dir
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize --source-root {}", dir.display()))?;
+        source_roots.push(canon.to_string_lossy().into_owned());
+    } else if let Some(m) = manifest.as_ref() {
         if !m.source_roots.is_empty() {
-            let resolved = resolve_source_roots(m).context("source root resolution failed")?;
-            options = options.with_static_source_roots(resolved);
+            source_roots = resolve_source_roots(m).context("source root resolution failed")?;
         }
     }
-    print_boot_summary(&mode, manifest.as_ref());
+    if !source_roots.is_empty() {
+        options = options.with_static_source_roots(source_roots.clone());
+    }
+    print_boot_summary(&mode, manifest.as_ref(), &source_roots);
 
     let server = McpServer::new(options);
     let service = server
@@ -262,11 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn single_graph_mode() {
-        let mode = pick_mode(&cli(&["--graph", "x.kgl"]));
+    fn source_root_mode() {
+        let mode = pick_mode(&cli(&["--source-root", "/tmp/src"]));
         match mode {
-            Mode::SingleGraph { graph } => assert_eq!(graph, PathBuf::from("x.kgl")),
-            _ => panic!("expected SingleGraph"),
+            Mode::SourceRoot { dir } => assert_eq!(dir, PathBuf::from("/tmp/src")),
+            _ => panic!("expected SourceRoot"),
         }
     }
 
@@ -289,14 +319,27 @@ mod tests {
     }
 
     #[test]
-    fn graph_and_workspace_mutually_exclusive() {
-        let res = Cli::try_parse_from(["mcp-server", "--graph", "x.kgl", "--workspace", "/tmp"]);
+    fn source_root_and_workspace_mutually_exclusive() {
+        let res = Cli::try_parse_from([
+            "mcp-server",
+            "--source-root",
+            "/tmp/src",
+            "--workspace",
+            "/tmp",
+        ]);
         assert!(res.is_err());
     }
 
     #[test]
     fn watch_and_workspace_mutually_exclusive() {
         let res = Cli::try_parse_from(["mcp-server", "--watch", "/tmp/a", "--workspace", "/tmp/b"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn graph_flag_no_longer_recognised() {
+        // mcp-methods's binary doesn't know about graphs — that's a kglite concept.
+        let res = Cli::try_parse_from(["mcp-server", "--graph", "x.kgl"]);
         assert!(res.is_err());
     }
 }

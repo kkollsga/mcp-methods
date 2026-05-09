@@ -9,6 +9,16 @@ server built on the official `rmcp` SDK (v1.6) with a stdio transport.
 Designed to replace the Python `kglite.mcp_server` over the next few
 phases. The new binary is `mcp-server`.
 
+**CLI refit** — drop `--graph` (graph concept lives in downstream
+binaries like kglite-mcp-server, not in mcp-methods). Replace with
+`--source-root DIR` for direct binding of the source tools to a fixed
+directory. Modes are now: `bare` / `--source-root` / `--workspace` /
+`--watch`. Help text rewritten to clarify the framework's domain-
+agnostic role; downstream binaries (kglite, etc.) layer their domain
+tools on top by re-using `McpServer::new` with custom registrations.
+Also dropped `--embedder` (the manifest's `embedder:` block remains
+the source of truth).
+
 **Phase 3** — GitHub tools (`github_issues`, `github_api`) registered
 on the rmcp server. Both tools resolve the active repo via a
 caller-supplied dynamic provider with an optional per-call `repo_name=`
