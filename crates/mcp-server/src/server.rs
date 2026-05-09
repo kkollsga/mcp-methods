@@ -285,6 +285,76 @@ impl McpServer {
         &mut self.tool_router
     }
 
+    /// Register a typed dynamic tool. Compresses the boilerplate of:
+    /// 1. Generating a JSON Schema for the args type via `schemars`.
+    /// 2. Building a [`rmcp::model::Tool`] attr from the schema +
+    ///    name + description.
+    /// 3. Deserialising the per-call JSON arguments via serde.
+    /// 4. Wrapping the handler in a [`rmcp::handler::server::router::tool::ToolRoute::new_dyn`]
+    ///    closure suitable for [`tool_router_mut`](Self::tool_router_mut).
+    ///
+    /// The handler is `Fn(T) -> String`; it owns whatever state it
+    /// needs through the closure environment (typically an Arc-clone
+    /// of a domain-specific state handle). Returning a string means
+    /// the tool reports a clean text body to the agent rather than
+    /// exposing a tool-error envelope — matches the framework's
+    /// "errors as values" convention for source / GitHub tools.
+    pub fn register_typed_tool<T, F>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+        handler: F,
+    ) where
+        T: for<'de> serde::Deserialize<'de>
+            + schemars::JsonSchema
+            + Default
+            + Send
+            + Sync
+            + 'static,
+        F: Fn(T) -> String + Send + Sync + 'static,
+    {
+        use std::pin::Pin;
+        type DynFut<'a, R> = Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>>;
+
+        let schema_obj = serde_json::to_value(schemars::schema_for!(T))
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let attr = rmcp::model::Tool::new(name, description, Arc::new(schema_obj));
+        let handler = std::sync::Arc::new(handler);
+
+        self.tool_router
+            .add_route(rmcp::handler::server::router::tool::ToolRoute::new_dyn(
+                attr,
+                move |ctx: rmcp::handler::server::tool::ToolCallContext<'_, McpServer>|
+                    -> DynFut<'_, Result<rmcp::model::CallToolResult, rmcp::ErrorData>> {
+                    let handler = handler.clone();
+                    let arguments = ctx.arguments.clone();
+                    Box::pin(async move {
+                        let args: T = match arguments {
+                            Some(map) => {
+                                match serde_json::from_value(serde_json::Value::Object(map)) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        return Ok(rmcp::model::CallToolResult::success(vec![
+                                            rmcp::model::Content::text(format!(
+                                                "invalid arguments: {e}"
+                                            )),
+                                        ]));
+                                    }
+                                }
+                            }
+                            None => T::default(),
+                        };
+                        let body = handler(args);
+                        Ok(rmcp::model::CallToolResult::success(vec![
+                            rmcp::model::Content::text(body),
+                        ]))
+                    })
+                },
+            ));
+    }
+
     fn current_source_roots(&self) -> Vec<String> {
         match &self.options.source_roots {
             Some(provider) => provider(),

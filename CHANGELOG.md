@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.21
+
+- **`McpServer::register_typed_tool<T, F>(name, description, handler)`**
+  — typed dynamic-tool registration helper. Compresses the boilerplate
+  of building a `Tool` attr from a JSON Schema (via schemars), serde-
+  deserialising per-call arguments, and wrapping the handler in a
+  `ToolRoute::new_dyn` closure. Domain binaries (kglite-mcp-server) use
+  this to register their tools in ~5 lines instead of ~35. The handler
+  is `Fn(T) -> String`; state lives in the closure environment.
+
 ## 0.3.20
 
 ### Added — `mcp-server` crate (Rust-native MCP server framework + binary)
