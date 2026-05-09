@@ -46,6 +46,8 @@ pub struct ServerOptions {
     /// Dynamic provider returning the active GitHub repo (org/repo).
     /// When `None`, github tools require a per-call `repo_name=` arg.
     pub default_repo: Option<RepoProvider>,
+    /// Workspace handle (when `--workspace` mode is active).
+    pub workspace: Option<crate::workspace::Workspace>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -74,6 +76,7 @@ impl ServerOptions {
             instructions: manifest.and_then(|m| m.instructions.clone()),
             source_roots: None,
             default_repo: None,
+            workspace: None,
         }
     }
 
@@ -95,6 +98,24 @@ impl ServerOptions {
 
     pub fn with_dynamic_repo(mut self, provider: RepoProvider) -> Self {
         self.default_repo = Some(provider);
+        self
+    }
+
+    /// Bind a workspace handle. Source roots and default repo become
+    /// dynamic — both are read from the workspace's active-repo state
+    /// at every tool call, so `repo_management` swapping the active
+    /// repo immediately re-points the source tools.
+    pub fn with_workspace(mut self, ws: crate::workspace::Workspace) -> Self {
+        let ws_for_roots = ws.clone();
+        let ws_for_repo = ws.clone();
+        self.workspace = Some(ws);
+        self.source_roots = Some(Arc::new(move || {
+            ws_for_roots
+                .active_repo_path()
+                .map(|p| vec![p.to_string_lossy().into_owned()])
+                .unwrap_or_default()
+        }));
+        self.default_repo = Some(Arc::new(move || ws_for_repo.active_repo_name()));
         self
     }
 }
@@ -146,6 +167,19 @@ pub struct GrepArgs {
     /// Case-insensitive matching.
     #[serde(default)]
     pub case_insensitive: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RepoManagementArgs {
+    /// org/repo to clone and activate. Omit for list mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Delete the repo + inventory entry instead of activating.
+    #[serde(default)]
+    pub delete: bool,
+    /// Refresh the active repo (no name required).
+    #[serde(default)]
+    pub update: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -424,6 +458,26 @@ impl McpServer {
             args.limit,
             args.labels.as_deref(),
         );
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Manage GitHub repos in the workspace. Pass `name='org/repo'` to \
+                       clone (if missing) and activate it as the source root for \
+                       read_source / grep / list_source. Pass `delete=true` to remove a \
+                       repo. Pass `update=true` to fetch upstream changes for the active \
+                       repo. Call with no arguments to list all known repos with their \
+                       last-access counts. Idle repos auto-sweep on each call (default 7 \
+                       days, configurable via --stale-after-days)."
+    )]
+    async fn repo_management(
+        &self,
+        Parameters(args): Parameters<RepoManagementArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = match &self.options.workspace {
+            Some(ws) => ws.repo_management(args.name.as_deref(), args.delete, args.update),
+            None => "repo_management requires --workspace mode.".to_string(),
+        };
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 

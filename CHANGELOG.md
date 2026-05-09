@@ -19,6 +19,34 @@ tools on top by re-using `McpServer::new` with custom registrations.
 Also dropped `--embedder` (the manifest's `embedder:` block remains
 the source of truth).
 
+**Phase 6** — Workspace mode (`--workspace DIR`). Multi-repo
+clone-and-track flow with idle-sweep inventory.
+
+- `repo_management` MCP tool: pass `name='org/repo'` to clone (if
+  missing) and activate; `delete=true` to remove; `update=true` to
+  fast-forward the active repo; no args to list with access counts.
+- Active repo state lives in `Workspace::Arc<RwLock<…>>`; source tools
+  pick up the swap on the very next call (`with_workspace` wires
+  dynamic source-roots and default-repo providers).
+- Inventory persists to `<workspace>/inventory.json` with
+  `cloned_at` / `last_accessed` / `access_count` / `stale` per repo;
+  reconciles with on-disk state at boot (un-tracked clones get
+  inventory entries; vanished repos marked stale).
+- Auto-sweeps idle repos older than `--stale-after-days` (default 7);
+  active repo is exempt; stale entries preserve their access history
+  even after deletion.
+- Git operations shell out to `git` (clone --depth 1, fetch + reset
+  --hard FETCH_HEAD); no `libgit2` dep.
+- `PostActivateHook` callback type lets downstream binaries fire
+  custom logic after each successful clone/update — kglite-mcp-server
+  will use this to invoke `code_tree::build` on the freshly-activated
+  repo and pin the resulting graph.
+- Self-contained ISO-8601 (seconds-precision) formatter avoids
+  pulling in `chrono` for a handful of timestamps.
+- End-to-end test: cloned `rust-lang/rustlings` from github.com,
+  `list_source` returned the active repo's tree, `repo_management()`
+  listing shows it as `[active]` with access counts.
+
 **Phase 5** — Watch mode (`--watch DIR`). The CLI now spawns a
 recursive debounced filesystem watcher (default 500 ms debounce) that
 logs change events at INFO level and can fire a downstream-supplied

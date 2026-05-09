@@ -42,6 +42,7 @@ mod python;
 mod server;
 mod source;
 mod watch;
+mod workspace;
 
 use crate::manifest::{find_workspace_manifest, Manifest, ManifestError};
 use crate::server::{McpServer, ServerOptions};
@@ -260,8 +261,9 @@ async fn main() -> Result<()> {
         options.name = cli.name.clone();
     }
 
-    // Wire source roots: --source-root and --watch each pin a single
-    // dir; manifest declaration applies otherwise.
+    // Wire source roots / workspace: --source-root and --watch each pin
+    // a single dir; --workspace gets a dynamic provider driven by the
+    // active repo; manifest declaration applies in bare mode.
     let mut source_roots: Vec<String> = Vec::new();
     match &mode {
         Mode::SourceRoot { dir } | Mode::Watch { dir } => {
@@ -270,7 +272,13 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed to canonicalize directory {}", dir.display()))?;
             source_roots.push(canon.to_string_lossy().into_owned());
         }
-        _ => {
+        Mode::Workspace { dir } => {
+            let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            let ws = workspace::Workspace::open(canon, cli.stale_after_days, None)
+                .context("workspace initialisation failed")?;
+            options = options.with_workspace(ws);
+        }
+        Mode::Bare => {
             if let Some(m) = manifest.as_ref() {
                 if !m.source_roots.is_empty() {
                     source_roots =
