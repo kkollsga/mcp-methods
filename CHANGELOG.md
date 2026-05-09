@@ -19,6 +19,16 @@ tools on top by re-using `McpServer::new` with custom registrations.
 Also dropped `--embedder` (the manifest's `embedder:` block remains
 the source of truth).
 
+**Phase 5** — Watch mode (`--watch DIR`). The CLI now spawns a
+recursive debounced filesystem watcher (default 500 ms debounce) that
+logs change events at INFO level and can fire a downstream-supplied
+callback on each batch. Source roots are auto-pinned to the watched
+directory so the source tools (`read_source` / `grep` / `list_source`)
+operate on the live tree. Powered by the `notify` + `notify-debouncer-mini`
+crates. Downstream binaries (kglite-mcp-server, etc.) plug in their
+rebuild logic via the `ChangeHandler` callback type — phase-6 work
+will wire one in for code-tree rebuilding once kglite layers in.
+
 **Phase 4** — Python extension layer. Embeds CPython into the
 binary via PyO3's `auto-initialize` feature so manifest-declared
 `python:` tools and custom embedder factories work out of the box.

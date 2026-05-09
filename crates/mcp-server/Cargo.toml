@@ -49,5 +49,9 @@ ignore = "0.4"
 # the binary so users only need their tool code on disk.
 pyo3 = { version = "0.28", features = ["auto-initialize"] }
 
+# Watch-mode file watcher (debounced).
+notify = "8"
+notify-debouncer-mini = "0.6"
+
 [dev-dependencies]
 tempfile = "3"

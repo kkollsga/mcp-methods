@@ -41,6 +41,7 @@ mod manifest;
 mod python;
 mod server;
 mod source;
+mod watch;
 
 use crate::manifest::{find_workspace_manifest, Manifest, ManifestError};
 use crate::server::{McpServer, ServerOptions};
@@ -244,6 +245,14 @@ async fn main() -> Result<()> {
             );
         }
     }
+    if let Mode::Watch { dir } = &mode {
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "--watch path does not exist or is not a directory: {}",
+                dir.display()
+            );
+        }
+    }
 
     let manifest = load_manifest(&cli, &mode).context("manifest load failed")?;
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
@@ -251,16 +260,23 @@ async fn main() -> Result<()> {
         options.name = cli.name.clone();
     }
 
-    // Wire source roots: --source-root flag takes precedence over manifest declaration.
+    // Wire source roots: --source-root and --watch each pin a single
+    // dir; manifest declaration applies otherwise.
     let mut source_roots: Vec<String> = Vec::new();
-    if let Mode::SourceRoot { dir } = &mode {
-        let canon = dir
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize --source-root {}", dir.display()))?;
-        source_roots.push(canon.to_string_lossy().into_owned());
-    } else if let Some(m) = manifest.as_ref() {
-        if !m.source_roots.is_empty() {
-            source_roots = resolve_source_roots(m).context("source root resolution failed")?;
+    match &mode {
+        Mode::SourceRoot { dir } | Mode::Watch { dir } => {
+            let canon = dir
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize directory {}", dir.display()))?;
+            source_roots.push(canon.to_string_lossy().into_owned());
+        }
+        _ => {
+            if let Some(m) = manifest.as_ref() {
+                if !m.source_roots.is_empty() {
+                    source_roots =
+                        resolve_source_roots(m).context("source root resolution failed")?;
+                }
+            }
         }
     }
     if !source_roots.is_empty() {
@@ -274,6 +290,14 @@ async fn main() -> Result<()> {
         register_python_extensions(&mut server, m, cli.trust_tools)?
     } else {
         0
+    };
+
+    // Watch-mode background subsystem. Held until the server exits;
+    // dropping the handle stops the watcher cleanly.
+    let _watch_handle = if let Mode::Watch { dir } = &mode {
+        Some(watch::watch(dir, None, None).context("failed to start file watcher")?)
+    } else {
+        None
     };
 
     print_boot_summary(&mode, manifest.as_ref(), &source_roots, python_tool_count);
