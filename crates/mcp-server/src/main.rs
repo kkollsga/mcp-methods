@@ -35,17 +35,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
-use tracing_subscriber::EnvFilter;
 
-mod manifest;
-mod python;
-mod server;
-mod source;
-mod watch;
-mod workspace;
-
-use crate::manifest::{find_workspace_manifest, Manifest, ManifestError};
-use crate::server::{McpServer, ServerOptions};
+use mcp_server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
+use mcp_server::server::{McpServer, ServerOptions};
+use mcp_server::{
+    apply_python_extensions, init_tracing, maybe_watch, resolve_source_roots, workspace,
+    PythonExtensions,
+};
 
 /// Operating mode picked from the CLI flags.
 #[derive(Debug, Clone)]
@@ -163,43 +159,6 @@ fn fallback_name(mode: &Mode) -> &'static str {
     }
 }
 
-/// Resolve manifest-declared source_roots relative to the yaml directory.
-///
-/// Each entry must canonicalize to an existing directory; failures bubble
-/// as a [`ManifestError`] so a typo lands on stderr at boot rather than
-/// surfacing later as a path-traversal rejection.
-fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, ManifestError> {
-    let base = manifest
-        .yaml_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut resolved: Vec<String> = Vec::new();
-    for raw in &manifest.source_roots {
-        let candidate = base.join(raw);
-        let canon = candidate.canonicalize().map_err(|_| {
-            ManifestError::at(
-                &manifest.yaml_path,
-                format!(
-                    "source root {raw:?} resolves to {:?} which is not an existing directory",
-                    candidate.display()
-                ),
-            )
-        })?;
-        if !canon.is_dir() {
-            return Err(ManifestError::at(
-                &manifest.yaml_path,
-                format!(
-                    "source root {raw:?} resolves to {:?} which is not a directory",
-                    canon.display()
-                ),
-            ));
-        }
-        resolved.push(canon.to_string_lossy().into_owned());
-    }
-    Ok(resolved)
-}
-
 fn print_boot_summary(
     mode: &Mode,
     manifest: Option<&Manifest>,
@@ -292,23 +251,26 @@ async fn main() -> Result<()> {
     }
     let mut server = McpServer::new(options);
 
-    // Python extension layer — register `python:` tools and load
-    // custom embedder factory if the manifest declares either.
-    let python_tool_count = if let Some(m) = manifest.as_ref() {
-        register_python_extensions(&mut server, m, cli.trust_tools)?
-    } else {
-        0
+    let py_ext = match manifest.as_ref() {
+        Some(m) => apply_python_extensions(&mut server, m, cli.trust_tools)?,
+        None => PythonExtensions::default(),
     };
+    if let Some(_emb) = py_ext.embedder {
+        tracing::info!("embedder factory loaded (no consumer in framework binary)");
+    }
 
-    // Watch-mode background subsystem. Held until the server exits;
-    // dropping the handle stops the watcher cleanly.
     let _watch_handle = if let Mode::Watch { dir } = &mode {
-        Some(watch::watch(dir, None, None).context("failed to start file watcher")?)
+        maybe_watch(Some(dir), None)?
     } else {
         None
     };
 
-    print_boot_summary(&mode, manifest.as_ref(), &source_roots, python_tool_count);
+    print_boot_summary(
+        &mode,
+        manifest.as_ref(),
+        &source_roots,
+        py_ext.python_tool_count,
+    );
 
     let service = server
         .serve(stdio())
@@ -316,85 +278,6 @@ async fn main() -> Result<()> {
         .context("failed to start MCP service over stdio")?;
     service.waiting().await?;
     Ok(())
-}
-
-/// Register manifest-declared python: tools and load the embedder
-/// factory (when configured). Returns the count of python tools added
-/// to the router; embedder loading produces a logged side effect only
-/// since wiring it to a graph is downstream-binary territory.
-fn register_python_extensions(
-    server: &mut McpServer,
-    manifest: &Manifest,
-    trust_tools: bool,
-) -> Result<usize> {
-    use crate::manifest::ToolSpec;
-
-    let has_python_tools = manifest
-        .tools
-        .iter()
-        .any(|t| matches!(t, ToolSpec::Python(_)));
-    let has_embedder = manifest.embedder.is_some();
-    if !has_python_tools && !has_embedder {
-        return Ok(0);
-    }
-
-    if has_python_tools {
-        if !manifest.trust.allow_python_tools {
-            anyhow::bail!(
-                "manifest declares `python:` tools but `trust.allow_python_tools: true` is not set"
-            );
-        }
-        if !trust_tools {
-            anyhow::bail!(
-                "manifest declares `python:` tools but the CLI was started without --trust-tools \
-                 (refusing to load arbitrary code)"
-            );
-        }
-    }
-    if has_embedder {
-        if !manifest.trust.allow_embedder {
-            anyhow::bail!(
-                "manifest declares an embedder but `trust.allow_embedder: true` is not set"
-            );
-        }
-        if !trust_tools {
-            anyhow::bail!(
-                "manifest declares an embedder but the CLI was started without --trust-tools"
-            );
-        }
-    }
-
-    python::ensure_python().context("Python interpreter failed to initialise")?;
-
-    let count = if has_python_tools {
-        python::register_python_tools(server.tool_router_mut(), manifest)
-            .context("python tool registration failed")?
-    } else {
-        0
-    };
-
-    if let Some(cfg) = manifest.embedder.as_ref() {
-        let manifest_dir = manifest
-            .yaml_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let _instance =
-            python::load_embedder(cfg, &manifest_dir).context("embedder factory load failed")?;
-        tracing::info!(class = %cfg.class, "embedder factory loaded");
-    }
-
-    Ok(count)
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
 }
 
 #[cfg(test)]

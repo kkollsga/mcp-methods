@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Rust-native MCP server framework + binary, built on rmcp + mcp-methods primitives"
 
+[lib]
+name = "mcp_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mcp-server"
 path = "src/main.rs"

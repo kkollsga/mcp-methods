@@ -167,7 +167,11 @@ fn py_result_to_string(py: Python<'_>, val: &Py<PyAny>) -> PyResult<String> {
 }
 
 /// Recursively convert serde_json values to Py<PyAny>s.
-fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
+///
+/// Public so downstream binaries can reuse the same conversion when
+/// dispatching their own dynamic Python tools (e.g. kglite's
+/// graph_overview which forwards JSON kwargs to `graph.describe`).
+pub fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
     use serde_json::Value as V;
     Ok(match val {
         V::Null => py.None(),

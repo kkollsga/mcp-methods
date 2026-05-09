@@ -19,6 +19,17 @@ tools on top by re-using `McpServer::new` with custom registrations.
 Also dropped `--embedder` (the manifest's `embedder:` block remains
 the source of truth).
 
+**Library extraction (post-phase-6).** The crate now exposes a
+`[lib]` target alongside the `[[bin]]`, with the framework boilerplate
+(`apply_python_extensions`, `resolve_source_roots`, `init_tracing`,
+`maybe_watch`) lifted into a new `mcp_server::runtime` module. This
+lets downstream binaries (kglite-mcp-server, etc.) reuse the entire
+boot sequence without copy-pasting hundreds of LoC of glue.
+
+`mcp_server::python::json_to_py` is now `pub` so dynamic-tool
+implementations can reuse it for forwarding JSON kwargs to Python
+callables (e.g. `graph.describe(**kwargs)`).
+
 **Phase 6** — Workspace mode (`--workspace DIR`). Multi-repo
 clone-and-track flow with idle-sweep inventory.
 
