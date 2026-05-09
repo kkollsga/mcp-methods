@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.20
 
 ### Added — `mcp-server` crate (Rust-native MCP server framework + binary)
 
