@@ -44,5 +44,10 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 
+# Python extension layer — load manifest-declared `python:` tool hooks
+# and custom embedder factories. `auto-initialize` embeds CPython into
+# the binary so users only need their tool code on disk.
+pyo3 = { version = "0.28", features = ["auto-initialize"] }
+
 [dev-dependencies]
 tempfile = "3"

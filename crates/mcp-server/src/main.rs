@@ -38,6 +38,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 mod manifest;
+mod python;
 mod server;
 mod source;
 
@@ -197,7 +198,12 @@ fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, ManifestErro
     Ok(resolved)
 }
 
-fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>, source_roots: &[String]) {
+fn print_boot_summary(
+    mode: &Mode,
+    manifest: Option<&Manifest>,
+    source_roots: &[String],
+    python_tool_count: usize,
+) {
     let mode_label = match mode {
         Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
         Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
@@ -210,6 +216,12 @@ fn print_boot_summary(mode: &Mode, manifest: Option<&Manifest>, source_roots: &[
         if !m.tools.is_empty() {
             parts.push(format!("{} manifest tool(s)", m.tools.len()));
         }
+        if m.embedder.is_some() {
+            parts.push("embedder loaded".to_string());
+        }
+    }
+    if python_tool_count > 0 {
+        parts.push(format!("{python_tool_count} python tool(s) registered"));
     }
     if !source_roots.is_empty() {
         parts.push(format!("source roots: {source_roots:?}"));
@@ -254,15 +266,93 @@ async fn main() -> Result<()> {
     if !source_roots.is_empty() {
         options = options.with_static_source_roots(source_roots.clone());
     }
-    print_boot_summary(&mode, manifest.as_ref(), &source_roots);
+    let mut server = McpServer::new(options);
 
-    let server = McpServer::new(options);
+    // Python extension layer — register `python:` tools and load
+    // custom embedder factory if the manifest declares either.
+    let python_tool_count = if let Some(m) = manifest.as_ref() {
+        register_python_extensions(&mut server, m, cli.trust_tools)?
+    } else {
+        0
+    };
+
+    print_boot_summary(&mode, manifest.as_ref(), &source_roots, python_tool_count);
+
     let service = server
         .serve(stdio())
         .await
         .context("failed to start MCP service over stdio")?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Register manifest-declared python: tools and load the embedder
+/// factory (when configured). Returns the count of python tools added
+/// to the router; embedder loading produces a logged side effect only
+/// since wiring it to a graph is downstream-binary territory.
+fn register_python_extensions(
+    server: &mut McpServer,
+    manifest: &Manifest,
+    trust_tools: bool,
+) -> Result<usize> {
+    use crate::manifest::ToolSpec;
+
+    let has_python_tools = manifest
+        .tools
+        .iter()
+        .any(|t| matches!(t, ToolSpec::Python(_)));
+    let has_embedder = manifest.embedder.is_some();
+    if !has_python_tools && !has_embedder {
+        return Ok(0);
+    }
+
+    if has_python_tools {
+        if !manifest.trust.allow_python_tools {
+            anyhow::bail!(
+                "manifest declares `python:` tools but `trust.allow_python_tools: true` is not set"
+            );
+        }
+        if !trust_tools {
+            anyhow::bail!(
+                "manifest declares `python:` tools but the CLI was started without --trust-tools \
+                 (refusing to load arbitrary code)"
+            );
+        }
+    }
+    if has_embedder {
+        if !manifest.trust.allow_embedder {
+            anyhow::bail!(
+                "manifest declares an embedder but `trust.allow_embedder: true` is not set"
+            );
+        }
+        if !trust_tools {
+            anyhow::bail!(
+                "manifest declares an embedder but the CLI was started without --trust-tools"
+            );
+        }
+    }
+
+    python::ensure_python().context("Python interpreter failed to initialise")?;
+
+    let count = if has_python_tools {
+        python::register_python_tools(server.tool_router_mut(), manifest)
+            .context("python tool registration failed")?
+    } else {
+        0
+    };
+
+    if let Some(cfg) = manifest.embedder.as_ref() {
+        let manifest_dir = manifest
+            .yaml_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let _instance =
+            python::load_embedder(cfg, &manifest_dir).context("embedder factory load failed")?;
+        tracing::info!(class = %cfg.class, "embedder factory loaded");
+    }
+
+    Ok(count)
 }
 
 fn init_tracing() {

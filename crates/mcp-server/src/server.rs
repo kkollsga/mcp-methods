@@ -242,6 +242,15 @@ impl McpServer {
         }
     }
 
+    /// Mutable access to the tool router for dynamic tool registration.
+    ///
+    /// Use only at server-construction time (before [`serve`](rmcp::ServiceExt::serve)).
+    /// Once dispatching starts, the router is cloned per request and
+    /// mutation would race.
+    pub fn tool_router_mut(&mut self) -> &mut ToolRouter<McpServer> {
+        &mut self.tool_router
+    }
+
     fn current_source_roots(&self) -> Vec<String> {
         match &self.options.source_roots {
             Some(provider) => provider(),
@@ -442,7 +451,7 @@ impl McpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let name = self

@@ -19,6 +19,43 @@ tools on top by re-using `McpServer::new` with custom registrations.
 Also dropped `--embedder` (the manifest's `embedder:` block remains
 the source of truth).
 
+**Phase 4** — Python extension layer. Embeds CPython into the
+binary via PyO3's `auto-initialize` feature so manifest-declared
+`python:` tools and custom embedder factories work out of the box.
+
+- Manifest `tools: [{ name, python: ./X.py, function: F }]` entries
+  load via `importlib.util` (no `sys.path` mutation), introspect the
+  function signature with `inspect.signature` to derive a JSON Schema
+  for MCP, and register dynamically on rmcp's tool router via
+  `ToolRoute::new_dyn` so the agent sees them in `tools/list`
+  alongside the built-in source / GitHub tools.
+- Manifest `embedder: { module, class, kwargs }` block is loaded
+  + instantiated at boot. The PyObject is held in memory; downstream
+  binaries (kglite-mcp-server) wire it to a graph's text-score path
+  via their own integration.
+- Two-signal trust gating: `python:` tools require both
+  `trust.allow_python_tools: true` and `--trust-tools`; embedders
+  require `trust.allow_embedder: true` + `--trust-tools`. Refusing
+  either way is the default. Boot-time errors are clear and specific.
+- Type-hint → JSON Schema mapping: `str → string`, `int → integer`,
+  `float → number`, `bool → boolean`, `list → array`, `dict → object`.
+  Unmatched annotations fall back to `string` with the Python repr
+  in the schema's `title` field. Defaults are JSON-encoded into
+  `default`.
+- `ServerHandler` impl on `McpServer` switched from `Self::tool_router()`
+  (static) to `self.tool_router` (instance) so dynamic routes added
+  before serving show up in `tools/list`.
+- End-to-end test: a `def greet(name: str, count: int = 3) -> str`
+  Python function loads, registers with the right schema (`name`
+  required, `count` defaulted), and dispatches correctly through
+  `tools/call`.
+
+The FastMCP-API-compat shim (`from mcp_methods.fastmcp import FastMCP`)
+is deferred to a follow-up. The manifest form already accepts any
+plain Python function — users with existing FastMCP code just declare
+each decorated function as a separate manifest entry until the shim
+ships.
+
 **Phase 3** — GitHub tools (`github_issues`, `github_api`) registered
 on the rmcp server. Both tools resolve the active repo via a
 caller-supplied dynamic provider with an optional per-call `repo_name=`
