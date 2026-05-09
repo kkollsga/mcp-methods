@@ -9,6 +9,20 @@ server built on the official `rmcp` SDK (v1.6) with a stdio transport.
 Designed to replace the Python `kglite.mcp_server` over the next few
 phases. The new binary is `mcp-server`.
 
+**Phase 3** — GitHub tools (`github_issues`, `github_api`) registered
+on the rmcp server. Both tools resolve the active repo via a
+caller-supplied dynamic provider with an optional per-call `repo_name=`
+override; auto-detects from cwd's git remote as a last resort.
+`github_issues` covers all three modes — FETCH (`number=`), SEARCH
+(`query=`), LIST (no args) — by delegating to the existing
+`mcp_methods::github` Rust internals (no PyO3 in the hot path). To make
+that delegation possible, mcp-methods now ships as both a Python
+extension (`cdylib`) and a regular Rust library (`rlib`), with the
+`extension-module` PyO3 feature gated behind the new `python-extension`
+Cargo feature so `cargo build` can produce both. `pyproject.toml`
+maturin features updated accordingly. End-to-end stdio test against
+github.com/rust-lang/rustlings confirmed.
+
 **Phase 2** — source tools (`read_source`, `grep`, `list_source`)
 registered on the rmcp server. Each tool is gated on the server having
 an active source-roots provider (static or dynamic); when none is

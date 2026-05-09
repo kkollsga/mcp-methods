@@ -1138,6 +1138,52 @@ pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> S
     git_api_internal(repo, path, truncate_at)
 }
 
+/// Pure-Rust dispatcher for the github_issues tool.
+///
+/// Returns a user-facing string for all logical conditions (invalid repo,
+/// fetch failure, etc.). Callers that want structured errors should
+/// invoke the `_internal` functions directly.
+#[allow(clippy::too_many_arguments)]
+pub fn github_issues_rust(
+    repo: Option<&str>,
+    number: Option<u64>,
+    query: Option<&str>,
+    kind: &str,
+    state: &str,
+    sort: Option<&str>,
+    limit: usize,
+    labels: Option<&str>,
+) -> String {
+    let repo_str = match repo {
+        Some(r) => r.to_string(),
+        None => match detect_git_repo(".") {
+            Some(r) => r,
+            None => {
+                return "No repo specified and could not auto-detect from git remote.".to_string()
+            }
+        },
+    };
+    if let Some(err) = git_refs::validate_repo(&repo_str) {
+        return err;
+    }
+
+    match (number, query) {
+        (Some(num), _) => match fetch_issue_internal(&repo_str, num) {
+            Ok((text, _cache)) => text,
+            Err(e) => e,
+        },
+        (None, Some(q)) => search_issues_dispatch(&repo_str, q, kind, state, sort, limit, labels),
+        (None, None) => list_issues_internal(
+            &repo_str,
+            kind,
+            state,
+            sort.unwrap_or("created"),
+            limit,
+            labels,
+        ),
+    }
+}
+
 /// Fetch, search, or list GitHub issues/PRs/Discussions.
 ///
 /// Mode determined by parameters:
@@ -1168,47 +1214,9 @@ pub fn github_issues(
     limit: usize,
     labels: Option<&str>,
 ) -> PyResult<String> {
-    // Resolve repo: explicit or auto-detect from cwd
-    let repo_str = match repo {
-        Some(r) => r.to_string(),
-        None => match detect_git_repo(".") {
-            Some(r) => r,
-            None => {
-                return Ok(
-                    "No repo specified and could not auto-detect from git remote.".to_string(),
-                )
-            }
-        },
-    };
-    if let Some(err) = git_refs::validate_repo(&repo_str) {
-        return Ok(err);
-    }
-
-    match (number, query) {
-        (Some(num), _) => {
-            // FETCH mode
-            let (text, _cache) = fetch_issue_internal(&repo_str, num)
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-            Ok(text)
-        }
-        (None, Some(q)) => {
-            // SEARCH mode
-            Ok(search_issues_dispatch(
-                &repo_str, q, kind, state, sort, limit, labels,
-            ))
-        }
-        (None, None) => {
-            // LIST mode
-            Ok(list_issues_internal(
-                &repo_str,
-                kind,
-                state,
-                sort.unwrap_or("created"),
-                limit,
-                labels,
-            ))
-        }
-    }
+    Ok(github_issues_rust(
+        repo, number, query, kind, state, sort, limit, labels,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,7 +1440,7 @@ fn search_discussions_graphql(
 }
 
 /// Route SEARCH mode to the right backend based on `kind`.
-fn search_issues_dispatch(
+pub fn search_issues_dispatch(
     repo: &str,
     query: &str,
     kind: &str,
@@ -1649,7 +1657,7 @@ fn list_discussions_graphql(repo: &str, state: &str, sort: &str, per_page: usize
     out.trim_end().to_string()
 }
 
-fn list_issues_internal(
+pub fn list_issues_internal(
     repo: &str,
     kind: &str,
     state: &str,

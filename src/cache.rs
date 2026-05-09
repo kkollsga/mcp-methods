@@ -38,6 +38,12 @@ pub struct ElementCache {
     store: HashMap<(String, u64), HashMap<String, Value>>,
 }
 
+impl Default for ElementCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl ElementCache {
     #[new]

@@ -49,7 +49,7 @@ Repository = "https://github.com/kkollsga/mcp-methods"
 Issues = "https://github.com/kkollsga/mcp-methods/issues"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["python-extension"]
 python-source = "python"
 module-name = "mcp_methods._mcp_methods"
 

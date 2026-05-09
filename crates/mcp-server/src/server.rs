@@ -1,8 +1,12 @@
 //! MCP `ServerHandler` implementation.
 //!
-//! Phase 1 surface: server identity, instructions, capabilities, ping tool.
-//! Phase 2 adds: source tools (`read_source`, `grep`, `list_source`)
-//! gated on the server having an active source-roots provider.
+//! Phase 1: server identity, ping tool.
+//! Phase 2: source tools (`read_source`, `grep`, `list_source`)
+//!          gated on an active source-roots provider.
+//! Phase 3: github tools (`github_issues`, `github_api`) — always
+//!          registered (they don't need a source root); the active
+//!          repo is resolved per-call from a configured default + an
+//!          optional `repo_name=` argument.
 //!
 //! The source-roots provider is dynamic — workspace mode swaps it as
 //! the active repo changes; single-graph and watch modes wire it to
@@ -24,6 +28,11 @@ use crate::source::{
     self, resolve_dir_under_roots, GrepOpts, ListOpts, ReadOpts, SourceRootsProvider,
 };
 
+/// Provider returning the active GitHub repo (e.g. `"pydata/xarray"`)
+/// or `None` when nothing is bound. Workspace mode wires this to the
+/// active workspace repo; single-graph mode can pin a fixed value.
+pub type RepoProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Per-server runtime state shared by every tool dispatch.
 #[derive(Clone, Default)]
 pub struct ServerOptions {
@@ -34,6 +43,9 @@ pub struct ServerOptions {
     /// Dynamic provider returning the active source roots, if any.
     /// `None` disables the source tools entirely.
     pub source_roots: Option<SourceRootsProvider>,
+    /// Dynamic provider returning the active GitHub repo (org/repo).
+    /// When `None`, github tools require a per-call `repo_name=` arg.
+    pub default_repo: Option<RepoProvider>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -44,6 +56,10 @@ impl std::fmt::Debug for ServerOptions {
             .field(
                 "source_roots",
                 &self.source_roots.as_ref().map(|_| "<provider>"),
+            )
+            .field(
+                "default_repo",
+                &self.default_repo.as_ref().map(|_| "<provider>"),
             )
             .finish()
     }
@@ -57,6 +73,7 @@ impl ServerOptions {
                 .or_else(|| Some(fallback_name.to_string())),
             instructions: manifest.and_then(|m| m.instructions.clone()),
             source_roots: None,
+            default_repo: None,
         }
     }
 
@@ -68,6 +85,16 @@ impl ServerOptions {
 
     pub fn with_dynamic_source_roots(mut self, provider: SourceRootsProvider) -> Self {
         self.source_roots = Some(provider);
+        self
+    }
+
+    pub fn with_static_repo(mut self, repo: String) -> Self {
+        self.default_repo = Some(Arc::new(move || Some(repo.clone())));
+        self
+    }
+
+    pub fn with_dynamic_repo(mut self, provider: RepoProvider) -> Self {
+        self.default_repo = Some(provider);
         self
     }
 }
@@ -122,6 +149,58 @@ pub struct GrepArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GithubIssuesArgs {
+    /// GitHub issue / PR / Discussion number (FETCH mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    /// org/repo override; defaults to the active server repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Free-text query (SEARCH mode). When set, `number` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// "issue" | "pr" | "discussion" | "all" (default).
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// "open" (default) | "closed" | "all".
+    #[serde(default = "default_state")]
+    pub state: String,
+    /// Sort key. Default "created" for list mode, relevance for search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    /// Max results to return (default 20).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Comma-separated label filter (e.g. "bug,P0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<String>,
+}
+
+fn default_kind() -> String {
+    "all".to_string()
+}
+fn default_state() -> String {
+    "open".to_string()
+}
+fn default_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GithubApiArgs {
+    /// API path. Relative paths (e.g. "pulls?state=open", "commits/abc",
+    /// "branches", "compare/main...x") are prefixed with /repos/<repo_name>/.
+    /// Absolute resources ("search/issues?q=...", "users/octocat") pass through.
+    pub path: String,
+    /// org/repo override; defaults to the active server repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Truncate response body at N chars (default 80,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncate_at: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListSourceArgs {
     /// Subdirectory relative to the source root (default ``"."``).
     #[serde(default = "default_path")]
@@ -168,6 +247,38 @@ impl McpServer {
             Some(provider) => provider(),
             None => Vec::new(),
         }
+    }
+
+    /// Resolve the active repo: per-call override → configured default →
+    /// auto-detect from cwd (last-resort fallback). Returns the resolved
+    /// repo string and an `Err` (formatted user message) if none is found
+    /// or the value is malformed.
+    fn resolve_repo(&self, override_repo: Option<String>) -> Result<String, String> {
+        if let Some(r) = override_repo {
+            if let Some(err) = _mcp_methods::git_refs::validate_repo(&r) {
+                return Err(err);
+            }
+            return Ok(r);
+        }
+        if let Some(provider) = &self.options.default_repo {
+            if let Some(r) = provider() {
+                if let Some(err) = _mcp_methods::git_refs::validate_repo(&r) {
+                    return Err(err);
+                }
+                return Ok(r);
+            }
+        }
+        // Auto-detect last-resort
+        if let Some(detected) = _mcp_methods::github::detect_git_repo(".") {
+            if _mcp_methods::git_refs::validate_repo(&detected).is_none() {
+                return Ok(detected);
+            }
+        }
+        Err(
+            "No active repository. Pass `repo_name='org/repo'`, configure a default in the \
+             server, or run from a directory whose git remote points at github.com."
+                .to_string(),
+        )
     }
 
     #[tool(
@@ -272,6 +383,61 @@ impl McpServer {
             dirs_only: args.dirs_only,
         };
         let body = source::list_source(&target, &primary, &opts);
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Search, list, or fetch GitHub issues / pull requests / Discussions. \
+                       Pass `number=N` for FETCH (single issue/PR/discussion); `query=\"...\"` \
+                       for SEARCH (across issues+PRs and Discussions); neither for LIST. \
+                       `kind` ∈ \"issue\" / \"pr\" / \"discussion\" / \"all\" (default). \
+                       `state` ∈ \"open\" (default) / \"closed\" / \"all\". `limit` caps \
+                       result count (default 20). `labels` is a comma-separated string. \
+                       `repo_name=\"org/repo\"` overrides the active repo for one call."
+    )]
+    async fn github_issues(
+        &self,
+        Parameters(args): Parameters<GithubIssuesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo = match self.resolve_repo(args.repo_name) {
+            Ok(r) => r,
+            Err(msg) => {
+                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+            }
+        };
+        let body = _mcp_methods::github::github_issues_rust(
+            Some(&repo),
+            args.number,
+            args.query.as_deref(),
+            &args.kind,
+            &args.state,
+            args.sort.as_deref(),
+            args.limit,
+            args.labels.as_deref(),
+        );
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Read-only GET against the GitHub REST API. `path` may be a \
+                       repo-relative endpoint (\"pulls?state=open\", \"commits/abc123\", \
+                       \"branches\", \"compare/main...feature\") which is auto-prefixed \
+                       with /repos/<repo_name>/, or an absolute resource (\"search/issues?q=...\", \
+                       \"users/octocat\") which passes through. Returns JSON, truncated at \
+                       80 KB by default."
+    )]
+    async fn github_api(
+        &self,
+        Parameters(args): Parameters<GithubApiArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo = match self.resolve_repo(args.repo_name) {
+            Ok(r) => r,
+            Err(msg) => {
+                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+            }
+        };
+        let truncate_at = args.truncate_at.unwrap_or(80_000);
+        let body = _mcp_methods::github::git_api_internal(&repo, &args.path, truncate_at);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }

@@ -17,7 +17,15 @@ description = "Reusable utility methods for MCP servers — Rust core"
 
 [lib]
 name = "_mcp_methods"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# `python-extension` toggles pyo3's extension-module feature. Activated
+# by maturin when building the wheel (see pyproject.toml). Off by
+# default so the rlib can be linked into a normal Rust binary that
+# embeds CPython itself.
+[features]
+default = []
+python-extension = ["pyo3/extension-module"]
 
 [dependencies]
 pyo3 = "0.28.2"

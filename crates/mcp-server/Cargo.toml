@@ -11,6 +11,11 @@ name = "mcp-server"
 path = "src/main.rs"
 
 [dependencies]
+# Sibling crate: re-uses mcp-methods's pure-Rust internals (github API,
+# discussion compaction, ElementCache). The PyO3 layer is in the cdylib;
+# we depend on the rlib output here.
+mcp-methods = { path = "../.." }
+
 # MCP protocol
 rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "schemars"] }
 

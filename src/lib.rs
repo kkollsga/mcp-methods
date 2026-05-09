@@ -1,14 +1,26 @@
+//! ``mcp-methods`` — primitives for building MCP servers.
+//!
+//! The crate ships as both a Python extension (`cdylib`, exported as the
+//! `mcp_methods._mcp_methods` Python module) and a Rust library (`rlib`,
+//! consumable from other Rust crates such as the sibling `mcp-server`
+//! binary in this workspace).
+//!
+//! Public Rust API surface — call these from another Rust crate via
+//! ``use _mcp_methods::module::function;``. The PyO3 wrappers in
+//! ``#[pymodule] fn _mcp_methods(...)`` re-export the same functions for
+//! Python callers.
+
 use pyo3::prelude::*;
 
-mod cache;
-mod compact;
-mod files;
-mod git_refs;
-mod github;
-mod grep;
-mod html;
-mod json_grep;
-mod list_dir;
+pub mod cache;
+pub mod compact;
+pub mod files;
+pub mod git_refs;
+pub mod github;
+pub mod grep;
+pub mod html;
+pub mod json_grep;
+pub mod list_dir;
 
 #[pymodule]
 fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {

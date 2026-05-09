@@ -1,0 +1,13 @@
+# Embed an rpath for libpython3.12 so the mcp-server binary can find it
+# at runtime. Without this, dyld errors out because pyo3 emits @rpath/libpython
+# but the rpath itself is never set.
+#
+# This is a development-time hack; release distribution should rely on
+# bundling libpython next to the binary or static-linking via the
+# `python-static` PyO3 feature.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/opt/miniconda3/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/opt/miniconda3/lib"]
