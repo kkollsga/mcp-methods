@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+Closing the kglite wishlist gaps (inbox/read/2026-05-10) so the 5 deployed
+YAML manifests + ~3,000 LoC of custom Python MCP servers can retire onto
+this framework.
+
+### `mcp-server` framework
+
+- **`.env` auto-loading at startup.** Walks upward from the workspace /
+  source-root / watch / cwd looking for `.env`; loads `KEY=VALUE` lines
+  into the process env (skip blanks/`#`, strip outer quotes, do not
+  overwrite existing). Operators who want a non-implicit pick declare
+  `env_file: ../.env` at the YAML top level.
+- **`github_issues` element drill-down.** New `element_id` / `lines` /
+  `grep` / `context` / `refresh` arguments on the MCP tool. FETCH
+  responses cache collapsed `cb_N` / `patch_N` / `comment_N` / `overflow`
+  elements server-side (via `_mcp_methods::cache::ElementCache`); pass
+  `element_id="cb_1"` (with the same `number=N`) to retrieve a single
+  element without re-fetching, optionally narrowed by `lines="40-60"` or
+  `grep="pat"`.
+- **Honest tool listing.** `github_issues` and `github_api` are now
+  registered dynamically at boot only when `GITHUB_TOKEN` is set; they
+  no longer appear in tool-listing responses when the agent couldn't use
+  them. Boot-time decision — restart to pick up a token that appears
+  later. The framework binary logs an `info` line announcing the skip.
+- **`Workspace::last_built_sha(name)`.** New public reader exposing the
+  HEAD SHA persisted after the last successful post-activate hook for a
+  repo. Backed by an additive `last_built_sha` field on the per-repo
+  `inventory.json` entry (`#[serde(default)]` keeps older inventories
+  loading cleanly). Foundation for the auto-rebuild-gating work landing
+  in Phase C.
+- **Embedder lifecycle (`mcp_server::embedder`).** New module exposing
+  `EmbedderHandle` (load/unload/embed/touch + idle tracking) and
+  `spawn_idle_watch` for the eviction tokio task. `PythonExtensions`
+  now yields `Option<Arc<EmbedderHandle>>` plus `embedder_cooldown` and
+  `embedder_watcher`. The framework owns the cooldown timer; the value
+  is extracted from `embedder.kwargs.cooldown` in the manifest. Embedder
+  classes must expose `embed` + `dimension`; `load` / `unload` are
+  optional but called automatically when present.
+- **Manifest schema** — new `env_file:` top-level key (added to
+  `ALLOWED_TOP_KEYS`; strict-unknown-key validation preserved).
+
 ## 0.3.21
 
 - **`McpServer::register_typed_tool<T, F>(name, description, handler)`**

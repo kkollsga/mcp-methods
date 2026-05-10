@@ -15,7 +15,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -208,6 +208,29 @@ pub struct GithubIssuesArgs {
     /// Comma-separated label filter (e.g. "bug,P0").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<String>,
+    /// Drill-down: cached collapsed-element ID returned by a previous
+    /// FETCH (e.g. ``"cb_1"``, ``"comment_3"``, ``"overflow"``). When
+    /// set, `number` is required and the call returns the cached
+    /// element instead of re-fetching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
+    /// Line range filter for drill-down (``"N-M"`` 1-indexed). Only
+    /// meaningful alongside `element_id`. For comment segments,
+    /// interpreted as comment-index range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<String>,
+    /// Regex pattern for drill-down. Only meaningful alongside
+    /// `element_id`. Returns matching lines/items plus context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grep: Option<String>,
+    /// Context lines around each grep match in drill-down mode
+    /// (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<usize>,
+    /// Force a re-fetch (skip cache) when in FETCH mode. Useful after
+    /// an issue has been updated upstream.
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 fn default_kind() -> String {
@@ -231,6 +254,11 @@ impl Default for GithubIssuesArgs {
             sort: None,
             limit: default_limit(),
             labels: None,
+            element_id: None,
+            lines: None,
+            grep: None,
+            context: None,
+            refresh: false,
         }
     }
 }
@@ -308,6 +336,14 @@ impl McpServer {
         }
         let default_repo = self.options.default_repo.clone();
         let repo_provider = default_repo.clone();
+        // Per-server ElementCache: stores collapsed elements (cb_1,
+        // patch_2, comment_3, overflow) emitted by FETCH so the agent
+        // can drill down via `element_id` on subsequent calls without
+        // re-fetching the whole issue. Mutex contention is negligible
+        // for MCP's serial request dispatch.
+        let cache: Arc<Mutex<_mcp_methods::cache::ElementCache>> =
+            Arc::new(Mutex::new(_mcp_methods::cache::ElementCache::new()));
+        let cache_for_issues = cache.clone();
         self.register_typed_tool::<GithubIssuesArgs, _>(
             "github_issues",
             "Search, list, or fetch GitHub issues / pull requests / Discussions. \
@@ -316,12 +352,42 @@ impl McpServer {
              `kind` ∈ \"issue\" / \"pr\" / \"discussion\" / \"all\" (default). \
              `state` ∈ \"open\" (default) / \"closed\" / \"all\". `limit` caps \
              result count (default 20). `labels` is a comma-separated string. \
-             `repo_name=\"org/repo\"` overrides the active repo for one call.",
-            move |args: GithubIssuesArgs| match resolve_repo_from(
-                repo_provider.as_ref(),
-                args.repo_name.clone(),
-            ) {
-                Ok(repo) => _mcp_methods::github::github_issues_rust(
+             `repo_name=\"org/repo\"` overrides the active repo for one call. \
+             FETCH responses collapse big code blocks / patches / comments into \
+             `cb_N` / `patch_N` / `comment_N` / `overflow` placeholders; pass \
+             `element_id=\"cb_1\"` (with the same `number`) to retrieve a single \
+             element, optionally narrowed by `lines=\"40-60\"` or `grep=\"pat\"`. \
+             `refresh=true` bypasses the cache for re-fetch.",
+            move |args: GithubIssuesArgs| {
+                let repo = match resolve_repo_from(repo_provider.as_ref(), args.repo_name.clone()) {
+                    Ok(r) => r,
+                    Err(msg) => return msg,
+                };
+                // FETCH / drill-down: route through ElementCache so cb_*,
+                // patch_*, overflow stays addressable. Cache.fetch_issue
+                // does both the network fetch and the drill-down branch.
+                if let Some(number) = args.number {
+                    let context = args.context.unwrap_or(3);
+                    let mut guard = cache_for_issues.lock().unwrap();
+                    return match guard.fetch_issue(
+                        &repo,
+                        number,
+                        args.element_id.as_deref(),
+                        args.lines.as_deref(),
+                        args.grep.as_deref(),
+                        context,
+                        args.refresh,
+                    ) {
+                        Ok(body) => body,
+                        Err(e) => format!("github_issues fetch error: {e}"),
+                    };
+                }
+                if args.element_id.is_some() {
+                    return "element_id requires `number=N` (the issue/PR being drilled into)."
+                        .to_string();
+                }
+                // SEARCH / LIST: no caching, pure delegation.
+                _mcp_methods::github::github_issues_rust(
                     Some(&repo),
                     args.number,
                     args.query.as_deref(),
@@ -330,8 +396,7 @@ impl McpServer {
                     args.sort.as_deref(),
                     args.limit,
                     args.labels.as_deref(),
-                ),
-                Err(msg) => msg,
+                )
             },
         );
         let repo_provider = default_repo;
