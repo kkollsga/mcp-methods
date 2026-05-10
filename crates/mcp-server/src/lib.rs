@@ -46,6 +46,7 @@ pub use manifest::{
     EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
     WorkspaceConfig, WorkspaceKind,
 };
+pub use python::build_tool_attr;
 pub use runtime::{
     apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
     PythonExtensions,

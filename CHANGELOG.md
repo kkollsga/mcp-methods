@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.23
+
+Patch release in response to kglite's 0.3.22 smoke-test findings
+(inbox/read/2026-05-10-from-kglite-smoke-test-findings.md). The
+framework stays domain-agnostic — Cypher tool registration is a
+graph-engine concern, so it stays on the kglite side. What we expose
+here is the primitive that lets downstream binaries build that
+registration cleanly.
+
+### `mcp-server` framework
+
+- **`mcp_server::build_tool_attr` now public.** Closes the primitives
+  half of Gap A: downstream binaries can now build the rmcp `Tool`
+  attr from `(name, description, json_schema)` in the same shape the
+  framework uses internally and pair it with `ToolRoute::new_dyn` to
+  register their own dynamic tools — Cypher runners, custom DSL
+  handlers, anything else. No API divergence between the framework's
+  own registrations and downstream ones.
+
+### `mcp-methods` (Rust core)
+
+- **`auth_token` filters empty strings.** Closes Gap C: an env var
+  set to `""` (e.g. for clearing the token without unbinding) was
+  reported as "token present" by `has_git_token()`, causing the
+  github tools to register and then 401 on the first call. Now an
+  empty string is treated identically to a missing var. Test added.
+
 ## 0.3.22
 
 Closing the kglite wishlist gaps (inbox/read/2026-05-10) so the 5 deployed

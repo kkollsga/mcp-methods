@@ -72,9 +72,15 @@ pub fn estimate_json_size(val: &Value) -> usize {
 // ---------------------------------------------------------------------------
 
 fn auth_token() -> Option<String> {
+    // `env::var` returns Ok("") for an env var set to the empty string,
+    // which would mark `has_git_token()` as `true` and let the github
+    // tools register, only to 401 on the first call. Filter empties so
+    // operators can clear the token by setting it to "" without having
+    // to delete the binding entirely.
     env::var("GITHUB_TOKEN")
         .or_else(|_| env::var("GH_TOKEN"))
         .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Check if a GitHub token is available in the environment.
@@ -1893,4 +1899,52 @@ fn format_mixed_list(repo: &str, state: &str, items: &[&Value]) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tests mutate process env; serialise to avoid cross-test races.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn empty_string_token_is_treated_as_missing() {
+        let _g = env_lock();
+        // Save original values so we can restore them after the test.
+        let prev_gh_token = std::env::var("GITHUB_TOKEN").ok();
+        let prev_alt_token = std::env::var("GH_TOKEN").ok();
+
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "");
+            std::env::remove_var("GH_TOKEN");
+        }
+        assert!(
+            !has_git_token(),
+            "empty GITHUB_TOKEN must be treated as missing"
+        );
+
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "ghp_real_value");
+        }
+        assert!(has_git_token(), "non-empty token must be detected");
+
+        // Restore.
+        unsafe {
+            match prev_gh_token {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+            match prev_alt_token {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+        }
+    }
 }

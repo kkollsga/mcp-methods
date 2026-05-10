@@ -390,7 +390,15 @@ fn json_value_to_object(
     }
 }
 
-fn build_tool_attr(
+/// Build an rmcp [`Tool`] attr from the user-facing pieces of a
+/// dynamic tool registration: name, optional description, and an
+/// arbitrary JSON Schema map.
+///
+/// Public so downstream consumers that build their own dynamic
+/// `ToolRoute::new_dyn` registrations (without going through the
+/// framework's `register_*` helpers) can construct the matching
+/// attr in the same shape the framework uses.
+pub fn build_tool_attr(
     name: &str,
     description: Option<&str>,
     schema: serde_json::Map<String, serde_json::Value>,
