@@ -43,13 +43,19 @@ use mcp_server::{
     workspace, PythonExtensions,
 };
 
-/// Operating mode picked from the CLI flags.
+/// Operating mode picked from the CLI flags and the manifest's
+/// optional `workspace:` block. Manifest declarations win over CLI
+/// flags (same precedence rule as `source_root:`).
 #[derive(Debug, Clone)]
 enum Mode {
     /// Source-root mode — single fixed directory bound to the source tools.
     SourceRoot { dir: PathBuf },
-    /// Workspace mode — clone-and-track flow, idle-sweep inventory.
+    /// Workspace mode (github flavour) — clone-and-track flow, idle-sweep inventory.
     Workspace { dir: PathBuf },
+    /// Workspace mode (local flavour) — bind a fixed local dir + fire
+    /// post-activate hook on every change. Set via `workspace.kind: local`
+    /// in the manifest.
+    LocalWorkspace { root: PathBuf, watch: bool },
     /// Watch mode — auto-rebuild trigger on file changes.
     Watch { dir: PathBuf },
     /// Framework only — no source binding. Useful for testing the
@@ -127,6 +133,7 @@ fn default_manifest_path(mode: &Mode) -> Option<PathBuf> {
         Mode::SourceRoot { .. } => None,
         Mode::Workspace { dir } => find_workspace_manifest(dir),
         Mode::Watch { dir } => find_workspace_manifest(dir),
+        Mode::LocalWorkspace { root, .. } => find_workspace_manifest(root),
         Mode::Bare => None,
     }
 }
@@ -154,6 +161,7 @@ fn fallback_name(mode: &Mode) -> &'static str {
     match mode {
         Mode::SourceRoot { .. } => "MCP Server (source-root)",
         Mode::Workspace { .. } => "MCP Server (workspace)",
+        Mode::LocalWorkspace { .. } => "MCP Server (local-workspace)",
         Mode::Watch { .. } => "MCP Server (watch)",
         Mode::Bare => "MCP Server",
     }
@@ -169,6 +177,11 @@ fn print_boot_summary(
     let mode_label = match mode {
         Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
         Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
+        Mode::LocalWorkspace { root, watch } => format!(
+            "local-workspace [{}{}]",
+            root.display(),
+            if *watch { " +watch" } else { "" }
+        ),
         Mode::Watch { dir } => format!("watch [{}]", dir.display()),
         Mode::Bare => "bare framework".to_string(),
     };
@@ -199,7 +212,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let mode = pick_mode(&cli);
+    let mut mode = pick_mode(&cli);
 
     if let Mode::SourceRoot { dir } = &mode {
         if !dir.is_dir() {
@@ -220,9 +233,33 @@ async fn main() -> Result<()> {
 
     let manifest = load_manifest(&cli, &mode).context("manifest load failed")?;
 
+    // Manifest `workspace.kind: local` wins over CLI flags (same rule
+    // as manifest `source_root:` overriding bare mode). Convert the
+    // mode here before any binding logic runs.
+    if let Some(m) = manifest.as_ref() {
+        if let Some(wcfg) = m.workspace.as_ref() {
+            if wcfg.kind == mcp_server::WorkspaceKind::Local {
+                let raw_root = wcfg.root.as_ref().expect("validated by manifest loader");
+                let base = m
+                    .yaml_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let resolved = base.join(raw_root).canonicalize().with_context(|| {
+                    format!("workspace.root {raw_root:?} resolves to a path that does not exist")
+                })?;
+                mode = Mode::LocalWorkspace {
+                    root: resolved,
+                    watch: wcfg.watch,
+                };
+            }
+        }
+    }
+
     // Load .env before anything reads env vars (e.g. github tools' GITHUB_TOKEN).
     let env_start_dir: PathBuf = match &mode {
         Mode::SourceRoot { dir } | Mode::Workspace { dir } | Mode::Watch { dir } => dir.clone(),
+        Mode::LocalWorkspace { root, .. } => root.clone(),
         Mode::Bare => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
     let env_file_loaded = load_env_for_mode(manifest.as_ref(), &env_start_dir)?;
@@ -247,6 +284,11 @@ async fn main() -> Result<()> {
             let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             let ws = workspace::Workspace::open(canon, cli.stale_after_days, None)
                 .context("workspace initialisation failed")?;
+            options = options.with_workspace(ws);
+        }
+        Mode::LocalWorkspace { root, .. } => {
+            let ws = workspace::Workspace::open_local(root.clone(), None)
+                .context("local-workspace initialisation failed")?;
             options = options.with_workspace(ws);
         }
         Mode::Bare => {
@@ -278,10 +320,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    let _watch_handle = if let Mode::Watch { dir } = &mode {
-        maybe_watch(Some(dir), None)?
-    } else {
-        None
+    let _watch_handle = match &mode {
+        Mode::Watch { dir } => maybe_watch(Some(dir), None)?,
+        Mode::LocalWorkspace { root, watch: true } => maybe_watch(Some(root), None)?,
+        _ => None,
     };
 
     print_boot_summary(

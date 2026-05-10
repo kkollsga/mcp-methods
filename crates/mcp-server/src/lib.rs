@@ -37,6 +37,7 @@ pub use embedder::{spawn_idle_watch as spawn_embedder_watch, EmbedderHandle};
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
     EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
+    WorkspaceConfig, WorkspaceKind,
 };
 pub use runtime::{
     apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,

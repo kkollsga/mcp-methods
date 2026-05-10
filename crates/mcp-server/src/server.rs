@@ -48,6 +48,11 @@ pub struct ServerOptions {
     pub default_repo: Option<RepoProvider>,
     /// Workspace handle (when `--workspace` mode is active).
     pub workspace: Option<crate::workspace::Workspace>,
+    /// Manifest-declared `builtins:` block. Surfaced verbatim so
+    /// downstream consumers (kglite's `graph_overview` tool, for
+    /// example) can read `temp_cleanup` / `save_graph` settings and
+    /// implement the corresponding behaviour without re-parsing YAML.
+    pub builtins: crate::manifest::BuiltinsConfig,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -77,6 +82,7 @@ impl ServerOptions {
             source_roots: None,
             default_repo: None,
             workspace: None,
+            builtins: manifest.map(|m| m.builtins.clone()).unwrap_or_default(),
         }
     }
 
@@ -169,7 +175,13 @@ pub struct GrepArgs {
     pub case_insensitive: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SetRootDirArgs {
+    /// Absolute or relative path to bind as the new source root.
+    pub path: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RepoManagementArgs {
     /// org/repo to clone and activate. Omit for list mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +192,11 @@ pub struct RepoManagementArgs {
     /// Refresh the active repo (no name required).
     #[serde(default)]
     pub update: bool,
+    /// Bypass the auto-rebuild gate: re-run the post-activate hook
+    /// even when the HEAD SHA matches the last successful build.
+    /// Useful after upgrading the builder code itself.
+    #[serde(default)]
+    pub force_rebuild: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -318,7 +335,33 @@ impl McpServer {
             tool_router: Self::tool_router(),
         };
         server.register_github_tools_if_authorized();
+        server.register_local_workspace_tools();
         server
+    }
+
+    /// Register `set_root_dir` when the bound workspace is local-flavoured.
+    /// Github workspaces use `repo_management(name='org/repo')` to swap
+    /// roots; local workspaces need this alternative entry point.
+    fn register_local_workspace_tools(&mut self) {
+        let Some(ws) = self.options.workspace.clone() else {
+            return;
+        };
+        if !matches!(ws.kind(), crate::workspace::WorkspaceKind::Local) {
+            return;
+        }
+        self.register_typed_tool::<SetRootDirArgs, _>(
+            "set_root_dir",
+            "Swap the active source root (local-workspace mode only). Pass `path` \
+             to a directory; the framework canonicalises it, rebinds the source \
+             tools (`read_source`, `grep`, `list_source`), and fires the post-\
+             activate hook so any downstream graph rebuilds against the new root. \
+             Inventory persists across swaps; SHA-gating skips rebuilds when the \
+             same root is re-bound with no content changes.",
+            move |args: SetRootDirArgs| {
+                let p = std::path::PathBuf::from(&args.path);
+                ws.set_root_dir(&p)
+            },
+        );
     }
 
     /// Register `github_issues` + `github_api` as dynamic tools — but
@@ -419,6 +462,16 @@ impl McpServer {
                 Err(msg) => msg,
             },
         );
+    }
+
+    /// Read the manifest-declared `builtins:` config. Downstream
+    /// consumers (e.g. a `graph_overview` tool that wipes a `temp/`
+    /// directory when `temp_cleanup: on_overview` is set) call this
+    /// to discover what flags the operator asked for. The framework
+    /// itself does not act on this — that would force it to interpret
+    /// graph-specific semantics it shouldn't know about.
+    pub fn builtins(&self) -> &crate::manifest::BuiltinsConfig {
+        &self.options.builtins
     }
 
     /// Mutable access to the tool router for dynamic tool registration.
@@ -626,16 +679,23 @@ impl McpServer {
                        clone (if missing) and activate it as the source root for \
                        read_source / grep / list_source. Pass `delete=true` to remove a \
                        repo. Pass `update=true` to fetch upstream changes for the active \
-                       repo. Call with no arguments to list all known repos with their \
-                       last-access counts. Idle repos auto-sweep on each call (default 7 \
-                       days, configurable via --stale-after-days)."
+                       repo (rebuild auto-skipped when HEAD hasn't moved since the last \
+                       build; set `force_rebuild=true` to bypass). Call with no \
+                       arguments to list all known repos with their last-access counts. \
+                       Idle repos auto-sweep on each call (default 7 days, configurable \
+                       via --stale-after-days)."
     )]
     async fn repo_management(
         &self,
         Parameters(args): Parameters<RepoManagementArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = match &self.options.workspace {
-            Some(ws) => ws.repo_management(args.name.as_deref(), args.delete, args.update),
+            Some(ws) => ws.repo_management(
+                args.name.as_deref(),
+                args.delete,
+                args.update,
+                args.force_rebuild,
+            ),
             None => "repo_management requires --workspace mode.".to_string(),
         };
         Ok(CallToolResult::success(vec![Content::text(body)]))
@@ -705,6 +765,19 @@ mod tests {
     fn options_from_manifest_uses_name_when_set() {
         let opts = ServerOptions::from_manifest(None, "Fallback");
         assert_eq!(opts.name.as_deref(), Some("Fallback"));
+    }
+
+    #[test]
+    fn builtins_exposed_via_server() {
+        use crate::manifest::{BuiltinsConfig, TempCleanup};
+        let mut opts = ServerOptions::default();
+        opts.builtins = BuiltinsConfig {
+            save_graph: true,
+            temp_cleanup: TempCleanup::OnOverview,
+        };
+        let server = McpServer::new(opts);
+        assert!(server.builtins().save_graph);
+        assert_eq!(server.builtins().temp_cleanup, TempCleanup::OnOverview);
     }
 
     #[test]

@@ -41,6 +41,34 @@ this framework.
   optional but called automatically when present.
 - **Manifest schema** — new `env_file:` top-level key (added to
   `ALLOWED_TOP_KEYS`; strict-unknown-key validation preserved).
+- **Auto-rebuild gating on `repo_management(update=True)`.** Captures
+  the new HEAD SHA on each clone/fetch; when the gate sees
+  `action == "current"` AND `prev_built_sha == new_head` AND the user
+  did not pass `force_rebuild`, the post-activate hook is skipped and
+  the response carries a `[build skipped: ...]` marker. New
+  `force_rebuild: bool` argument on the `repo_management` MCP tool
+  bypasses the gate (useful after the builder itself has been
+  upgraded).
+- **`workspace.kind: local` mode** — new top-level manifest block
+  `workspace: { kind, root, watch }`. `kind: local` binds a fixed
+  directory as the source root and reuses the same auto-rebuild
+  gating (with a cheap recursive-mtime fingerprint instead of git
+  HEAD SHA). When the manifest declares `kind: local`, that wins over
+  the CLI `--workspace` flag's interpretation — manifest is the
+  source of truth, same rule as `source_root:`. `watch: true` wires
+  the framework's debounced file watcher to the root for hot-reload
+  rebuilds. Local mode rejects `name=` / `delete=true` in
+  `repo_management` with a friendly error. New `set_root_dir(path)`
+  MCP tool (registered automatically when in local mode) swaps the
+  active root at runtime — drop-in for the legacy `code_review` server
+  workflow. `inventory.json` is stored under `<root>/.mcp-workspace/`
+  in local mode to keep the user's tree clean.
+- **`McpServer::builtins()` public getter.** Surfaces the manifest's
+  `builtins:` block (`save_graph`, `temp_cleanup`) verbatim so
+  downstream consumers (e.g. kglite's `graph_overview` tool deciding
+  whether to wipe `temp/`) can read the operator's intent without
+  re-parsing YAML. The framework does not act on these — it doesn't
+  know what an "overview" call means.
 
 ## 0.3.21
 

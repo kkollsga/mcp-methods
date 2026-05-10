@@ -39,7 +39,10 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "embedder",
     "builtins",
     "env_file",
+    "workspace",
 ];
+const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch"];
+const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
 const ALLOWED_TRUST_KEYS: &[&str] = &["allow_python_tools", "allow_embedder"];
 const ALLOWED_TOOL_KEYS: &[&str] = &[
     "name",
@@ -143,6 +146,37 @@ impl TempCleanup {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    /// Clone-and-track GitHub repos. The default when no `workspace:`
+    /// block is set and the operator passed `--workspace DIR`.
+    #[default]
+    Github,
+    /// Bind a fixed local directory as the active source root. No
+    /// cloning happens; `set_root_dir(path)` swaps the active root.
+    Local,
+}
+
+impl WorkspaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkspaceKind::Github => "github",
+            WorkspaceKind::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceConfig {
+    pub kind: WorkspaceKind,
+    /// Local-mode only: path to the directory to bind as the source
+    /// root. Relative paths resolve against the YAML's parent dir.
+    pub root: Option<String>,
+    /// Local-mode only: wire the framework's file watcher to `root`
+    /// (debounced rebuild trigger via the post-activate hook).
+    pub watch: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub yaml_path: PathBuf,
@@ -158,6 +192,10 @@ pub struct Manifest {
     /// When unset, the runtime walks upward from the start directory
     /// looking for a `.env` file.
     pub env_file: Option<String>,
+    /// Optional explicit workspace declaration. When set, this wins
+    /// over CLI `--workspace`/`--source-root` flags interpretation
+    /// (manifest is the source of truth — same rule as `source_root:`).
+    pub workspace: Option<WorkspaceConfig>,
 }
 
 /// Auto-detect ``<basename>_mcp.yaml`` next to a graph file.
@@ -242,6 +280,7 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
     let tools = build_tools(raw.get("tools"), yaml_path)?;
     let embedder = build_embedder(raw.get("embedder"), yaml_path)?;
     let builtins = build_builtins(raw.get("builtins"), yaml_path)?;
+    let workspace = build_workspace(raw.get("workspace"), yaml_path)?;
 
     Ok(Manifest {
         yaml_path: yaml_path.to_path_buf(),
@@ -254,7 +293,76 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
         embedder,
         builtins,
         env_file: optional_str(raw, "env_file", yaml_path)?,
+        workspace,
     })
+}
+
+fn build_workspace(
+    raw: Option<&serde_yaml::Value>,
+    yaml_path: &Path,
+) -> Result<Option<WorkspaceConfig>, ManifestError> {
+    let Some(raw) = raw else { return Ok(None) };
+    if matches!(raw, serde_yaml::Value::Null) {
+        return Ok(None);
+    }
+    let map = raw
+        .as_mapping()
+        .ok_or_else(|| ManifestError::at(yaml_path, "workspace must be a mapping"))?;
+    check_keys(map, ALLOWED_WORKSPACE_KEYS, "workspace keys", yaml_path)?;
+    let kind = match map.get("kind") {
+        None | Some(serde_yaml::Value::Null) => WorkspaceKind::default(),
+        Some(serde_yaml::Value::String(s)) => match s.as_str() {
+            "github" => WorkspaceKind::Github,
+            "local" => WorkspaceKind::Local,
+            other => {
+                return Err(ManifestError::at(
+                    yaml_path,
+                    format!(
+                        "workspace.kind must be one of {VALID_WORKSPACE_KIND:?}, got {other:?}"
+                    ),
+                ));
+            }
+        },
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!("workspace.kind must be one of {VALID_WORKSPACE_KIND:?}"),
+            ))
+        }
+    };
+    let root = match map.get("root") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            return Err(ManifestError::at(
+                yaml_path,
+                "workspace.root must be a non-empty string",
+            ))
+        }
+    };
+    let watch = match map.get("watch") {
+        None | Some(serde_yaml::Value::Null) => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                "workspace.watch must be a bool",
+            ))
+        }
+    };
+    if kind == WorkspaceKind::Local && root.is_none() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.kind: local requires workspace.root to be set",
+        ));
+    }
+    if kind == WorkspaceKind::Github && watch {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.watch is only valid with workspace.kind: local",
+        ));
+    }
+    Ok(Some(WorkspaceConfig { kind, root, watch }))
 }
 
 fn check_keys(
@@ -736,6 +844,54 @@ mod tests {
         let sibling = dir.path().join("demo_mcp.yaml");
         std::fs::write(&sibling, "name: x\n").unwrap();
         assert_eq!(find_sibling_manifest(&graph), Some(sibling));
+    }
+
+    #[test]
+    fn workspace_local_parses() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n  watch: true\n");
+        let m = load(f.path()).unwrap();
+        let w = m.workspace.unwrap();
+        assert_eq!(w.kind, WorkspaceKind::Local);
+        assert_eq!(w.root.as_deref(), Some("./src"));
+        assert!(w.watch);
+    }
+
+    #[test]
+    fn workspace_github_default_kind() {
+        let f = write_tmp("workspace: {}\n");
+        let m = load(f.path()).unwrap();
+        let w = m.workspace.unwrap();
+        assert_eq!(w.kind, WorkspaceKind::Github);
+        assert!(w.root.is_none());
+        assert!(!w.watch);
+    }
+
+    #[test]
+    fn workspace_local_without_root_errors() {
+        let f = write_tmp("workspace:\n  kind: local\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("requires workspace.root"));
+    }
+
+    #[test]
+    fn workspace_unknown_key_rejected() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./x\n  bogus: 1\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("unknown workspace keys"));
+    }
+
+    #[test]
+    fn workspace_invalid_kind_rejected() {
+        let f = write_tmp("workspace:\n  kind: docker\n  root: ./x\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("workspace.kind"));
+    }
+
+    #[test]
+    fn workspace_watch_invalid_for_github() {
+        let f = write_tmp("workspace:\n  kind: github\n  watch: true\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("watch is only valid"));
     }
 
     #[test]
