@@ -161,6 +161,43 @@ from mcp_methods import read_file
 content = read_file("src/main.py", ["/project"])
 ```
 
+## Deployment — `mcp-server` binary
+
+This crate also ships an MCP server binary at `crates/mcp-server`. Build
+and install it with:
+
+```bash
+cargo install --path crates/mcp-server
+# → ~/.cargo/bin/mcp-server
+```
+
+For deployments that previously pinned a binary path elsewhere (e.g.
+`/opt/miniconda3/envs/embeddings/bin/kglite-mcp-server`), drop a
+symlink:
+
+```bash
+ln -s ~/.cargo/bin/mcp-server /opt/miniconda3/envs/embeddings/bin/mcp-server
+```
+
+The binary is domain-agnostic — source tools + GitHub access + a
+manifest-driven tool surface. Downstream binaries (e.g. `kglite-mcp-server`)
+re-export `mcp_server::McpServer::new(...)` to layer graph-specific
+tools on top while reusing the boot sequence, `.env` loading, workspace
+mode, watch mode, and embedder lifecycle.
+
+Operating modes (set via CLI flag or the YAML manifest):
+
+| Mode | How to set | When to use |
+|---|---|---|
+| bare | no flag | testing the protocol layer in isolation |
+| source-root | `--source-root DIR` or YAML `source_root:` | fixed local directory; no clone |
+| workspace (github) | `--workspace DIR` | clone-and-track GitHub repos |
+| workspace (local) | YAML `workspace: { kind: local, root: ..., watch: ... }` | fixed local dir + optional file watcher; alternative to the legacy `code_review` server |
+| watch | `--watch DIR` | rebuild downstream artifacts on file changes |
+
+YAML manifest declarations win over CLI flags when both are set
+(same precedence rule as `source_root:`).
+
 ## Architecture
 
 All heavy lifting is in Rust (PyO3/maturin), compiled to a native Python extension:

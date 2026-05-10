@@ -91,6 +91,20 @@ and registers the same tools the bundled binary ships, one-to-one.
 
 A runnable end-to-end stub lives at `examples/fastmcp_demo.py`.
 
+### Documentation + regression suite
+
+- **README "Deployment" section.** Documents the `cargo install --path
+  crates/mcp-server` recipe, the symlink path for deployments that
+  pinned a binary elsewhere, and a table of the operating modes (bare /
+  source-root / workspace[github] / workspace[local] / watch) with how
+  to set each via CLI flag or manifest.
+- **Regression test for deployed manifests.** New integration test
+  (`crates/mcp-server/tests/deployed_manifests.rs`) asserts the schema
+  shapes used by the 5 production manifests at
+  `/Volumes/EksternalHome/Koding/MCP servers/` continue to load
+  cleanly. If any starts failing after a schema change, a production
+  manifest has been broken — fix the schema or migrate the deployment.
+
 ## 0.3.21
 
 - **`McpServer::register_typed_tool<T, F>(name, description, handler)`**
