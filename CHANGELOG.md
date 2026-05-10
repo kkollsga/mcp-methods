@@ -70,6 +70,27 @@ this framework.
   re-parsing YAML. The framework does not act on these — it doesn't
   know what an "overview" call means.
 
+### `mcp_methods.fastmcp` (Python)
+
+New composable helpers for FastMCP authors so each one can drop the
+boilerplate that the YAML+CLI binary handles. Each helper takes the
+FastMCP `app` and the dependency it needs (graph, source roots, …)
+and registers the same tools the bundled binary ships, one-to-one.
+
+- `register_overview(app, graph, overview_prefix=None)` — `graph_overview`.
+- `register_cypher_query(app, graph, csv_dir="temp/")` — `cypher_query`
+  with `format="csv"` writing uuid-named files for streaming/exports.
+- `register_source_tools(app, source_roots=[...])` — `read_source`,
+  `grep`, `list_source` with the same path-sandbox semantics as the
+  Rust framework (`os.path.realpath` rejects traversal). Wraps the
+  existing PyO3 surface; ~10-line wrappers, no logic duplication.
+- `register_save_graph(app, graph)` — `save_graph(path)`.
+- `serve_csv_via_http(directory, port=0, bind="127.0.0.1")` — CORS-
+  enabled HTTP server for serving CSV exports to browser-side agent
+  contexts. Returns `(server, base_url)`; runs in a daemon thread.
+
+A runnable end-to-end stub lives at `examples/fastmcp_demo.py`.
+
 ## 0.3.21
 
 - **`McpServer::register_typed_tool<T, F>(name, description, handler)`**
