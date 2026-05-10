@@ -1,17 +1,33 @@
 //! MCP `ServerHandler` implementation.
 //!
-//! Phase 1: server identity, ping tool.
-//! Phase 2: source tools (`read_source`, `grep`, `list_source`)
-//!          gated on an active source-roots provider.
-//! Phase 3: github tools (`github_issues`, `github_api`) — always
-//!          registered (they don't need a source root); the active
-//!          repo is resolved per-call from a configured default + an
-//!          optional `repo_name=` argument.
+//! Tool surface, top to bottom:
+//!
+//! - **Always registered**: `ping`; the source tools (`read_source`,
+//!   `grep`, `list_source`) gated on an active source-roots provider;
+//!   `repo_management` (no-ops outside `--workspace` mode).
+//! - **Conditionally registered at boot** (dynamic):
+//!   - `github_issues` and `github_api` — only when `GITHUB_TOKEN` is
+//!     reachable. This is "honest tool listing": agents see the tools
+//!     only when they can succeed. Decision is boot-time; restart the
+//!     server to pick up a token that appears later.
+//!   - `set_root_dir` — only when the bound workspace is local-flavoured
+//!     (`workspace.kind: local`); swaps the active root at runtime.
+//!   - Manifest-declared `python:` tools and `cypher:` tools — added by
+//!     downstream binaries through `apply_python_extensions`.
 //!
 //! The source-roots provider is dynamic — workspace mode swaps it as
-//! the active repo changes; single-graph and watch modes wire it to
-//! a fixed root. An empty list signals "no active source" and the tools
-//! return a friendly error.
+//! the active repo changes; source-root and watch modes wire it to a
+//! fixed root; local-workspace mode rebinds it on `set_root_dir`. An
+//! empty list signals "no active source" and the tools return a
+//! friendly error rather than failing the call.
+//!
+//! Per-server state held on `McpServer` (cloned per request via `Arc`):
+//! a `ServerOptions` struct (providers + workspace handle + manifest
+//! builtins) and the rmcp `ToolRouter`. The `github_issues` closure
+//! additionally captures an `Arc<Mutex<ElementCache>>` so FETCH calls
+//! can cache collapsed elements (`cb_N`, `patch_N`, `comment_N`,
+//! `overflow`) for the agent to drill into via `element_id` on
+//! subsequent calls — no re-fetching.
 
 #![allow(dead_code)]
 

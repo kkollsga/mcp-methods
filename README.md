@@ -24,12 +24,15 @@ pip install -e ".[dev]"
 | `read_file` | Safe file reading with path traversal protection and line range support |
 | `github_discussions` | Fetch a single issue/PR with smart compaction, or list issues/PRs with filters |
 | `git_api` | GitHub REST API wrapper with token auth |
+| `has_git_token` | Returns whether a usable `GITHUB_TOKEN` is reachable (used for honest tool listing) |
 | `ElementCache` | Drill-down cache for collapsed elements (code blocks, comments, patches, thread segments) in GitHub discussions |
+| `html_to_text` | Lightweight HTML → plain-text converter (markdown-flavoured) |
 | `ripgrep_lines` | Search through text lines with context window merging |
 | `ripgrep_json_fields` | Extract fields from JSON text |
 | `compact_discussion` / `compact_text` / `collapse_code_blocks` | Text compaction utilities |
 | `extract_github_refs` | Parse GitHub issue/PR references from text |
 | `detect_git_repo` / `validate_repo` | Git repository detection and validation |
+| `mcp_methods.fastmcp` | Composable tool registrations for FastMCP servers — see below |
 
 ## Python API
 
@@ -111,14 +114,14 @@ from mcp_methods import ElementCache
 cache = ElementCache()
 
 # First call fetches from GitHub API, compacts, and caches elements
-text = cache.fetch_discussion("owner/repo", 123)
+text = cache.fetch_issue("owner/repo", 123)
 
 # Subsequent calls return cached summary (no network)
-summary = cache.fetch_discussion("owner/repo", 123)
+summary = cache.fetch_issue("owner/repo", 123)
 # → "Cached owner/repo#123 — 5 elements available: cb_1, comment_2, patch_1, patch_2, patch_3"
 
-# Force re-fetch when discussion has changed
-text = cache.fetch_discussion("owner/repo", 123, refresh=True)
+# Force re-fetch when the issue has changed upstream
+text = cache.fetch_issue("owner/repo", 123, refresh=True)
 
 # Drill into a collapsed code block
 code = cache.retrieve("owner/repo", 123, "cb_1")
@@ -160,6 +163,31 @@ from mcp_methods import read_file
 
 content = read_file("src/main.py", ["/project"])
 ```
+
+## `mcp_methods.fastmcp` — drop-in tools for FastMCP servers
+
+If you're running your own [FastMCP](https://github.com/modelcontextprotocol/python-sdk) server but want the same tool surface the bundled `mcp-server` binary ships (source navigation, graph overview, Cypher with CSV export, save_graph), import these helpers and register them on your `app`:
+
+```python
+from mcp.server.fastmcp import FastMCP
+from mcp_methods.fastmcp import (
+    register_overview,
+    register_cypher_query,
+    register_source_tools,
+    register_save_graph,
+    serve_csv_via_http,
+)
+
+app = FastMCP("My Server")
+register_overview(app, graph, overview_prefix="My custom guidance")
+register_cypher_query(app, graph, csv_dir="temp/")
+register_source_tools(app, source_roots=["./source"])
+register_save_graph(app, graph)
+_server, base_url = serve_csv_via_http("temp/")  # optional CORS-enabled HTTP server
+app.run(transport="stdio")
+```
+
+Each helper is a thin (~10-line) wrapper over the existing Rust PyO3 surface — there's no logic duplication between the YAML-driven binary and these helpers, so agent behaviour is identical regardless of which path booted the server. `graph` is any object exposing `describe()` / `cypher()` / `save()`; kglite's `KnowledgeGraph` satisfies it. A runnable end-to-end stub lives at `examples/fastmcp_demo.py`.
 
 ## Deployment — `mcp-server` binary
 

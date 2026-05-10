@@ -16,18 +16,33 @@
 //! - **`--source-root DIR`** *(or via manifest)*: file-tree mode.
 //!   Source tools (`read_source`, `grep`, `list_source`) operate
 //!   against the configured directory.
-//! - **`--workspace DIR`** *(phase 6)*: clone-and-track mode.
+//! - **`--workspace DIR`**: clone-and-track GitHub flow.
 //!   `repo_management` clones GitHub repos into the workspace,
-//!   maintains an inventory, and points the source tools at the
-//!   active repo.
-//! - **`--watch DIR`** *(phase 5)*: file-watcher mode. Source roots
-//!   stay pinned to the directory; downstream consumers register a
-//!   rebuild callback on file changes.
+//!   maintains an inventory (with auto-rebuild gating via
+//!   `last_built_sha`), and points the source tools at the active
+//!   repo.
+//! - **manifest `workspace: { kind: local, root, watch }`**: local-
+//!   workspace flow. A fixed directory is bound as the active source
+//!   root; rebuilds are triggered via `repo_management(update=True)`
+//!   (gated by a cheap recursive-mtime fingerprint), and the active
+//!   root can be swapped at runtime via the `set_root_dir(path)`
+//!   tool. Manifest declarations win over the CLI `--workspace` flag.
+//! - **`--watch DIR`**: file-watcher mode. Source roots stay pinned
+//!   to the directory; downstream consumers register a rebuild
+//!   callback on file changes.
+//!
+//! Boot sequence: parse CLI → load manifest → manifest `workspace:`
+//! overrides CLI-derived mode if set → `.env` walk-up (or explicit
+//! `env_file:`) → build ServerOptions → register dynamic tools →
+//! apply Python extensions (manifest-declared `python:` tools and
+//! embedder factory under trust gates) → spawn watcher if configured
+//! → serve over stdio.
 //!
 //! The manifest schema mirrors the legacy `kglite-mcp-server` Python
 //! CLI 1:1, so a YAML written for that CLI boots unchanged here.
-//! Auto-detected paths: `<workspace>/workspace_mcp.yaml` in workspace
-//! and watch modes; otherwise pass `--mcp-config PATH` explicitly.
+//! Auto-detected paths: `<workspace>/workspace_mcp.yaml` in workspace,
+//! watch, and local-workspace modes; otherwise pass `--mcp-config PATH`
+//! explicitly.
 
 use std::path::{Path, PathBuf};
 
@@ -75,15 +90,19 @@ folder navigation (read_source / grep / list_source), GitHub access \
 Graph-specific tools (e.g. cypher_query) are layered on top by domain \
 binaries like kglite-mcp-server.
 
-Modes:
+Modes (set via CLI flag or manifest `workspace:` block):
   (none)                  Bare framework — ping tool plus any manifest tools.
   --source-root DIR       Bind the source tools to a fixed directory.
-  --workspace DIR         Clone-and-track GitHub repos in DIR (phase 6).
-  --watch DIR             Watch DIR for changes; rebuild downstream artifacts (phase 5).
+  --workspace DIR         Clone-and-track GitHub repos in DIR.
+  --watch DIR             Watch DIR for changes; rebuild downstream artifacts.
+  manifest workspace.kind: local
+                          Bind a fixed local directory (no clone). Use
+                          set_root_dir(path) to swap. Optionally watch.
 
-The manifest is auto-detected: <workspace>/workspace_mcp.yaml in workspace \
-and watch modes. Override with --mcp-config PATH. The manifest's source_root \
-declaration is the manifest-driven equivalent of --source-root.\
+The manifest is auto-detected at <dir>/workspace_mcp.yaml in workspace, \
+watch, and local-workspace modes. Override with --mcp-config PATH. The \
+manifest's source_root declaration is the manifest-driven equivalent of \
+--source-root; manifest `workspace.kind: local` wins over --workspace.\
 "
 )]
 struct Cli {
@@ -92,11 +111,11 @@ struct Cli {
     #[arg(long = "source-root", conflicts_with_all = ["workspace", "watch"])]
     source_root: Option<PathBuf>,
 
-    /// Workspace directory (clone-and-track GitHub repos; phase 6).
+    /// Workspace directory (clone-and-track GitHub repos).
     #[arg(long, conflicts_with_all = ["source_root", "watch"])]
     workspace: Option<PathBuf>,
 
-    /// Local directory to watch for file changes (phase 5).
+    /// Local directory to watch for file changes.
     #[arg(long, conflicts_with_all = ["source_root", "workspace"])]
     watch: Option<PathBuf>,
 

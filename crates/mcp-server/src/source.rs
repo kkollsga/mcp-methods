@@ -2,9 +2,11 @@
 //!
 //! Operates on a *dynamic* source root provider — a closure returning
 //! the active list of allowed dirs at the moment of each tool call.
-//! Workspace mode wires this to the active repo's path; single-graph
-//! and watch modes wire it to a fixed root. An empty list signals "no
-//! active source" and the tools return a friendly error.
+//! GitHub-workspace mode wires this to the active repo's path; local-
+//! workspace mode wires it to the bound root (re-routed on each
+//! `set_root_dir` call); `--source-root` and `--watch` modes wire it
+//! to a fixed root. An empty list signals "no active source" and the
+//! tools return a friendly error.
 //!
 //! All path traversal protection is done by canonicalising the
 //! resolved path against the allowed dirs before any I/O happens.

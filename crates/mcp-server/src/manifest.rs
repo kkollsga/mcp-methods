@@ -16,9 +16,11 @@
 //! a manifest written for the Python server boots unchanged on the new
 //! Rust server.
 
-// Many fields and helpers here are wired in by later phases (source
-// tools, python: hooks, embedder factory, builtins). Keep them on the
-// type and silence dead-code warnings until those phases land.
+// A handful of fields/helpers are exposed for downstream consumers
+// (e.g. kglite-mcp-server reads `CypherTool::cypher` directly when
+// registering manifest-declared tools) and so look unused from this
+// crate's perspective. Silence dead-code warnings rather than chase
+// every cross-crate use.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

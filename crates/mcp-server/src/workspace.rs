@@ -1,6 +1,6 @@
 //! Workspace mode — two variants.
 //!
-//! **Github mode** (`Workspace::open_github`, the default when
+//! **Github mode** (`Workspace::open`, the default when
 //! `--workspace DIR` is set): the agent activates a GitHub repo via
 //! `repo_management('org/repo')`, the binary clones it into the
 //! workspace, and the active repo becomes the bound source root for
