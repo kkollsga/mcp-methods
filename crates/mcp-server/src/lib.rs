@@ -20,6 +20,8 @@
 //! `KnowledgeGraph` PyObject and fire after the framework's
 //! workspace/watch hooks rebuild the graph.
 
+pub mod embedder;
+pub mod env;
 pub mod manifest;
 pub mod python;
 pub mod runtime;
@@ -31,12 +33,14 @@ pub mod workspace;
 // Re-export the most commonly used types so downstream crates can
 // `use mcp_server::{Manifest, ServerOptions, McpServer};` without
 // chasing the module hierarchy.
+pub use embedder::{spawn_idle_watch as spawn_embedder_watch, EmbedderHandle};
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
     EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
 };
 pub use runtime::{
-    apply_python_extensions, init_tracing, maybe_watch, resolve_source_roots, PythonExtensions,
+    apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
+    PythonExtensions,
 };
 pub use server::{McpServer, RepoProvider, ServerOptions};
 pub use source::SourceRootsProvider;

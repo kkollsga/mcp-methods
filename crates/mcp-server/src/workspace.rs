@@ -65,6 +65,13 @@ struct InventoryEntry {
     access_count: u64,
     #[serde(default)]
     stale: bool,
+    /// HEAD SHA at the time the post-activate hook last completed
+    /// successfully. Drives auto-rebuild gating: when an `update=True`
+    /// call ends with `action=="current"` AND the new HEAD matches this,
+    /// the post-activate hook can be skipped. `serde(default)` keeps
+    /// older inventory.json files (without this field) loading cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_built_sha: Option<String>,
 }
 
 /// Workspace runtime state. Shared across MCP request clones via Arc.
@@ -191,6 +198,7 @@ impl Workspace {
                             last_accessed: mtime,
                             access_count: 0,
                             stale: false,
+                            last_built_sha: None,
                         }
                     });
                 }
@@ -215,6 +223,7 @@ impl Workspace {
                 last_accessed: now.clone(),
                 access_count: 0,
                 stale: false,
+                last_built_sha: None,
             });
         entry.last_accessed = now.clone();
         entry.access_count += 1;
@@ -293,8 +302,9 @@ impl Workspace {
     // Git operations
     // ------------------------------------------------------------------
 
-    /// Clone (if missing) or fast-forward (if cloned). Returns ("cloned"|"updated"|"current", repo_path).
-    fn clone_or_update(&self, name: &str) -> Result<(String, PathBuf)> {
+    /// Clone (if missing) or fast-forward (if cloned). Returns the
+    /// action label, the repo path, and the new HEAD SHA after the op.
+    fn clone_or_update(&self, name: &str) -> Result<(String, PathBuf, String)> {
         let parts: Vec<&str> = name.splitn(2, '/').collect();
         let repo_path = self.repos_dir().join(parts[0]).join(parts[1]);
         if !repo_path.exists() {
@@ -310,7 +320,8 @@ impl Workspace {
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
-            return Ok(("cloned".to_string(), repo_path));
+            let sha = git_rev_parse(&repo_path, "HEAD")?;
+            return Ok(("cloned".to_string(), repo_path, sha));
         }
 
         // Fetch + check head delta
@@ -327,24 +338,40 @@ impl Workspace {
                 .current_dir(&repo_path)
                 .output()
                 .context("git reset failed")?;
-            return Ok(("updated".to_string(), repo_path));
+            let sha = git_rev_parse(&repo_path, "HEAD")?;
+            return Ok(("updated".to_string(), repo_path, sha));
         }
-        Ok(("current".to_string(), repo_path))
+        Ok(("current".to_string(), repo_path, local))
     }
 
     /// Activate a repo: clone if needed, fast-forward, fire post-activate hook.
+    ///
+    /// On successful hook completion the new HEAD SHA is persisted to
+    /// `inventory.json[name].last_built_sha`. If the hook fails the SHA
+    /// is NOT recorded, so the next `update=True` re-attempts the build.
     fn activate(&self, name: &str) -> Result<String> {
-        let (action, repo_path) = self.clone_or_update(name)?;
+        let (action, repo_path, head_sha) = self.clone_or_update(name)?;
         self.bump_access(name, &action);
         {
             let mut state = self.inner.state.write().unwrap();
             state.active_repo_name = Some(name.to_string());
             state.active_repo_path = Some(repo_path.clone());
         }
-        if let Some(hook) = &self.inner.post_activate {
-            if let Err(e) = hook(&repo_path, name) {
-                tracing::warn!("post-activate hook for {name} failed: {e}");
+        let hook_ok = if let Some(hook) = &self.inner.post_activate {
+            match hook(&repo_path, name) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("post-activate hook for {name} failed: {e}");
+                    false
+                }
             }
+        } else {
+            // No hook configured → nothing built, but nothing failed either.
+            // Recording the SHA still helps the gating logic in #C1.
+            true
+        };
+        if hook_ok {
+            self.record_built_sha(name, &head_sha);
         }
         let verb = match action.as_str() {
             "cloned" => "Cloned",
@@ -353,6 +380,24 @@ impl Workspace {
             other => other,
         };
         Ok(format!("{verb} '{name}' at {}.", repo_path.display()))
+    }
+
+    fn record_built_sha(&self, name: &str, sha: &str) {
+        let mut inv = self.load_inventory();
+        if let Some(entry) = inv.get_mut(name) {
+            entry.last_built_sha = Some(sha.to_string());
+            let _ = self.save_inventory(&inv);
+        }
+    }
+
+    /// Read the SHA recorded after the last successful post-activate hook
+    /// for the named repo. `None` if the repo was never built (or the
+    /// hook last failed). Useful for downstream consumers gating
+    /// "is the active graph up to date with the repo HEAD?" checks.
+    pub fn last_built_sha(&self, name: &str) -> Option<String> {
+        self.load_inventory()
+            .get(name)
+            .and_then(|e| e.last_built_sha.clone())
     }
 
     fn delete(&self, name: &str) -> Result<String> {
@@ -637,6 +682,46 @@ mod tests {
         let s = chrono_lite::format_secs(now);
         let back = chrono_lite::parse_secs(&s).unwrap();
         assert_eq!(now, back);
+    }
+
+    #[test]
+    fn last_built_sha_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        // Seed an inventory entry directly (clone_or_update needs git).
+        ws.bump_access("acme/widgets", "cloned");
+        assert_eq!(ws.last_built_sha("acme/widgets"), None);
+        ws.record_built_sha("acme/widgets", "abc1234deadbeef");
+        assert_eq!(
+            ws.last_built_sha("acme/widgets").as_deref(),
+            Some("abc1234deadbeef")
+        );
+        // Survives an Workspace::open re-read (proves persistence).
+        let ws2 = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        assert_eq!(
+            ws2.last_built_sha("acme/widgets").as_deref(),
+            Some("abc1234deadbeef")
+        );
+    }
+
+    #[test]
+    fn inventory_loads_legacy_entries_without_sha_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        // Hand-craft an old-style inventory.json without `last_built_sha`.
+        let legacy = r#"{
+            "old/repo": {
+                "cloned_at": "2024-01-01T00:00:00",
+                "last_accessed": "2024-01-01T00:00:00",
+                "access_count": 5,
+                "stale": false
+            }
+        }"#;
+        std::fs::write(dir.path().join("inventory.json"), legacy).unwrap();
+        // Re-open and confirm graceful read.
+        let ws2 = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        assert_eq!(ws2.last_built_sha("old/repo"), None);
+        let _ = ws;
     }
 
     #[test]

@@ -38,6 +38,7 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "tools",
     "embedder",
     "builtins",
+    "env_file",
 ];
 const ALLOWED_TRUST_KEYS: &[&str] = &["allow_python_tools", "allow_embedder"];
 const ALLOWED_TOOL_KEYS: &[&str] = &[
@@ -153,6 +154,10 @@ pub struct Manifest {
     pub tools: Vec<ToolSpec>,
     pub embedder: Option<EmbedderConfig>,
     pub builtins: BuiltinsConfig,
+    /// Optional explicit `.env` path (relative to the YAML or absolute).
+    /// When unset, the runtime walks upward from the start directory
+    /// looking for a `.env` file.
+    pub env_file: Option<String>,
 }
 
 /// Auto-detect ``<basename>_mcp.yaml`` next to a graph file.
@@ -248,6 +253,7 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
         tools,
         embedder,
         builtins,
+        env_file: optional_str(raw, "env_file", yaml_path)?,
     })
 }
 
@@ -730,6 +736,20 @@ mod tests {
         let sibling = dir.path().join("demo_mcp.yaml");
         std::fs::write(&sibling, "name: x\n").unwrap();
         assert_eq!(find_sibling_manifest(&graph), Some(sibling));
+    }
+
+    #[test]
+    fn env_file_key_parses() {
+        let f = write_tmp("env_file: ../.env\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.env_file.as_deref(), Some("../.env"));
+    }
+
+    #[test]
+    fn env_file_unset_is_none() {
+        let f = write_tmp("name: Demo\n");
+        let m = load(f.path()).unwrap();
+        assert!(m.env_file.is_none());
     }
 
     #[test]

@@ -6,13 +6,16 @@
 //! place to change boot-time behaviour.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
+use crate::embedder::{self, EmbedderHandle};
 use crate::manifest::{Manifest, ManifestError, ToolSpec};
 use crate::server::McpServer;
-use crate::{python, watch};
+use crate::{env, python, watch};
 
 /// Initialise stderr-only `tracing` with `RUST_LOG=info` default.
 ///
@@ -26,6 +29,31 @@ pub fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init();
+}
+
+/// Load environment variables from a `.env` file before any tool that
+/// reads `GITHUB_TOKEN` / API credentials runs.
+///
+/// Resolution order:
+/// 1. If the manifest sets `env_file:`, load that path (error if missing).
+/// 2. Otherwise walk upward from `start_dir` looking for a `.env`.
+///
+/// Returns the path actually loaded (for boot-summary logging), or
+/// `None` if nothing was found. Existing env vars are never overwritten.
+pub fn load_env_for_mode(manifest: Option<&Manifest>, start_dir: &Path) -> Result<Option<PathBuf>> {
+    if let Some(m) = manifest {
+        if let Some(rel) = m.env_file.as_ref() {
+            let base = m
+                .yaml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let resolved = base.join(rel);
+            env::load_env_explicit(&resolved).map_err(anyhow::Error::msg)?;
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(env::load_env_walk(start_dir))
 }
 
 /// Resolve a manifest's `source_root(s)` declarations to canonical
@@ -64,14 +92,38 @@ pub fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, Manifest
 }
 
 /// Outcome of [`apply_python_extensions`].
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PythonExtensions {
     /// Number of `python:` tools registered on the router.
     pub python_tool_count: usize,
-    /// The instantiated embedder, when the manifest declared one. The
-    /// caller is responsible for binding it to whatever consumes the
-    /// embedder (e.g. `KnowledgeGraph::set_embedder`).
-    pub embedder: Option<pyo3::Py<pyo3::PyAny>>,
+    /// Lifecycle-aware wrapper around the manifest-loaded embedder.
+    /// Downstream consumers (e.g. `KnowledgeGraph::set_embedder`) read
+    /// the raw `Py<PyAny>` via [`EmbedderHandle::instance`] but should
+    /// drive embedding calls through the handle so the idle-watch
+    /// timer sees activity.
+    pub embedder: Option<Arc<EmbedderHandle>>,
+    /// Cooldown extracted from `embedder.kwargs.cooldown`, when set.
+    /// `None` means "no idle eviction" — the embedder lives for the
+    /// process lifetime.
+    pub embedder_cooldown: Option<Duration>,
+    /// If a cooldown is configured, this is the abort handle of the
+    /// tokio task driving the idle-unload check. Drop it to stop
+    /// watching (e.g. on graceful shutdown).
+    pub embedder_watcher: Option<tokio::task::AbortHandle>,
+}
+
+impl std::fmt::Debug for PythonExtensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonExtensions")
+            .field("python_tool_count", &self.python_tool_count)
+            .field("embedder", &self.embedder.as_ref().map(|_| "<handle>"))
+            .field("embedder_cooldown", &self.embedder_cooldown)
+            .field(
+                "embedder_watcher",
+                &self.embedder_watcher.as_ref().map(|_| "<task>"),
+            )
+            .finish()
+    }
 }
 
 /// Wire manifest-declared `python:` tools and load the embedder
@@ -131,20 +183,28 @@ pub fn apply_python_extensions(
         0
     };
 
-    let embedder = if let Some(cfg) = manifest.embedder.as_ref() {
-        let manifest_dir = manifest
-            .yaml_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        Some(python::load_embedder(cfg, &manifest_dir).context("embedder factory load failed")?)
-    } else {
-        None
-    };
+    let (embedder, embedder_cooldown, embedder_watcher) =
+        if let Some(cfg) = manifest.embedder.as_ref() {
+            let manifest_dir = manifest
+                .yaml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let py_instance = python::load_embedder(cfg, &manifest_dir)
+                .context("embedder factory load failed")?;
+            let handle = Arc::new(EmbedderHandle::new(py_instance));
+            let cooldown = embedder::extract_cooldown(&cfg.kwargs);
+            let watcher = cooldown.map(|d| embedder::spawn_idle_watch(handle.clone(), d));
+            (Some(handle), cooldown, watcher)
+        } else {
+            (None, None, None)
+        };
 
     Ok(PythonExtensions {
         python_tool_count,
         embedder,
+        embedder_cooldown,
+        embedder_watcher,
     })
 }
 

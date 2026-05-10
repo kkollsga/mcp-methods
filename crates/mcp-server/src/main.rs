@@ -29,7 +29,7 @@
 //! Auto-detected paths: `<workspace>/workspace_mcp.yaml` in workspace
 //! and watch modes; otherwise pass `--mcp-config PATH` explicitly.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,8 +39,8 @@ use rmcp::ServiceExt;
 use mcp_server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
 use mcp_server::server::{McpServer, ServerOptions};
 use mcp_server::{
-    apply_python_extensions, init_tracing, maybe_watch, resolve_source_roots, workspace,
-    PythonExtensions,
+    apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
+    workspace, PythonExtensions,
 };
 
 /// Operating mode picked from the CLI flags.
@@ -164,6 +164,7 @@ fn print_boot_summary(
     manifest: Option<&Manifest>,
     source_roots: &[String],
     python_tool_count: usize,
+    env_file_loaded: Option<&Path>,
 ) {
     let mode_label = match mode {
         Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
@@ -172,6 +173,9 @@ fn print_boot_summary(
         Mode::Bare => "bare framework".to_string(),
     };
     let mut parts = vec![format!("mode: {mode_label}")];
+    if let Some(p) = env_file_loaded {
+        parts.push(format!("env: {}", p.display()));
+    }
     if let Some(m) = manifest {
         parts.push(format!("manifest: {}", m.yaml_path.display()));
         if !m.tools.is_empty() {
@@ -215,6 +219,14 @@ async fn main() -> Result<()> {
     }
 
     let manifest = load_manifest(&cli, &mode).context("manifest load failed")?;
+
+    // Load .env before anything reads env vars (e.g. github tools' GITHUB_TOKEN).
+    let env_start_dir: PathBuf = match &mode {
+        Mode::SourceRoot { dir } | Mode::Workspace { dir } | Mode::Watch { dir } => dir.clone(),
+        Mode::Bare => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let env_file_loaded = load_env_for_mode(manifest.as_ref(), &env_start_dir)?;
+
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
     if cli.name.is_some() {
         options.name = cli.name.clone();
@@ -255,8 +267,15 @@ async fn main() -> Result<()> {
         Some(m) => apply_python_extensions(&mut server, m, cli.trust_tools)?,
         None => PythonExtensions::default(),
     };
-    if let Some(_emb) = py_ext.embedder {
-        tracing::info!("embedder factory loaded (no consumer in framework binary)");
+    if py_ext.embedder.is_some() {
+        let cooldown = py_ext
+            .embedder_cooldown
+            .map(|d| format!("{}s", d.as_secs()))
+            .unwrap_or_else(|| "never".to_string());
+        tracing::info!(
+            embedder_cooldown = %cooldown,
+            "embedder factory loaded (no consumer in framework binary)"
+        );
     }
 
     let _watch_handle = if let Mode::Watch { dir } = &mode {
@@ -270,6 +289,7 @@ async fn main() -> Result<()> {
         manifest.as_ref(),
         &source_roots,
         py_ext.python_tool_count,
+        env_file_loaded.as_deref(),
     );
 
     let service = server
