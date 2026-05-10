@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.22
 
 Closing the kglite wishlist gaps (inbox/read/2026-05-10) so the 5 deployed
 YAML manifests + ~3,000 LoC of custom Python MCP servers can retire onto
