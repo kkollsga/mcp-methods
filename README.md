@@ -213,7 +213,27 @@ re-export `mcp_server::McpServer::new(...)` to layer graph-specific
 tools on top while reusing the boot sequence, `.env` loading, workspace
 mode, watch mode, and embedder lifecycle.
 
-Operating modes (set via CLI flag or the YAML manifest):
+### Cargo features
+
+By default the framework includes Python extension support — YAML-
+declared `python:` tool hooks and the `embedder:` factory load via
+PyO3. Downstream binaries that want a framework without the
+`crates/mcp-server`-level PyO3 dep can opt out:
+
+```toml
+mcp-server = { git = "...", default-features = false }
+```
+
+Note: `mcp-methods` (the top-level crate) still pulls in PyO3 as a
+hard dep because the Python wheel surface depends on it. The
+feature gate above removes the *direct* dep from
+`crates/mcp-server` only — useful for keeping the framework's
+non-Python build path clean and for downstream binaries that don't
+want manifest-declared `python:` tools / embedder. For a fully
+PyO3-free build path, the consuming binary also needs to gate the
+mcp-methods dep itself.
+
+### Operating modes (set via CLI flag or the YAML manifest)
 
 | Mode | How to set | When to use |
 |---|---|---|

@@ -42,6 +42,7 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "builtins",
     "env_file",
     "workspace",
+    "extensions",
 ];
 const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch"];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
@@ -198,6 +199,16 @@ pub struct Manifest {
     /// over CLI `--workspace`/`--source-root` flags interpretation
     /// (manifest is the source of truth — same rule as `source_root:`).
     pub workspace: Option<WorkspaceConfig>,
+    /// Raw passthrough for downstream-binary-specific manifest keys.
+    /// The framework accepts any mapping under `extensions:` and stores
+    /// it here without validating the inner keys; downstream consumers
+    /// (e.g. kglite-mcp-server) read whatever they need from this map.
+    ///
+    /// This keeps the framework's strict-unknown-key validation strong
+    /// for the surfaces it owns (`builtins`, `workspace`, …) while
+    /// letting consumers add their own configuration namespace without
+    /// per-key framework round-trips.
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Auto-detect ``<basename>_mcp.yaml`` next to a graph file.
@@ -283,6 +294,7 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
     let embedder = build_embedder(raw.get("embedder"), yaml_path)?;
     let builtins = build_builtins(raw.get("builtins"), yaml_path)?;
     let workspace = build_workspace(raw.get("workspace"), yaml_path)?;
+    let extensions = build_extensions(raw.get("extensions"), yaml_path)?;
 
     Ok(Manifest {
         yaml_path: yaml_path.to_path_buf(),
@@ -296,7 +308,30 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
         builtins,
         env_file: optional_str(raw, "env_file", yaml_path)?,
         workspace,
+        extensions,
     })
+}
+
+fn build_extensions(
+    raw: Option<&serde_yaml::Value>,
+    yaml_path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, ManifestError> {
+    let Some(raw) = raw else {
+        return Ok(serde_json::Map::new());
+    };
+    if matches!(raw, serde_yaml::Value::Null) {
+        return Ok(serde_json::Map::new());
+    }
+    if !raw.is_mapping() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "extensions must be a mapping (downstream-binary-specific keys)",
+        ));
+    }
+    match yaml_to_json(raw.clone())? {
+        serde_json::Value::Object(o) => Ok(o),
+        _ => Err(ManifestError::at(yaml_path, "extensions must be a mapping")),
+    }
 }
 
 fn build_workspace(
@@ -894,6 +929,59 @@ mod tests {
         let f = write_tmp("workspace:\n  kind: github\n  watch: true\n");
         let err = load(f.path()).unwrap_err();
         assert!(err.message.contains("watch is only valid"));
+    }
+
+    #[test]
+    fn extensions_passthrough_parses() {
+        let f = write_tmp(
+            "extensions:\n  csv_http_server: true\n  csv_http_server_dir: temp/\n  arbitrary:\n    nested: 1\n",
+        );
+        let m = load(f.path()).unwrap();
+        assert_eq!(
+            m.extensions
+                .get("csv_http_server")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            m.extensions
+                .get("csv_http_server_dir")
+                .and_then(|v| v.as_str()),
+            Some("temp/")
+        );
+        // Nested values pass through unchanged.
+        assert_eq!(
+            m.extensions
+                .get("arbitrary")
+                .and_then(|v| v.get("nested"))
+                .and_then(|v| v.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn extensions_absent_defaults_to_empty() {
+        let f = write_tmp("name: x\n");
+        let m = load(f.path()).unwrap();
+        assert!(m.extensions.is_empty());
+    }
+
+    #[test]
+    fn extensions_inner_keys_unvalidated() {
+        // The framework intentionally does NOT validate keys inside
+        // `extensions:` — they're downstream-binary concerns. Any shape
+        // that's a YAML mapping must round-trip.
+        let f = write_tmp(
+            "extensions:\n  whatever_kglite_wants: foo\n  some_other_consumer: { a: 1, b: 2 }\n",
+        );
+        load(f.path()).unwrap();
+    }
+
+    #[test]
+    fn extensions_must_be_a_mapping() {
+        let f = write_tmp("extensions: not-a-mapping\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("extensions must be a mapping"));
     }
 
     #[test]

@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.24
+
+Responds to three kglite asks (inbox/read/2026-05-11-*). Three phases land
+together; consumer-visible APIs remain backward-compatible.
+
+### `mcp-server` framework
+
+- **`extensions:` top-level manifest passthrough.** New top-level
+  YAML key that the framework accepts but does not validate.
+  Stored on `Manifest` as
+  `extensions: serde_json::Map<String, serde_json::Value>`.
+  Downstream binaries read whatever keys they need from it.
+  Strict-unknown-key validation stays in force for the framework's
+  own surfaces (`builtins:`, `workspace:`, …) — only the
+  `extensions:` block is intentionally unvalidated. Closes
+  kglite's csv-http extension ask; matches the domain-agnostic
+  boundary set in 0.3.23.
+- **PyO3 is now an optional Cargo feature on `crates/mcp-server`.**
+  New `python` feature in `crates/mcp-server/Cargo.toml`, default-on.
+  Standalone `cargo install mcp-server` is unchanged. Downstream
+  binaries can disable with `default-features = false` to remove
+  the direct PyO3 dep from this crate. Note: the top-level
+  `mcp-methods` crate (the Python wheel) still depends on PyO3
+  unconditionally — that is by design. The feature flag on
+  `mcp-server` removes the *direct* link from this crate only;
+  for a fully PyO3-free downstream binary the consumer also needs
+  to gate the `mcp-methods` dep itself. CI now runs both
+  `cargo build -p mcp-server --no-default-features` and
+  `cargo test -p mcp-server --no-default-features` to catch leaks.
+- **Cfg-gated modules**: `python.rs` and `embedder.rs` are now
+  `#[cfg(feature = "python")]`. `runtime::PythonExtensions` and
+  `runtime::apply_python_extensions` are similarly gated.
+  `mcp-server` binary's `main()` emits a `warn`-level log if a
+  manifest declares `python:` tools or `embedder:` in a binary
+  built without the `python` feature, so operators aren't silently
+  ignored.
+
+### Tests + infrastructure
+
+- **Framework smoke-test suite.** New `tests/test_mcp_server_smoke.py`
+  drives the `mcp-server` binary over JSON-RPC stdio and exercises
+  every tool category: source navigation, GitHub access (with and
+  without token), `.env` walk-up + explicit `env_file:`, local-
+  workspace mode, bare boot. 19 tests, ~3 seconds, auto-skips when
+  the binary isn't built. Adapted from kglite's smoke suite shape;
+  kglite-specific tests (graph / Cypher / read_code_source) stay
+  in their repo.
+
 ## 0.3.23
 
 Patch release in response to kglite's 0.3.22 smoke-test findings

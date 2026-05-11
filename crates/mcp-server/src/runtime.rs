@@ -6,16 +6,27 @@
 //! place to change boot-time behaviour.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
+use crate::env;
+use crate::manifest::{Manifest, ManifestError};
+use crate::watch;
+
+#[cfg(feature = "python")]
+use std::sync::Arc;
+#[cfg(feature = "python")]
+use std::time::Duration;
+
+#[cfg(feature = "python")]
 use crate::embedder::{self, EmbedderHandle};
-use crate::manifest::{Manifest, ManifestError, ToolSpec};
+#[cfg(feature = "python")]
+use crate::manifest::ToolSpec;
+#[cfg(feature = "python")]
+use crate::python;
+#[cfg(feature = "python")]
 use crate::server::McpServer;
-use crate::{env, python, watch};
 
 /// Initialise stderr-only `tracing` with `RUST_LOG=info` default.
 ///
@@ -91,7 +102,9 @@ pub fn resolve_source_roots(manifest: &Manifest) -> Result<Vec<String>, Manifest
     Ok(resolved)
 }
 
-/// Outcome of [`apply_python_extensions`].
+/// Outcome of [`apply_python_extensions`]. Available only with the
+/// `python` Cargo feature (on by default).
+#[cfg(feature = "python")]
 #[derive(Default)]
 pub struct PythonExtensions {
     /// Number of `python:` tools registered on the router.
@@ -112,6 +125,7 @@ pub struct PythonExtensions {
     pub embedder_watcher: Option<tokio::task::AbortHandle>,
 }
 
+#[cfg(feature = "python")]
 impl std::fmt::Debug for PythonExtensions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PythonExtensions")
@@ -134,6 +148,9 @@ impl std::fmt::Debug for PythonExtensions {
 /// The embedder is *returned*, not bound — the caller decides what to
 /// do with it. Domain binaries (e.g. kglite) typically pass it to a
 /// graph via a `set_embedder` method; the framework binary just logs.
+///
+/// Available only with the `python` Cargo feature (on by default).
+#[cfg(feature = "python")]
 pub fn apply_python_extensions(
     server: &mut McpServer,
     manifest: &Manifest,

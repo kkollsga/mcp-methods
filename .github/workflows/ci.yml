@@ -16,6 +16,10 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
+      # Catch pyo3 leaks into the pure-Rust framework surface — downstream
+      # binaries that opt out of the `python` feature must still build.
+      - run: cargo build -p mcp-server --no-default-features
+      - run: cargo test -p mcp-server --no-default-features
 
   python-checks:
     name: Python checks

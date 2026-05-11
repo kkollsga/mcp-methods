@@ -27,9 +27,11 @@
 //! FastMCP server instead of this binary can compose the same tools
 //! via the `mcp_methods.fastmcp` helper submodule on the Python side.
 
+#[cfg(feature = "python")]
 pub mod embedder;
 pub mod env;
 pub mod manifest;
+#[cfg(feature = "python")]
 pub mod python;
 pub mod runtime;
 pub mod server;
@@ -40,17 +42,18 @@ pub mod workspace;
 // Re-export the most commonly used types so downstream crates can
 // `use mcp_server::{Manifest, ServerOptions, McpServer};` without
 // chasing the module hierarchy.
+#[cfg(feature = "python")]
 pub use embedder::{spawn_idle_watch as spawn_embedder_watch, EmbedderHandle};
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
     EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
     WorkspaceConfig, WorkspaceKind,
 };
+#[cfg(feature = "python")]
 pub use python::build_tool_attr;
-pub use runtime::{
-    apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
-    PythonExtensions,
-};
+#[cfg(feature = "python")]
+pub use runtime::{apply_python_extensions, PythonExtensions};
+pub use runtime::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots};
 pub use server::{McpServer, RepoProvider, ServerOptions};
 pub use source::SourceRootsProvider;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};

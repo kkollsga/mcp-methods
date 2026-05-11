@@ -51,11 +51,23 @@ ignore = "0.4"
 # Python extension layer — load manifest-declared `python:` tool hooks
 # and custom embedder factories. `auto-initialize` embeds CPython into
 # the binary so users only need their tool code on disk.
-pyo3 = { version = "0.28", features = ["auto-initialize"] }
+#
+# Optional and behind the `python` feature so downstream binaries that
+# don't need YAML-declared Python hooks (e.g. kglite-mcp-server in its
+# pure-Rust distribution) can opt out and avoid the libpython link.
+pyo3 = { version = "0.28", features = ["auto-initialize"], optional = true }
 
 # Watch-mode file watcher (debounced).
 notify = "8"
 notify-debouncer-mini = "0.6"
+
+[features]
+# By default the framework includes Python extension support — YAML-
+# declared `python:` tool hooks and the `embedder:` factory load via
+# PyO3. Downstream binaries that want a pure-Rust framework (no
+# libpython link) can opt out with `default-features = false`.
+default = ["python"]
+python = ["dep:pyo3"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -53,10 +53,10 @@ use rmcp::ServiceExt;
 
 use mcp_server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
 use mcp_server::server::{McpServer, ServerOptions};
-use mcp_server::{
-    apply_python_extensions, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
-    workspace, PythonExtensions,
-};
+use mcp_server::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots, workspace};
+
+#[cfg(feature = "python")]
+use mcp_server::{apply_python_extensions, PythonExtensions};
 
 /// Operating mode picked from the CLI flags and the manifest's
 /// optional `workspace:` block. Manifest declarations win over CLI
@@ -324,20 +324,48 @@ async fn main() -> Result<()> {
     }
     let mut server = McpServer::new(options);
 
-    let py_ext = match manifest.as_ref() {
-        Some(m) => apply_python_extensions(&mut server, m, cli.trust_tools)?,
-        None => PythonExtensions::default(),
+    #[cfg(feature = "python")]
+    let python_tool_count = {
+        let py_ext = match manifest.as_ref() {
+            Some(m) => apply_python_extensions(&mut server, m, cli.trust_tools)?,
+            None => PythonExtensions::default(),
+        };
+        if py_ext.embedder.is_some() {
+            let cooldown = py_ext
+                .embedder_cooldown
+                .map(|d| format!("{}s", d.as_secs()))
+                .unwrap_or_else(|| "never".to_string());
+            tracing::info!(
+                embedder_cooldown = %cooldown,
+                "embedder factory loaded (no consumer in framework binary)"
+            );
+        }
+        py_ext.python_tool_count
     };
-    if py_ext.embedder.is_some() {
-        let cooldown = py_ext
-            .embedder_cooldown
-            .map(|d| format!("{}s", d.as_secs()))
-            .unwrap_or_else(|| "never".to_string());
-        tracing::info!(
-            embedder_cooldown = %cooldown,
-            "embedder factory loaded (no consumer in framework binary)"
-        );
-    }
+    #[cfg(not(feature = "python"))]
+    let python_tool_count: usize = {
+        // Without the `python` feature, manifest-declared `python:` tools
+        // and `embedder:` blocks are silently no-ops. Warn if either was
+        // present so operators know why their YAML didn't take effect.
+        let _ = &mut server;
+        if let Some(m) = manifest.as_ref() {
+            let py_count = m
+                .tools
+                .iter()
+                .filter(|t| matches!(t, mcp_server::ToolSpec::Python(_)))
+                .count();
+            if py_count > 0 || m.embedder.is_some() {
+                tracing::warn!(
+                    "manifest declares Python extensions ({py_count} python tool(s), \
+                     embedder={}); binary was built with --no-default-features, so those \
+                     declarations are ignored",
+                    m.embedder.is_some()
+                );
+            }
+        }
+        let _ = cli.trust_tools;
+        0
+    };
 
     let _watch_handle = match &mode {
         Mode::Watch { dir } => maybe_watch(Some(dir), None)?,
@@ -349,7 +377,7 @@ async fn main() -> Result<()> {
         &mode,
         manifest.as_ref(),
         &source_roots,
-        py_ext.python_tool_count,
+        python_tool_count,
         env_file_loaded.as_deref(),
     );
 
