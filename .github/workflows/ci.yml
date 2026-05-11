@@ -16,10 +16,21 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
-      # Catch pyo3 leaks into the pure-Rust framework surface — downstream
-      # binaries that opt out of the `python` feature must still build.
-      - run: cargo build -p mcp-server --no-default-features
-      - run: cargo test -p mcp-server --no-default-features
+      # Default build (python + server features both on) — covers the
+      # standard `cargo install` path and the wheel build path.
+      - run: cargo build
+      - run: cargo test
+      # Pure-Rust primitives — no pyo3, no rmcp, no tokio. Downstream
+      # consumers that want only the cache/github/git_refs/compact/html
+      # subset must continue to build cleanly. This is what guards
+      # kglite's pyo3-free path against future pyo3 leaks.
+      - run: cargo build --no-default-features
+      - run: cargo test --no-default-features
+      # Pure-Rust server (no python, with rmcp framework) — the binary
+      # downstream consumers ship in their own wheel without libpython
+      # linkage. Verifies the cfg gating across both axes.
+      - run: cargo build --no-default-features --features server
+      - run: cargo test --no-default-features --features server
 
   python-checks:
     name: Python checks

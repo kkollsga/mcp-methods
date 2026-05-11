@@ -102,6 +102,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: pip install maturin
+      # Build the bundled `mcp-server` binary first and copy it into
+      # the python package's `_bin/` directory. Maturin's `include`
+      # config (in pyproject.toml) then force-packages the binary into
+      # the wheel — without this step the wheel ships with an
+      # unresolvable `[project.scripts]` entry point that points at a
+      # missing file.
+      - name: Build + bundle mcp-server binary
+        run: |
+          cargo build --release --target ${{ matrix.target }} --features server --bin mcp-server
+          if (!(Test-Path -Path "python/mcp_methods/_bin")) { New-Item -ItemType Directory -Path "python/mcp_methods/_bin" -Force }
+          if ($IsWindows) {
+            Copy-Item "target/${{ matrix.target }}/release/mcp-server.exe" "python/mcp_methods/_bin/mcp-server.exe"
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/mcp-server" "python/mcp_methods/_bin/mcp-server"
+          }
+        shell: pwsh
       - name: Build wheels
         run: |
           if (!(Test-Path -Path "wheels")) { New-Item -ItemType Directory -Path "wheels" }

@@ -1,3 +1,4 @@
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::Value;
@@ -1032,8 +1033,8 @@ fn cache_all_patches(result: &mut Value, cache: &mut Option<Value>) {
 ///
 /// When cache_json is provided (a JSON object string), collapsed elements are stored with IDs.
 /// Returns (collapsed_text, updated_cache_json).
-#[pyfunction]
-#[pyo3(signature = (text, cache_json = None))]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(signature = (text, cache_json = None)))]
 pub fn collapse_code_blocks(text: &str, cache_json: Option<&str>) -> (String, Option<String>) {
     let mut cache: Option<Value> = cache_json.and_then(|s| serde_json::from_str(s).ok());
     let result = collapse_code_blocks_mut(text, &mut cache);
@@ -1043,8 +1044,8 @@ pub fn collapse_code_blocks(text: &str, cache_json: Option<&str>) -> (String, Op
 
 /// Collapse code blocks then truncate if over limit.
 /// Returns (text, was_truncated, cache_json).
-#[pyfunction]
-#[pyo3(signature = (text, limit, cache_json = None))]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(signature = (text, limit, cache_json = None)))]
 pub fn compact_text(
     text: &str,
     limit: usize,
@@ -1056,20 +1057,20 @@ pub fn compact_text(
     (result, truncated, cache_out)
 }
 
-/// Compact a discussion JSON string using budget-based adaptive compaction.
-/// Returns (compacted_json, cache_json).
+/// Compact a discussion JSON string using budget-based adaptive
+/// compaction. Pure-Rust callable in both build modes.
 ///
-/// budget/item_budget control output size limits (defaults: 60KB / 15KB).
-#[pyfunction]
-#[pyo3(signature = (discussion_json, cache_json = None, budget = None, item_budget = None))]
+/// Returns `Ok((compacted_json, cache_json))` on success or `Err(msg)`
+/// for JSON parse errors. `budget`/`item_budget` control output size
+/// limits (defaults: 60KB / 15KB).
 pub fn compact_discussion(
     discussion_json: &str,
     cache_json: Option<&str>,
     budget: Option<usize>,
     item_budget: Option<usize>,
-) -> PyResult<(String, Option<String>)> {
-    let mut result: Value = serde_json::from_str(discussion_json)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
+) -> Result<(String, Option<String>), String> {
+    let mut result: Value =
+        serde_json::from_str(discussion_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
     let mut cache: Option<Value> = cache_json.and_then(|s| serde_json::from_str(s).ok());
 
@@ -1081,4 +1082,19 @@ pub fn compact_discussion(
     let out = serde_json::to_string_pretty(&result).unwrap_or_default();
     let cache_out = cache.map(|c| serde_json::to_string(&c).unwrap_or_default());
     Ok((out, cache_out))
+}
+
+/// PyO3 wrapper for `compact_discussion`. Exposed to Python under the
+/// same name; converts `Err(String)` to `PyValueError`.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(name = "compact_discussion", signature = (discussion_json, cache_json = None, budget = None, item_budget = None))]
+pub fn py_compact_discussion(
+    discussion_json: &str,
+    cache_json: Option<&str>,
+    budget: Option<usize>,
+    item_budget: Option<usize>,
+) -> PyResult<(String, Option<String>)> {
+    compact_discussion(discussion_json, cache_json, budget, item_budget)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }

@@ -1,3 +1,4 @@
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -84,13 +85,13 @@ fn auth_token() -> Option<String> {
 }
 
 /// Check if a GitHub token is available in the environment.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn has_git_token() -> bool {
     auth_token().is_some()
 }
 
 /// Auto-detect `org/repo` from the git remote in *cwd*.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn detect_git_repo(cwd: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -1134,10 +1135,12 @@ pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// PyO3 wrappers
+// PyO3 wrappers — only compiled with the `python` feature.
+// Pure-Rust callers use the `*_internal` / `*_rust` companions directly.
 // ---------------------------------------------------------------------------
 
 /// Read-only GET against any GitHub REST API endpoint. Returns JSON.
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (repo, path, *, truncate_at=80_000))]
 pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> String {
@@ -1196,6 +1199,7 @@ pub fn github_issues_rust(
 /// - `number` given → FETCH a single issue/PR/Discussion
 /// - `query` given → SEARCH via GitHub search API
 /// - neither → LIST recent items
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (
     *,

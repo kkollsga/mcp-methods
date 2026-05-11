@@ -1,4 +1,5 @@
 use fancy_regex::Regex as FancyRegex;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
@@ -16,7 +17,7 @@ static SHORT_RE: LazyLock<FancyRegex> =
     LazyLock::new(|| FancyRegex::new(r"(?<![a-zA-Z0-9/])#(\d+)\b").unwrap());
 
 /// Validate `org/repo` format. Returns an error string, or empty string if valid.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn validate_repo(repo_name: &str) -> Option<String> {
     let parts: Vec<&str> = repo_name.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -27,7 +28,7 @@ pub fn validate_repo(repo_name: &str) -> Option<String> {
 
 /// Extract GitHub issue/PR references from text.
 /// Returns a list of (repo_name, number) tuples.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn extract_github_refs(text: &str, default_repo: &str) -> Vec<(String, u64)> {
     if text.is_empty() {
         return Vec::new();

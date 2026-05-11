@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.3.25
+
+Structural consolidation + the long-tail of the PyO3 decoupling work.
+This release closes both distribution goals: `pip install mcp-methods`
+puts `mcp-server` on PATH, and downstream Rust binaries
+(`kglite-mcp-server`, etc.) can build with no transitive libpython
+linkage via `default-features = false`.
+
+### Workspace consolidation
+
+- **`crates/mcp-server` is gone.** Its modules moved into the root
+  `mcp-methods` crate under a new `server` feature. Every public type
+  and function name is preserved — paths shift by one segment:
+  - `mcp_server::McpServer` → `mcp_methods::server::McpServer`
+  - `mcp_server::manifest::ToolSpec` → `mcp_methods::server::manifest::ToolSpec`
+  - `mcp_server::build_tool_attr` → `mcp_methods::server::build_tool_attr`
+  - etc.
+- **Lib name renamed** `_mcp_methods` → `mcp_methods`. The leading-
+  underscore convention is Python-internal; in Rust it forced
+  consumers to write `use _mcp_methods::*`. Now they write
+  `use mcp_methods::*`. Python's `from mcp_methods._mcp_methods import …`
+  still works — maturin's `module-name` override places the cdylib
+  at the same wheel path as before.
+- **`crate::cache::ElementCache`, `crate::github::*`, `crate::git_refs::*`,
+  `crate::compact::*`, `crate::html::*`** stay at the crate root —
+  intra-crate references shift from `_mcp_methods::*` to `crate::*`.
+
+### `pip install mcp-methods` ships `mcp-server` on PATH
+
+- Wheel now bundles the native Rust binary under
+  `mcp_methods/_bin/mcp-server` and registers a Python console-script
+  entry point (`mcp-server = "mcp_methods._cli:main"`) that execs it.
+- `make dev-with-bin` builds + bundles the binary locally; the wheel-
+  build CI workflow runs the same sequence before maturin packages.
+- Per-platform wheel size grows ~10 MB (the native binary).
+
+### Cargo features
+
+The crate's feature surface is now coherent across both build modes:
+
+- `default = ["python", "server"]` — standard `cargo install` or wheel
+  build path includes everything.
+- `python` — opt-out drops PyO3 (no `_mcp_methods` cdylib, no
+  callback-bound helpers like `read_file`/`ripgrep`/`list_dir`/
+  `json_grep`, no manifest-declared `python:` tools or `embedder:`
+  blocks).
+- `server` — opt-out drops rmcp + tokio + clap + the framework
+  modules + the `mcp-server` binary.
+- `python-extension` — implies `python`, adds `pyo3/extension-module`
+  for the wheel cdylib.
+
+A `--no-default-features` build is the pure-Rust primitives subset.
+A `--no-default-features --features server` build is the
+framework-only path with no libpython linkage — verified with
+`otool -L target/debug/mcp-server` showing no `libpython3.x.dylib`.
+
+### Downstream migration (kglite + similar)
+
+```toml
+# Before — two separate deps:
+mcp-methods = { git = "...", rev = "0.3.24", default-features = false }
+mcp-server  = { git = "...", rev = "0.3.24", default-features = false }
+
+# After — one dep with the `server` feature:
+mcp-methods = { git = "...", rev = "0.3.25", default-features = false, features = ["server"] }
+```
+
+Source rename pattern: `mcp_server::X` → `mcp_methods::server::X`;
+`_mcp_methods::X` → `mcp_methods::X`.
+
+### CI
+
+- Workspace-root rows added: `cargo build/test`,
+  `cargo build/test --no-default-features`,
+  `cargo build/test --no-default-features --features server`.
+- Wheel-build workflow updated to build + copy the bundled binary
+  before maturin runs.
+
+### Tests
+
+- 90 cargo unit tests (was 17 + 73 split across two crates) +
+  7 manifest regression + 7 binary CLI tests + 19 smoke + 157 python
+  = **280 tests** pass.
+- All 5 deployed YAML manifests parse unchanged.
+
 ## 0.3.24
 
 Responds to three kglite asks (inbox/read/2026-05-11-*). Three phases land

@@ -39,8 +39,8 @@ use rmcp::model::*;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::Manifest;
-use crate::source::{
+use crate::server::manifest::Manifest;
+use crate::server::source::{
     self, resolve_dir_under_roots, GrepOpts, ListOpts, ReadOpts, SourceRootsProvider,
 };
 
@@ -63,12 +63,12 @@ pub struct ServerOptions {
     /// When `None`, github tools require a per-call `repo_name=` arg.
     pub default_repo: Option<RepoProvider>,
     /// Workspace handle (when `--workspace` mode is active).
-    pub workspace: Option<crate::workspace::Workspace>,
+    pub workspace: Option<crate::server::workspace::Workspace>,
     /// Manifest-declared `builtins:` block. Surfaced verbatim so
     /// downstream consumers (kglite's `graph_overview` tool, for
     /// example) can read `temp_cleanup` / `save_graph` settings and
     /// implement the corresponding behaviour without re-parsing YAML.
-    pub builtins: crate::manifest::BuiltinsConfig,
+    pub builtins: crate::server::manifest::BuiltinsConfig,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -127,7 +127,7 @@ impl ServerOptions {
     /// dynamic — both are read from the workspace's active-repo state
     /// at every tool call, so `repo_management` swapping the active
     /// repo immediately re-points the source tools.
-    pub fn with_workspace(mut self, ws: crate::workspace::Workspace) -> Self {
+    pub fn with_workspace(mut self, ws: crate::server::workspace::Workspace) -> Self {
         let ws_for_roots = ws.clone();
         let ws_for_repo = ws.clone();
         self.workspace = Some(ws);
@@ -362,7 +362,7 @@ impl McpServer {
         let Some(ws) = self.options.workspace.clone() else {
             return;
         };
-        if !matches!(ws.kind(), crate::workspace::WorkspaceKind::Local) {
+        if !matches!(ws.kind(), crate::server::workspace::WorkspaceKind::Local) {
             return;
         }
         self.register_typed_tool::<SetRootDirArgs, _>(
@@ -386,7 +386,7 @@ impl McpServer {
     /// Decision is boot-time; restart the server to pick up a token
     /// that appears later.
     fn register_github_tools_if_authorized(&mut self) {
-        if !_mcp_methods::github::has_git_token() {
+        if !crate::github::has_git_token() {
             tracing::info!(
                 "GITHUB_TOKEN not set — github_issues / github_api tools hidden from the agent. \
                  Set the env var and restart to enable them."
@@ -400,8 +400,8 @@ impl McpServer {
         // can drill down via `element_id` on subsequent calls without
         // re-fetching the whole issue. Mutex contention is negligible
         // for MCP's serial request dispatch.
-        let cache: Arc<Mutex<_mcp_methods::cache::ElementCache>> =
-            Arc::new(Mutex::new(_mcp_methods::cache::ElementCache::new()));
+        let cache: Arc<Mutex<crate::cache::ElementCache>> =
+            Arc::new(Mutex::new(crate::cache::ElementCache::new()));
         let cache_for_issues = cache.clone();
         self.register_typed_tool::<GithubIssuesArgs, _>(
             "github_issues",
@@ -425,10 +425,12 @@ impl McpServer {
                 // FETCH / drill-down: route through ElementCache so cb_*,
                 // patch_*, overflow stays addressable. Cache.fetch_issue
                 // does both the network fetch and the drill-down branch.
+                // All paths return a status `String` — invalid-repo,
+                // fetch-failure, cached-summary, overflow, full-text.
                 if let Some(number) = args.number {
                     let context = args.context.unwrap_or(3);
                     let mut guard = cache_for_issues.lock().unwrap();
-                    return match guard.fetch_issue(
+                    return guard.fetch_issue(
                         &repo,
                         number,
                         args.element_id.as_deref(),
@@ -436,17 +438,14 @@ impl McpServer {
                         args.grep.as_deref(),
                         context,
                         args.refresh,
-                    ) {
-                        Ok(body) => body,
-                        Err(e) => format!("github_issues fetch error: {e}"),
-                    };
+                    );
                 }
                 if args.element_id.is_some() {
                     return "element_id requires `number=N` (the issue/PR being drilled into)."
                         .to_string();
                 }
                 // SEARCH / LIST: no caching, pure delegation.
-                _mcp_methods::github::github_issues_rust(
+                crate::github::github_issues_rust(
                     Some(&repo),
                     args.number,
                     args.query.as_deref(),
@@ -473,7 +472,7 @@ impl McpServer {
             ) {
                 Ok(repo) => {
                     let truncate_at = args.truncate_at.unwrap_or(80_000);
-                    _mcp_methods::github::git_api_internal(&repo, &args.path, truncate_at)
+                    crate::github::git_api_internal(&repo, &args.path, truncate_at)
                 }
                 Err(msg) => msg,
             },
@@ -486,7 +485,7 @@ impl McpServer {
     /// to discover what flags the operator asked for. The framework
     /// itself does not act on this — that would force it to interpret
     /// graph-specific semantics it shouldn't know about.
-    pub fn builtins(&self) -> &crate::manifest::BuiltinsConfig {
+    pub fn builtins(&self) -> &crate::server::manifest::BuiltinsConfig {
         &self.options.builtins
     }
 
@@ -730,21 +729,21 @@ fn resolve_repo_from(
     override_repo: Option<String>,
 ) -> Result<String, String> {
     if let Some(r) = override_repo {
-        if let Some(err) = _mcp_methods::git_refs::validate_repo(&r) {
+        if let Some(err) = crate::git_refs::validate_repo(&r) {
             return Err(err);
         }
         return Ok(r);
     }
     if let Some(provider) = default_repo {
         if let Some(r) = provider() {
-            if let Some(err) = _mcp_methods::git_refs::validate_repo(&r) {
+            if let Some(err) = crate::git_refs::validate_repo(&r) {
                 return Err(err);
             }
             return Ok(r);
         }
     }
-    if let Some(detected) = _mcp_methods::github::detect_git_repo(".") {
-        if _mcp_methods::git_refs::validate_repo(&detected).is_none() {
+    if let Some(detected) = crate::github::detect_git_repo(".") {
+        if crate::git_refs::validate_repo(&detected).is_none() {
             return Ok(detected);
         }
     }
@@ -785,7 +784,7 @@ mod tests {
 
     #[test]
     fn builtins_exposed_via_server() {
-        use crate::manifest::{BuiltinsConfig, TempCleanup};
+        use crate::server::manifest::{BuiltinsConfig, TempCleanup};
         let mut opts = ServerOptions::default();
         opts.builtins = BuiltinsConfig {
             save_graph: true,

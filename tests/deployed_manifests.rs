@@ -9,9 +9,11 @@
 //! `ALLOWED_TOP_KEYS` (or fix the test if the breakage is intentional
 //! and the deployment can be migrated).
 
+#![cfg(feature = "server")]
+
 use std::io::Write;
 
-use mcp_server::manifest::{load, TempCleanup, WorkspaceKind};
+use mcp_methods::server::manifest::{load, TempCleanup, WorkspaceKind};
 
 fn write_tmp(text: &str) -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();

@@ -83,7 +83,7 @@ struct InventoryEntry {
 
 // `WorkspaceKind` is re-used from the manifest module so config and
 // runtime share one enum — the values mean the same thing.
-pub use crate::manifest::WorkspaceKind;
+pub use crate::server::manifest::WorkspaceKind;
 
 /// Workspace runtime state. Shared across MCP request clones via Arc.
 #[derive(Clone)]
@@ -768,8 +768,7 @@ fn format_iso(t: SystemTime) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // Lightweight RFC3339-ish formatter. Drop sub-second precision; matches Python isoformat(timespec=seconds).
-    let datetime = chrono_lite::format_secs(secs);
-    datetime
+    chrono_lite::format_secs(secs)
 }
 
 fn parse_iso(s: &str) -> Option<SystemTime> {
@@ -824,7 +823,6 @@ mod chrono_lite {
     }
 
     fn days_to_civil(z: i64) -> (i64, u32, u32) {
-        let z = z;
         let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
         let doe = (z - era * 146_097) as u64;
         let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;

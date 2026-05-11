@@ -1,6 +1,6 @@
 # mcp-methods
 
-Shared Rust-powered utilities for MCP servers. Pip-installable library that provides fast file search, GitHub integration, and text processing — the common building blocks needed when writing MCP tool servers.
+Shared Rust-powered utilities for MCP servers. Pip-installable library that provides fast file search, GitHub integration, and text processing — the common building blocks needed when writing MCP tool servers. Ships an `mcp-server` binary on PATH for the YAML+CLI MCP-server workflow.
 
 ## Install
 
@@ -8,10 +8,19 @@ Shared Rust-powered utilities for MCP servers. Pip-installable library that prov
 pip install mcp-methods
 ```
 
-For development (requires Rust toolchain + maturin):
+After install, `mcp-server` is on PATH:
 
 ```bash
-pip install -e ".[dev]"
+mcp-server --help
+mcp-server --source-root ./my-project
+```
+
+For local development (requires Rust toolchain + maturin):
+
+```bash
+make dev-with-bin       # builds binary + installs editable wheel
+# or, without the binary on PATH:
+make dev                # cdylib + python source only
 ```
 
 ## What's included
@@ -191,47 +200,54 @@ Each helper is a thin (~10-line) wrapper over the existing Rust PyO3 surface —
 
 ## Deployment — `mcp-server` binary
 
-This crate also ships an MCP server binary at `crates/mcp-server`. Build
-and install it with:
+`pip install mcp-methods` puts the `mcp-server` binary on PATH —
+nothing else needed. The wheel ships the native Rust binary under
+`mcp_methods/_bin/`, and a Python launcher (`mcp_methods._cli:main`)
+execs it.
+
+If you'd rather build from source with a Rust toolchain:
 
 ```bash
-cargo install --path crates/mcp-server
+cargo install --path . --features server
 # → ~/.cargo/bin/mcp-server
 ```
 
-For deployments that previously pinned a binary path elsewhere (e.g.
-`/opt/miniconda3/envs/embeddings/bin/kglite-mcp-server`), drop a
-symlink:
-
-```bash
-ln -s ~/.cargo/bin/mcp-server /opt/miniconda3/envs/embeddings/bin/mcp-server
-```
-
 The binary is domain-agnostic — source tools + GitHub access + a
-manifest-driven tool surface. Downstream binaries (e.g. `kglite-mcp-server`)
-re-export `mcp_server::McpServer::new(...)` to layer graph-specific
+manifest-driven tool surface. Downstream Rust crates (e.g.
+`kglite-mcp-server`) depend on `mcp-methods` and re-use
+`mcp_methods::server::McpServer::new(...)` to layer graph-specific
 tools on top while reusing the boot sequence, `.env` loading, workspace
 mode, watch mode, and embedder lifecycle.
 
 ### Cargo features
 
-By default the framework includes Python extension support — YAML-
-declared `python:` tool hooks and the `embedder:` factory load via
-PyO3. Downstream binaries that want a framework without the
-`crates/mcp-server`-level PyO3 dep can opt out:
+The framework is gated behind two opt-out features:
+
+| Feature | What it enables | Default |
+|---|---|---|
+| `python` | PyO3 + the `_mcp_methods` cdylib + Python-callable surface (read_file, ripgrep, list_dir, …) + manifest-declared `python:` tools and `embedder:` blocks. | on |
+| `server` | The `mcp-server` framework: rmcp + tokio + clap + manifest + tool routing + the `[[bin]]` target. | on |
+| `python-extension` | Wheel-build path — implies `python`, adds `pyo3/extension-module`. | off (maturin sets it) |
+
+Downstream Rust binaries that want only the pure primitives opt out:
 
 ```toml
-mcp-server = { git = "...", default-features = false }
+mcp-methods = { git = "...", default-features = false }
 ```
 
-Note: `mcp-methods` (the top-level crate) still pulls in PyO3 as a
-hard dep because the Python wheel surface depends on it. The
-feature gate above removes the *direct* dep from
-`crates/mcp-server` only — useful for keeping the framework's
-non-Python build path clean and for downstream binaries that don't
-want manifest-declared `python:` tools / embedder. For a fully
-PyO3-free build path, the consuming binary also needs to gate the
-mcp-methods dep itself.
+Adds back what you need:
+
+```toml
+# Just the framework (no Python interop, no libpython link):
+mcp-methods = { git = "...", default-features = false, features = ["server"] }
+
+# Just the Python wheel surface (no rmcp / tokio):
+mcp-methods = { git = "...", default-features = false, features = ["python"] }
+```
+
+A `--no-default-features` build (or `--features server` alone) produces a
+binary with **no libpython link** — useful for distributing a static
+binary that doesn't have to match the operator's Python version.
 
 ### Operating modes (set via CLI flag or the YAML manifest)
 

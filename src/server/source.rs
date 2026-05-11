@@ -182,8 +182,7 @@ fn grep_lines(
         if k > 0 {
             out.push("--".to_string());
         }
-        for i in *s..=*e {
-            let (lineno, text) = lines[i];
+        for &(lineno, text) in lines.iter().take(*e + 1).skip(*s) {
             out.push(format!("{lineno:>6}: {text}"));
         }
     }
@@ -431,7 +430,7 @@ fn glob_to_regex(glob: &str) -> Result<Regex, regex::Error> {
     let mut out = String::with_capacity(glob.len() * 2 + 4);
     out.push('^');
     let mut chars = glob.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in &mut chars {
         match c {
             '*' => out.push_str(".*"),
             '?' => out.push('.'),

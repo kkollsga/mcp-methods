@@ -43,15 +43,43 @@ dev = [
     "mypy>=1.0",
 ]
 
+# `pip install mcp-methods` → `mcp-server` on PATH. The entry point
+# resolves to a Python launcher (`mcp_methods._cli:main`) which execs
+# the native Rust binary bundled under `mcp_methods/_bin/mcp-server`.
+# The native binary is built by maturin alongside the cdylib (the
+# `[[bin]]` target in Cargo.toml); the wheel-build workflow copies it
+# into the package's `_bin/` directory before maturin packages the
+# Python tree.
+[project.scripts]
+mcp-server = "mcp_methods._cli:main"
+
 [project.urls]
 Homepage = "https://github.com/kkollsga/mcp-methods"
 Repository = "https://github.com/kkollsga/mcp-methods"
 Issues = "https://github.com/kkollsga/mcp-methods/issues"
 
 [tool.maturin]
-features = ["python-extension"]
+# `python-extension` enables `python` + `pyo3/extension-module` for the
+# cdylib build path. `server` is enabled too so the binary is built
+# (and so the python.rs / embedder.rs modules are visible to the
+# cdylib for Python-facing tool loading).
+features = ["python-extension", "server"]
 python-source = "python"
 module-name = "mcp_methods._mcp_methods"
+
+# Force-include the bundled `mcp-server` binary into the wheel. It
+# lives under `python/mcp_methods/_bin/` after the `make bundle-bin`
+# step (or the equivalent CI workflow step) runs. The binary is
+# `.gitignore`d (would pollute git with platform-specific outputs),
+# and maturin would skip ignored files by default — this override
+# tells it the file is part of the wheel. POSIX builds package
+# `mcp-server`; Windows builds package `mcp-server.exe`. Only one of
+# the two exists on any given platform, but listing both keeps the
+# config platform-agnostic.
+include = [
+    { path = "python/mcp_methods/_bin/mcp-server", format = "wheel" },
+    { path = "python/mcp_methods/_bin/mcp-server.exe", format = "wheel" },
+]
 
 [tool.ruff]
 line-length = 100

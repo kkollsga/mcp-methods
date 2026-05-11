@@ -34,6 +34,10 @@ pub mod manifest;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod runtime;
+// `server` inside the `server` feature module — the inner module is
+// the rmcp `ServerHandler` impl. Rename would churn every downstream
+// import; allow the inception.
+#[allow(clippy::module_inception)]
 pub mod server;
 pub mod source;
 pub mod watch;

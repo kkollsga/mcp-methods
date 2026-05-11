@@ -35,7 +35,7 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{CallToolResult, Content, Tool};
 use rmcp::ErrorData as McpError;
 
-use crate::manifest::{EmbedderConfig, Manifest, PythonTool};
+use crate::server::manifest::{EmbedderConfig, Manifest, PythonTool};
 use crate::server::McpServer;
 
 type DynFut<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -64,7 +64,7 @@ pub fn register_python_tools(
         .tools
         .iter()
         .filter_map(|t| match t {
-            crate::manifest::ToolSpec::Python(p) => Some(p),
+            crate::server::manifest::ToolSpec::Python(p) => Some(p),
             _ => None,
         })
         .collect();

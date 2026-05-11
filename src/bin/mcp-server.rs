@@ -51,12 +51,14 @@ use clap::Parser;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
-use mcp_server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
-use mcp_server::server::{McpServer, ServerOptions};
-use mcp_server::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots, workspace};
+use mcp_methods::server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
+use mcp_methods::server::{
+    init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots, workspace, McpServer,
+    ServerOptions,
+};
 
 #[cfg(feature = "python")]
-use mcp_server::{apply_python_extensions, PythonExtensions};
+use mcp_methods::server::{apply_python_extensions, PythonExtensions};
 
 /// Operating mode picked from the CLI flags and the manifest's
 /// optional `workspace:` block. Manifest declarations win over CLI
@@ -257,7 +259,7 @@ async fn main() -> Result<()> {
     // mode here before any binding logic runs.
     if let Some(m) = manifest.as_ref() {
         if let Some(wcfg) = m.workspace.as_ref() {
-            if wcfg.kind == mcp_server::WorkspaceKind::Local {
+            if wcfg.kind == mcp_methods::server::WorkspaceKind::Local {
                 let raw_root = wcfg.root.as_ref().expect("validated by manifest loader");
                 let base = m
                     .yaml_path
@@ -352,7 +354,7 @@ async fn main() -> Result<()> {
             let py_count = m
                 .tools
                 .iter()
-                .filter(|t| matches!(t, mcp_server::ToolSpec::Python(_)))
+                .filter(|t| matches!(t, mcp_methods::server::ToolSpec::Python(_)))
                 .count();
             if py_count > 0 || m.embedder.is_some() {
                 tracing::warn!(

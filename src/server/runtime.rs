@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
-use crate::env;
-use crate::manifest::{Manifest, ManifestError};
-use crate::watch;
+use crate::server::env;
+use crate::server::manifest::{Manifest, ManifestError};
+use crate::server::watch;
 
 #[cfg(feature = "python")]
 use std::sync::Arc;
@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "python")]
-use crate::embedder::{self, EmbedderHandle};
+use crate::server::embedder::{self, EmbedderHandle};
 #[cfg(feature = "python")]
-use crate::manifest::ToolSpec;
+use crate::server::manifest::ToolSpec;
 #[cfg(feature = "python")]
-use crate::python;
+use crate::server::python;
 #[cfg(feature = "python")]
 use crate::server::McpServer;
 

@@ -1,3 +1,4 @@
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::Value;
@@ -31,8 +32,10 @@ use crate::github;
 /// Element cache for storing collapsed discussion elements (code blocks,
 /// details sections, truncated comments, overflow).
 ///
-/// Lives entirely in Rust memory. Python holds a reference to it.
-#[pyclass]
+/// Lives entirely in Rust memory. Python holds a reference to it when
+/// the `python` feature is enabled; pure-Rust consumers (e.g.
+/// mcp-server) use it directly as a normal struct.
+#[cfg_attr(feature = "python", pyclass)]
 pub struct ElementCache {
     // (repo, number) -> {element_id -> element_data_json}
     store: HashMap<(String, u64), HashMap<String, Value>>,
@@ -44,9 +47,16 @@ impl Default for ElementCache {
     }
 }
 
-#[pymethods]
+// Plain Rust impl — all the actual logic, callable from any Rust crate
+// regardless of feature flags. The `#[pymethods]` impl below is a thin
+// delegating layer added only with the `python` feature.
+//
+// Two impl blocks (rather than one with cfg_attr) because pyo3's
+// `#[new]` / `#[pyo3(signature = ...)]` sub-attributes can't be
+// produced via `cfg_attr` in pyo3 0.28 — they're recognised only when
+// `#[pymethods]` is present at parse time, not after attribute
+// resolution.
 impl ElementCache {
-    #[new]
     pub fn new() -> Self {
         Self {
             store: HashMap::new(),
@@ -105,7 +115,6 @@ impl ElementCache {
     /// Retrieve a cached element with optional line slicing or grep.
     ///
     /// This is the main drill-down method. Returns a JSON string.
-    #[pyo3(signature = (repo, number, element_id, lines=None, grep=None, context=3))]
     pub fn retrieve(
         &self,
         repo: &str,
@@ -293,34 +302,18 @@ impl ElementCache {
         serde_json::to_string_pretty(elem_data).unwrap_or_default()
     }
 
-    /// Compact a discussion dict and store cache entries.
-    ///
-    /// Takes discussion as JSON string, returns compacted JSON string.
-    /// Cache entries are stored directly in this cache object.
-    #[pyo3(signature = (repo, number, discussion_json))]
-    pub fn compact_and_store(
-        &mut self,
-        repo: &str,
-        number: u64,
-        discussion_json: &str,
-    ) -> PyResult<String> {
-        let cache_json = serde_json::to_string(&serde_json::json!({"_n": 0})).unwrap();
-        let (compacted_json, cache_out) =
-            compact::compact_discussion(discussion_json, Some(&cache_json), None, None)?;
-
-        // Extract and store cache entries
-        if let Some(ref cache_str) = cache_out {
-            self.store_elements(repo, number, cache_str);
-        }
-
-        Ok(compacted_json)
-    }
-
     /// Fetch a GitHub issue/PR, compact it, and store cache entries.
     ///
-    /// Releases the GIL during all HTTP and computation. This is the primary
-    /// entry point for fetching discussions with caching.
-    #[pyo3(signature = (repo, number, *, element_id=None, lines=None, grep=None, context=3, refresh=false))]
+    /// Releases the GIL during all HTTP and computation (when the
+    /// `python` feature is on). This is the primary entry point for
+    /// fetching discussions with caching, callable from both Python
+    /// and pure Rust.
+    ///
+    /// Every code path returns a status string — invalid-repo, fetch-
+    /// failure, cached-summary, overflow-preview, and full-text are
+    /// all returned as `String`; the return is never a real error
+    /// envelope. Pyo3 wraps the return as a Python `str` when the
+    /// `python` feature is enabled.
     #[allow(clippy::too_many_arguments)]
     pub fn fetch_issue(
         &mut self,
@@ -331,15 +324,15 @@ impl ElementCache {
         grep: Option<&str>,
         context: usize,
         refresh: bool,
-    ) -> PyResult<String> {
+    ) -> String {
         // Element retrieval — no network, fast
         if let Some(eid) = element_id {
-            return Ok(self.retrieve(repo, number, eid, lines, grep, context));
+            return self.retrieve(repo, number, eid, lines, grep, context);
         }
 
         // Validate repo
         if let Some(err) = crate::git_refs::validate_repo(repo) {
-            return Ok(err);
+            return err;
         }
 
         // If cached and not refreshing, return summary of available elements
@@ -349,7 +342,7 @@ impl ElementCache {
                 if !elements.is_empty() {
                     let mut ids: Vec<&String> = elements.keys().collect();
                     ids.sort();
-                    return Ok(format!(
+                    return format!(
                         "Cached {}#{} — {} elements available: {}\n\
                          Use element_id='...' to drill down, or refresh=True to re-fetch.",
                         repo,
@@ -359,7 +352,7 @@ impl ElementCache {
                             .map(|s| s.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
-                    ));
+                    );
                 }
             }
         }
@@ -367,10 +360,10 @@ impl ElementCache {
         // All HTTP + computation runs in Rust; parallel requests use std::thread::scope
         let (text, cache_json) = match github::fetch_issue_internal(repo, number) {
             Ok(r) => r,
-            Err(e) => return Ok(e),
+            Err(e) => return e,
         };
 
-        // Store cache entries (GIL held, &mut self available)
+        // Store cache entries
         if let Some(ref cj) = cache_json {
             self.store_elements(repo, number, cj);
         }
@@ -405,10 +398,102 @@ impl ElementCache {
                 text.len(),
                 total_lines
             ));
-            return Ok(preview);
+            return preview;
         }
 
-        Ok(text)
+        text
+    }
+}
+
+// PyO3 wrapper impl — thin delegating layer that re-exposes the plain
+// impl's surface to Python. Methods need pyo3-specific sub-attributes
+// (`#[new]`, `#[pyo3(signature = ...)]`) which cannot be produced via
+// `cfg_attr`, so we keep them inside a separate `#[pymethods]` impl
+// that's only compiled with the `python` feature.
+//
+// Each wrapper renames the Python-side method via `#[pyo3(name = "X")]`
+// to avoid colliding with the plain impl's identifier. The bodies just
+// delegate.
+#[cfg(feature = "python")]
+#[pymethods]
+impl ElementCache {
+    #[new]
+    fn py_new() -> Self {
+        Self::new()
+    }
+
+    #[pyo3(name = "get")]
+    fn py_get(&self, repo: &str, number: u64, element_id: &str) -> Option<String> {
+        self.get(repo, number, element_id)
+    }
+
+    #[pyo3(name = "store_elements")]
+    fn py_store_elements(&mut self, repo: &str, number: u64, elements_json: &str) {
+        self.store_elements(repo, number, elements_json);
+    }
+
+    #[pyo3(name = "update_elements")]
+    fn py_update_elements(&mut self, repo: &str, number: u64, elements_json: &str) {
+        self.update_elements(repo, number, elements_json);
+    }
+
+    #[pyo3(name = "available")]
+    fn py_available(&self, repo: &str, number: u64) -> Vec<String> {
+        self.available(repo, number)
+    }
+
+    #[pyo3(
+        name = "retrieve",
+        signature = (repo, number, element_id, lines=None, grep=None, context=3)
+    )]
+    fn py_retrieve(
+        &self,
+        repo: &str,
+        number: u64,
+        element_id: &str,
+        lines: Option<&str>,
+        grep: Option<&str>,
+        context: usize,
+    ) -> String {
+        self.retrieve(repo, number, element_id, lines, grep, context)
+    }
+
+    #[pyo3(
+        name = "fetch_issue",
+        signature = (repo, number, *, element_id=None, lines=None, grep=None, context=3, refresh=false)
+    )]
+    #[allow(clippy::too_many_arguments)]
+    fn py_fetch_issue(
+        &mut self,
+        repo: &str,
+        number: u64,
+        element_id: Option<&str>,
+        lines: Option<&str>,
+        grep: Option<&str>,
+        context: usize,
+        refresh: bool,
+    ) -> String {
+        self.fetch_issue(repo, number, element_id, lines, grep, context, refresh)
+    }
+
+    /// Compact a discussion dict and store cache entries. Python-only —
+    /// `compact::compact_discussion` returns `Result<_, String>`; we
+    /// map that to a `PyValueError` for the Python side.
+    #[pyo3(name = "compact_and_store", signature = (repo, number, discussion_json))]
+    fn py_compact_and_store(
+        &mut self,
+        repo: &str,
+        number: u64,
+        discussion_json: &str,
+    ) -> PyResult<String> {
+        let cache_json = serde_json::to_string(&serde_json::json!({"_n": 0})).unwrap();
+        let (compacted_json, cache_out) =
+            compact::compact_discussion(discussion_json, Some(&cache_json), None, None)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        if let Some(ref cache_str) = cache_out {
+            self.store_elements(repo, number, cache_str);
+        }
+        Ok(compacted_json)
     }
 }
 
