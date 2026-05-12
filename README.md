@@ -31,6 +31,19 @@ use mcp_methods::server::{McpServer, ServerOptions, Manifest}; // with default `
 
 Zero pyo3 in the dep tree. The `server` feature (default-on) adds the rmcp-backed framework; disable with `default-features = false` for the bare primitives.
 
+For pre-release coordination — pinning against a specific commit while the framework is iterating quickly — depend on a git rev directly:
+
+```toml
+mcp-methods = {
+    git = "https://github.com/kkollsga/mcp-methods.git",
+    rev = "<short SHA>",
+    default-features = false,
+    features = ["server"],
+}
+```
+
+The downstream `kglite-mcp-server` uses this pattern to stay locked to the exact framework rev its integration tests pass against; switch to a published `version = "0.3"` once API churn settles.
+
 ## Install — `mcp-server` CLI
 
 ```bash
@@ -264,6 +277,56 @@ mcp-methods = { version = "0.3", default-features = false }
 
 YAML manifest declarations win over CLI flags when both are set
 (same precedence rule as `source_root:`).
+
+### Trust gates (advisory metadata)
+
+The framework parses the `trust:` block but doesn't enforce its flags — downstream binaries enforce them when loading the corresponding extension. Operators reviewing a manifest for security audit can read `trust:` to see every dynamic-code hook the manifest enables in one place.
+
+| Flag | Gates |
+|---|---|
+| `allow_python_tools` | `tools[].python:` factories (consumer-enforced; mcp-methods 0.3.26+ removed framework-level loading). |
+| `allow_embedder` | `extensions.embedder` loaders in downstream binaries (e.g. kglite's bge-m3 wrapper). |
+| `allow_query_preprocessor` | `extensions.cypher_preprocessor` query-rewriter hooks (kglite 0.9.25+). |
+
+Each defaults to `false`. Downstream binaries should refuse to load the corresponding extension when the flag is unset, mirroring the embedder pattern. New trust keys are added as advisory metadata in patch releases.
+
+## Rust API reference
+
+`mcp_methods::server::*` is the Rust-consumer surface for the framework. Downstream binaries (e.g. [`kglite-mcp-server`](https://github.com/kkollsga/kglite/tree/main/crates/kglite-mcp-server) — ~500 LOC, readable end-to-end) build domain-specific MCP servers by composing these primitives.
+
+| Type / function | Purpose |
+|---|---|
+| `Manifest`, `load_manifest(path)` | Parse + validate YAML manifests with strict unknown-key checking. `Manifest::to_json()` returns a stable JSON shape for FFI/RPC bridging. |
+| `find_sibling_manifest`, `find_workspace_manifest` | Auto-detect manifest files next to a graph file or workspace directory. |
+| `Workspace::open(...)`, `Workspace::open_local(...)` | GitHub clone-tracker or local-directory bind. `set_root_dir` swaps the active root atomically (RwLock-protected); `repo_management` is the operator-facing tool dispatcher. |
+| `PostActivateHook = Arc<dyn Fn(&Path, &str) -> Result<()> + Send + Sync>` | Caller-supplied callback fired after each successful activate / `set_root_dir`. |
+| `watch_dir(...)`, `ChangeHandler`, `WatchHandle` | Filesystem watcher with `notify-debouncer-mini`. Drop the handle to stop. |
+| `load_env_walk(start)`, `load_env_explicit(path)` | `.env` loading; mirrors the Python `_utils.load_env` semantics (no-overwrite, quoted-value support). |
+| `McpServer`, `ServerOptions` | rmcp-backed framework boot — what `mcp-server` and downstream binaries wrap. |
+| `TrustConfig` (parsed; framework records, consumer enforces) | `allow_python_tools`, `allow_embedder`, `allow_query_preprocessor`. See [Trust gates](#trust-gates-advisory-metadata) above. |
+
+For full signatures and per-field docs, run `cargo doc -p mcp-methods --open` or browse [docs.rs](https://docs.rs/mcp-methods).
+
+### Serialising a `Manifest`
+
+`Manifest::to_json() -> serde_json::Value` returns a stable JSON representation of the parsed manifest. Useful when bridging to Python / RPC / JavaScript without per-field FFI getters.
+
+```rust
+use mcp_methods::server::manifest::load as load_manifest;
+
+let m = load_manifest(yaml_path)?;
+let json = m.to_json();
+// Shape:
+// {
+//   "yaml_path", "name", "instructions", "overview_prefix",
+//   "source_roots": [...],
+//   "trust": { "allow_python_tools", "allow_embedder", "allow_query_preprocessor" },
+//   "tools":   [ { "kind": "cypher"|"python", ... } ],
+//   "embedder", "builtins", "env_file", "workspace", "extensions"
+// }
+```
+
+Field additions are non-breaking patch releases; renames or removals require a minor version bump. See `to_json_shape_is_stable` in `crates/mcp-methods/src/server/manifest.rs` for the snapshot test that locks the canonical shape.
 
 ## Architecture
 
