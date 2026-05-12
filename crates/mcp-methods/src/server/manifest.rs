@@ -211,6 +211,64 @@ pub struct Manifest {
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
+impl Manifest {
+    /// JSON-friendly representation of the validated manifest for
+    /// FFI / RPC exposure (pyo3 wrappers, JSON-RPC bridges, etc.).
+    ///
+    /// The shape is stable across patch releases: fields can be added
+    /// non-breaking, but key renames or removals are breaking changes.
+    /// When adding a new field to `Manifest`, extend this method too —
+    /// the `to_json_shape_is_stable` test will fail until you do.
+    /// The `extensions` map is passed through unchanged; downstream
+    /// consumers parse their own namespace from it.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "yaml_path": self.yaml_path.display().to_string(),
+            "name": self.name,
+            "instructions": self.instructions,
+            "overview_prefix": self.overview_prefix,
+            "source_roots": self.source_roots,
+            "trust": {
+                "allow_python_tools": self.trust.allow_python_tools,
+                "allow_embedder": self.trust.allow_embedder,
+            },
+            "tools": self.tools.iter().map(|t| match t {
+                ToolSpec::Cypher(c) => serde_json::json!({
+                    "kind": "cypher",
+                    "name": c.name,
+                    "cypher": c.cypher,
+                    "description": c.description,
+                    "parameters": c.parameters,
+                }),
+                ToolSpec::Python(p) => serde_json::json!({
+                    "kind": "python",
+                    "name": p.name,
+                    "python": p.python,
+                    "function": p.function,
+                    "description": p.description,
+                    "parameters": p.parameters,
+                }),
+            }).collect::<Vec<_>>(),
+            "embedder": self.embedder.as_ref().map(|e| serde_json::json!({
+                "module": e.module,
+                "class": e.class,
+                "kwargs": e.kwargs,
+            })),
+            "builtins": {
+                "save_graph": self.builtins.save_graph,
+                "temp_cleanup": self.builtins.temp_cleanup.as_str(),
+            },
+            "env_file": self.env_file,
+            "workspace": self.workspace.as_ref().map(|w| serde_json::json!({
+                "kind": w.kind.as_str(),
+                "root": w.root,
+                "watch": w.watch,
+            })),
+            "extensions": self.extensions,
+        })
+    }
+}
+
 /// Auto-detect ``<basename>_mcp.yaml`` next to a graph file.
 pub fn find_sibling_manifest(graph_path: &Path) -> Option<PathBuf> {
     let stem = graph_path.file_stem()?;
@@ -1004,5 +1062,88 @@ mod tests {
         let manifest = dir.path().join("workspace_mcp.yaml");
         std::fs::write(&manifest, "name: ws\n").unwrap();
         assert_eq!(find_workspace_manifest(dir.path()), Some(manifest));
+    }
+
+    #[test]
+    fn to_json_shape_is_stable() {
+        let f = write_tmp(
+            r#"
+name: KGLite Codebase
+source_roots: [src, lib]
+trust:
+  allow_embedder: true
+embedder:
+  module: kglite.embed
+  class: SentenceTransformerEmbedder
+builtins:
+  save_graph: true
+  temp_cleanup: on_overview
+"#,
+        );
+        let m = load(f.path()).unwrap();
+        let actual = m.to_json();
+        let expected = serde_json::json!({
+            "yaml_path": f.path().display().to_string(),
+            "name": "KGLite Codebase",
+            "instructions": null,
+            "overview_prefix": null,
+            "source_roots": ["src", "lib"],
+            "trust": { "allow_python_tools": false, "allow_embedder": true },
+            "tools": [],
+            "embedder": {
+                "module": "kglite.embed",
+                "class": "SentenceTransformerEmbedder",
+                "kwargs": {},
+            },
+            "builtins": { "save_graph": true, "temp_cleanup": "on_overview" },
+            "env_file": null,
+            "workspace": null,
+            "extensions": {},
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn to_json_round_trips_tools_and_workspace() {
+        let f = write_tmp(
+            r#"
+name: Full Surface
+source_root: ./src
+trust:
+  allow_python_tools: true
+tools:
+  - name: nodes_for
+    cypher: "MATCH (n {name: $name}) RETURN n"
+    description: "fetch nodes by name"
+  - name: run_query
+    python: tools.py
+    function: run
+workspace:
+  kind: local
+  root: /tmp/ws
+  watch: true
+builtins:
+  save_graph: false
+env_file: .env.local
+extensions:
+  kglite:
+    flavour: standard
+"#,
+        );
+        let m = load(f.path()).unwrap();
+        let v = m.to_json();
+        assert_eq!(v["name"], "Full Surface");
+        assert_eq!(v["trust"]["allow_python_tools"], true);
+        assert_eq!(v["workspace"]["kind"], "local");
+        assert_eq!(v["workspace"]["root"], "/tmp/ws");
+        assert_eq!(v["workspace"]["watch"], true);
+        assert_eq!(v["env_file"], ".env.local");
+        assert_eq!(v["tools"][0]["kind"], "cypher");
+        assert_eq!(v["tools"][0]["name"], "nodes_for");
+        assert_eq!(v["tools"][1]["kind"], "python");
+        assert_eq!(v["tools"][1]["name"], "run_query");
+        assert_eq!(v["tools"][1]["python"], "tools.py");
+        assert_eq!(v["tools"][1]["function"], "run");
+        assert_eq!(v["extensions"]["kglite"]["flavour"], "standard");
     }
 }

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.27 — 2026-05-12
+
+### Added
+- `Manifest::to_json() -> serde_json::Value` for FFI / RPC introspection.
+  Returns a JSON-friendly view of the validated manifest with stable
+  shape across patch releases. Intended for pyo3 wrappers, JSON-RPC
+  bridges, and any consumer that needs programmatic access to the
+  loaded manifest without per-field getters. Schema knowledge lives
+  end-to-end on the framework side; downstream wrappers shrink to
+  roughly one passthrough method plus a generic `serde_json::Value ->
+  PyObject` (or equivalent) converter.
+
+### Notes
+- No breaking changes. No new dependencies (`serde_json` was already
+  in the dep tree).
+- The JSON shape is pinned by the `to_json_shape_is_stable` test in
+  `crates/mcp-methods/src/server/manifest.rs` — read it as the canonical
+  contract. Future renames or removals in this shape are breaking
+  changes; additions are non-breaking.
+- No `#[derive(Serialize)]` on any manifest struct: keeps the
+  hand-rolled parsing symmetry on input and output, and avoids
+  coupling JSON shape to Rust field names.
+
 ## 0.3.26
 
 The polars / pydantic-core distribution shape. `mcp-methods` is now a
