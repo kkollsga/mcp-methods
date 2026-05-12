@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.28 — 2026-05-12
+
+### Fixed
+- `Workspace::set_root_dir` no longer clobbers the just-set
+  `active_repo_path` back to the configured `workspace_dir`. The
+  local-mode branch of `clone_or_update` now reads the current
+  `active_repo_path` from state (falling back to `workspace_dir` only
+  when state is unset), so the activate-after-set_root_dir sequence
+  preserves the new root, and the post-activate hook fires against the
+  bound target rather than the original configured root.
+
+  Reported by kglite while wrapping `Workspace` in pyo3 for 0.9.24.
+  Bug had no effect on github-mode workspaces; only local-mode
+  `set_root_dir` callers who read `active_repo_path()` after the swap
+  (or whose post-activate hook needed to rebuild against the new root)
+  were affected.
+
+### Added (tests)
+- `set_root_dir_updates_active_path` — anchors the invariant.
+- `set_root_dir_post_activate_fires_against_new_root` — confirms the
+  hook fires against the bound target.
+
 ## 0.3.27 — 2026-05-12
 
 ### Added

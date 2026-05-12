@@ -379,7 +379,23 @@ impl Workspace {
     /// mtimes + sizes) so the auto-rebuild gate still works.
     fn clone_or_update(&self, name: &str) -> Result<(String, PathBuf, String)> {
         if matches!(self.inner.kind, WorkspaceKind::Local) {
-            let root = self.inner.workspace_dir.clone();
+            // Local mode tracks the *currently bound* root, not the
+            // immutable configured `workspace_dir`. `set_root_dir` writes
+            // the target to `active_repo_path` before calling `activate`;
+            // this read picks that up so the fingerprint and the
+            // post-activate hook fire against the new root, and so the
+            // subsequent `active_repo_path` write in `activate` doesn't
+            // clobber the just-set target back to `workspace_dir`. Falls
+            // back to `workspace_dir` only if state is unset, which
+            // shouldn't happen after `open_local` seeds it.
+            let root = self
+                .inner
+                .state
+                .read()
+                .unwrap()
+                .active_repo_path
+                .clone()
+                .unwrap_or_else(|| self.inner.workspace_dir.clone());
             let prev_sha = self.last_built_sha(name);
             let fingerprint = fingerprint_dir(&root);
             let action = match prev_sha {
@@ -1040,5 +1056,40 @@ mod tests {
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
         let out = ws.repo_management(None, false, true, false);
         assert!(out.contains("No active repository"));
+    }
+
+    #[test]
+    fn set_root_dir_updates_active_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
+        let _ = ws.set_root_dir(&child);
+        assert_eq!(
+            ws.active_repo_path().unwrap(),
+            child.canonicalize().unwrap(),
+            "set_root_dir didn't update active_repo_path"
+        );
+    }
+
+    #[test]
+    fn set_root_dir_post_activate_fires_against_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("a.txt"), b"hi").unwrap();
+        let seen_path: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::new(Default::default());
+        let seen = seen_path.clone();
+        let hook: PostActivateHook = Arc::new(move |p, _n| {
+            *seen.lock().unwrap() = Some(p.to_path_buf());
+            Ok(())
+        });
+        let ws = Workspace::open_local(dir.path().to_path_buf(), Some(hook)).unwrap();
+        let _ = ws.set_root_dir(&child);
+        assert_eq!(
+            seen_path.lock().unwrap().clone().unwrap(),
+            child.canonicalize().unwrap(),
+            "post_activate hook saw the wrong root after set_root_dir"
+        );
     }
 }
