@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.3.30 — 2026-05-12
+
+### Distribution shape — bundled binary in the pip wheel
+
+`pip install mcp-methods` now puts the `mcp-server` CLI on PATH again,
+restoring the pattern we shipped in 0.3.25. The wheel bundles the
+native Rust binary at `mcp_methods/_bin/mcp-server`; the Python entry
+point `mcp_methods._cli:main` execs it on invocation.
+
+This is the kglite-style "pip install gives you everything" UX,
+adapted for our case: because our `mcp-server` binary has zero
+libpython link (kept from the 0.3.26 pure-Rust separation), we stay
+at 3 abi3 wheels per OS — no per-Python-version matrix.
+
+### Why the revert
+
+The 0.3.26 polars-shape split removed the bundled binary on
+architectural grounds. Re-introducing it: pip is the operator-facing
+distribution and the CLI is the operator-facing artefact. A separate
+crates.io entry for `mcp-server` (the 0.3.29 plan) would have added a
+distribution path nobody asked for. Single distribution path is
+clearer.
+
+`crates/mcp-server/` stays in the workspace as the binary's source
+home — used by the wheel build to compile + bundle, and available
+for downstream Rust users via `cargo install --git`. **Not published
+to crates.io.**
+
+### crates.io — library publication
+
+`mcp-methods` 0.3.30 is the first version published to crates.io.
+The library is pure Rust, zero pyo3 in the dep tree (the polars
+shape from 0.3.26 is preserved). docs.rs auto-builds the rustdoc.
+Downstream consumers can now write:
+
+```toml
+mcp-methods = "0.3"
+```
+
+…instead of pinning to a git rev. kglite's existing git-rev pin
+keeps working unchanged.
+
+### Files touched
+- `pyproject.toml` — restored `[project.scripts]` + `[tool.maturin]
+  include` blocks.
+- `python/mcp_methods/_cli.py` — restored.
+- `Makefile` — restored `bundle-bin` / `dev-with-bin` targets.
+- `.github/workflows/build_wheels.yml` — restored the
+  cargo-build-binary + copy-into-wheel step (per-OS).
+- `.gitignore` — re-ignore `python/mcp_methods/_bin/`.
+- `crates/mcp-methods/Cargo.toml` — publish metadata
+  (repository, keywords, categories, docs.rs config).
+- `crates/mcp-server/Cargo.toml` — version 0.3.29 → 0.3.30 (still
+  workspace-local; not published).
+- README.md — drop the `cargo install mcp-server` section; fold the
+  CLI into the Python-install path.
+
+### No regression for downstream Rust consumers
+
+The library crate source is unchanged. kglite's `rev = "71f7ba6..."`
+pin resolves identically. The new 0.3.30 publish to crates.io is
+opt-in — downstream consumers who want to switch from git-rev to
+`version = "0.3"` can, but nothing forces them.
+
 ## 0.3.29 — 2026-05-12
 
 ### Added

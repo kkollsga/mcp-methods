@@ -14,7 +14,7 @@ pip install mcp-methods
 from mcp_methods import ElementCache, ripgrep, list_dir, github_issues, read_file, html_to_text
 ```
 
-Single abi3 wheel per OS — works on Python 3.10 through 3.13 without reinstall.
+Single abi3 wheel per OS — works on Python 3.10 through 3.13 without reinstall. The wheel also bundles the `mcp-server` CLI on PATH — see [Deployment — `mcp-server` CLI](#deployment--mcp-server-cli) below.
 
 ## Install — Rust library
 
@@ -43,14 +43,6 @@ mcp-methods = {
 ```
 
 The downstream `kglite-mcp-server` uses this pattern to stay locked to the exact framework rev its integration tests pass against; switch to a published `version = "0.3"` once API churn settles.
-
-## Install — `mcp-server` CLI
-
-```bash
-cargo install mcp-server
-```
-
-Generic MCP server binary that loads YAML manifests and serves the protocol over stdio. Separate crate; not bundled in the Python wheel.
 
 ## Local development
 
@@ -238,14 +230,20 @@ Each helper is a thin (~10-line) wrapper over the existing Rust PyO3 surface —
 
 ## Deployment — `mcp-server` CLI
 
-Get the binary via crates.io:
+`pip install mcp-methods` puts the `mcp-server` CLI on PATH automatically:
 
 ```bash
-cargo install mcp-server
-# → ~/.cargo/bin/mcp-server
+pip install mcp-methods
+which mcp-server
+# → /opt/miniconda3/bin/mcp-server (or your env's bin dir)
+mcp-server --help
 ```
 
+The wheel bundles the native Rust binary at `mcp_methods/_bin/mcp-server`; the Python entry point (`mcp_methods._cli:main`) execs it. Pure-Rust binary, zero libpython link — same single abi3 wheel per OS that the Python library ships in (3 wheels total across macOS / Linux / Windows).
+
 Generic MCP server, domain-agnostic: source tools + GitHub access + a manifest-driven tool surface. Reads YAML manifests and serves the MCP protocol over stdio.
+
+If you'd rather build the binary from source (no Python in the loop), the crate lives at `crates/mcp-server` in this repo and builds with `cargo build --release -p mcp-server`. Not published to crates.io — Rust toolchain users typically use `cargo install --git https://github.com/kkollsga/mcp-methods mcp-server` or vendor the crate.
 
 Downstream Rust crates (e.g. `kglite-mcp-server`) depend on `mcp-methods` directly and re-use `mcp_methods::server::McpServer::new(...)` to layer domain-specific tools on top while reusing the boot sequence, `.env` loading, workspace mode, and watch mode.
 

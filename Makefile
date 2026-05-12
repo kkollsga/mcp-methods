@@ -1,11 +1,25 @@
-.PHONY: dev test test-rust test-rust-all lint fmt clean
+.PHONY: dev dev-with-bin bundle-bin test test-rust test-rust-all lint fmt clean
 
-# Build + install the Python wheel into the active env. The wheel
-# contains the `_mcp_methods` cdylib only; the `mcp-server` CLI is a
-# separate crate — install it via `cargo install --path crates/mcp-server`
-# if you need it on PATH.
+# Build + install the Python wheel into the active env. Cdylib only,
+# no bundled `mcp-server` binary on PATH — use `make dev-with-bin` if
+# you want the CLI installed alongside.
 dev:
 	maturin develop --release
+
+# Dev install with the bundled `mcp-server` binary on PATH. Builds the
+# Rust binary, copies it under `python/mcp_methods/_bin/`, then runs
+# `maturin develop` so the binary is force-included via the
+# `[tool.maturin] include` block in `pyproject.toml`.
+dev-with-bin: bundle-bin
+	maturin develop --release
+
+# Build the binary from `crates/mcp-server` and copy it into the
+# python package. Idempotent. The wheel-build workflow does the same
+# steps before `maturin build`.
+bundle-bin:
+	cargo build --release -p mcp-server
+	mkdir -p python/mcp_methods/_bin
+	cp target/release/mcp-server python/mcp_methods/_bin/mcp-server
 
 test:
 	pytest tests/ -v

@@ -48,6 +48,16 @@ Homepage = "https://github.com/kkollsga/mcp-methods"
 Repository = "https://github.com/kkollsga/mcp-methods"
 Issues = "https://github.com/kkollsga/mcp-methods/issues"
 
+# `pip install mcp-methods` puts `mcp-server` on PATH via the Python
+# launcher at `mcp_methods._cli:main`, which execs the bundled native
+# Rust binary at `mcp_methods/_bin/mcp-server`. The binary is built
+# separately from `crates/mcp-server` (zero libpython link), copied
+# into the package by the wheel-build workflow before maturin packages
+# the Python tree, and force-included by the `[tool.maturin] include`
+# block below.
+[project.scripts]
+mcp-server = "mcp_methods._cli:main"
+
 [tool.maturin]
 # Wheel is built from the binding crate (`crates/mcp-methods-py`)
 # which depends on the pure-Rust library and adds the PyO3 wrappers.
@@ -58,6 +68,19 @@ Issues = "https://github.com/kkollsga/mcp-methods/issues"
 manifest-path = "crates/mcp-methods-py/Cargo.toml"
 python-source = "python"
 module-name = "mcp_methods._mcp_methods"
+# Force-include the bundled `mcp-server` binary into the wheel. It
+# lives under `python/mcp_methods/_bin/` after the wheel-build
+# workflow's pre-maturin step runs `cargo build -p mcp-server
+# --release` and copies the result into the package. `_bin/` is in
+# `.gitignore` so the binary doesn't get committed, and maturin would
+# skip ignored files by default — this override tells it the file is
+# part of the wheel. POSIX builds package `mcp-server`; Windows
+# builds package `mcp-server.exe`. Only one of the two paths exists
+# on any given build; maturin silently skips missing entries.
+include = [
+    { path = "python/mcp_methods/_bin/mcp-server", format = "wheel" },
+    { path = "python/mcp_methods/_bin/mcp-server.exe", format = "wheel" },
+]
 
 [tool.ruff]
 line-length = 100

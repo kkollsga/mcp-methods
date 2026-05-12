@@ -77,6 +77,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: pip install maturin
+      - name: Build + bundle mcp-server binary (POSIX)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p mcp-server
+          mkdir -p python/mcp_methods/_bin
+          cp target/${{ matrix.target }}/release/mcp-server python/mcp_methods/_bin/mcp-server
+          chmod +x python/mcp_methods/_bin/mcp-server
+          ls -lh python/mcp_methods/_bin/
+      - name: Build + bundle mcp-server binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p mcp-server
+          New-Item -ItemType Directory -Path "python/mcp_methods/_bin" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mcp-server.exe" "python/mcp_methods/_bin/mcp-server.exe"
+          Get-ChildItem "python/mcp_methods/_bin"
+        shell: pwsh
       - name: Build wheel
         run: |
           if (!(Test-Path -Path "wheels")) { New-Item -ItemType Directory -Path "wheels" }

@@ -34,3 +34,6 @@ venv/
 
 # Inbox
 inbox/
+
+# Bundled mcp-server binary (built by `make bundle-bin` or the wheel CI step)
+python/mcp_methods/_bin/
