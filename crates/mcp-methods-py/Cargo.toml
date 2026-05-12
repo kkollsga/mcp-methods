@@ -1,0 +1,22 @@
+[package]
+name = "mcp-methods-py"
+version = "0.3.26"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PyO3 bindings for mcp-methods — builds the Python wheel's cdylib"
+publish = false  # consumed only by maturin; not on crates.io
+
+[lib]
+name = "_mcp_methods"
+crate-type = ["cdylib"]
+
+[dependencies]
+mcp-methods = { path = "../mcp-methods", default-features = false }
+# `auto-initialize` for the rare case the cdylib is embedded somewhere
+# without a Python parent; `extension-module` for the wheel build path
+# (Python loads the .so, libpython stays unlinked). `abi3-py310`
+# collapses the per-Python-version wheel matrix into a single abi3
+# wheel per OS.
+pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310"] }
+serde_json = "1"

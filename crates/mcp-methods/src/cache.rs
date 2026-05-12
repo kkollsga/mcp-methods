@@ -1,5 +1,3 @@
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -32,10 +30,9 @@ use crate::github;
 /// Element cache for storing collapsed discussion elements (code blocks,
 /// details sections, truncated comments, overflow).
 ///
-/// Lives entirely in Rust memory. Python holds a reference to it when
-/// the `python` feature is enabled; pure-Rust consumers (e.g.
-/// mcp-server) use it directly as a normal struct.
-#[cfg_attr(feature = "python", pyclass)]
+/// Lives entirely in Rust memory. Pure Rust — Python bindings exist
+/// in the sibling `mcp-methods-py` crate as a thin `PyElementCache`
+/// newtype wrapping this struct.
 pub struct ElementCache {
     // (repo, number) -> {element_id -> element_data_json}
     store: HashMap<(String, u64), HashMap<String, Value>>,
@@ -47,15 +44,6 @@ impl Default for ElementCache {
     }
 }
 
-// Plain Rust impl — all the actual logic, callable from any Rust crate
-// regardless of feature flags. The `#[pymethods]` impl below is a thin
-// delegating layer added only with the `python` feature.
-//
-// Two impl blocks (rather than one with cfg_attr) because pyo3's
-// `#[new]` / `#[pyo3(signature = ...)]` sub-attributes can't be
-// produced via `cfg_attr` in pyo3 0.28 — they're recognised only when
-// `#[pymethods]` is present at parse time, not after attribute
-// resolution.
 impl ElementCache {
     pub fn new() -> Self {
         Self {
@@ -404,100 +392,6 @@ impl ElementCache {
         text
     }
 }
-
-// PyO3 wrapper impl — thin delegating layer that re-exposes the plain
-// impl's surface to Python. Methods need pyo3-specific sub-attributes
-// (`#[new]`, `#[pyo3(signature = ...)]`) which cannot be produced via
-// `cfg_attr`, so we keep them inside a separate `#[pymethods]` impl
-// that's only compiled with the `python` feature.
-//
-// Each wrapper renames the Python-side method via `#[pyo3(name = "X")]`
-// to avoid colliding with the plain impl's identifier. The bodies just
-// delegate.
-#[cfg(feature = "python")]
-#[pymethods]
-impl ElementCache {
-    #[new]
-    fn py_new() -> Self {
-        Self::new()
-    }
-
-    #[pyo3(name = "get")]
-    fn py_get(&self, repo: &str, number: u64, element_id: &str) -> Option<String> {
-        self.get(repo, number, element_id)
-    }
-
-    #[pyo3(name = "store_elements")]
-    fn py_store_elements(&mut self, repo: &str, number: u64, elements_json: &str) {
-        self.store_elements(repo, number, elements_json);
-    }
-
-    #[pyo3(name = "update_elements")]
-    fn py_update_elements(&mut self, repo: &str, number: u64, elements_json: &str) {
-        self.update_elements(repo, number, elements_json);
-    }
-
-    #[pyo3(name = "available")]
-    fn py_available(&self, repo: &str, number: u64) -> Vec<String> {
-        self.available(repo, number)
-    }
-
-    #[pyo3(
-        name = "retrieve",
-        signature = (repo, number, element_id, lines=None, grep=None, context=3)
-    )]
-    fn py_retrieve(
-        &self,
-        repo: &str,
-        number: u64,
-        element_id: &str,
-        lines: Option<&str>,
-        grep: Option<&str>,
-        context: usize,
-    ) -> String {
-        self.retrieve(repo, number, element_id, lines, grep, context)
-    }
-
-    #[pyo3(
-        name = "fetch_issue",
-        signature = (repo, number, *, element_id=None, lines=None, grep=None, context=3, refresh=false)
-    )]
-    #[allow(clippy::too_many_arguments)]
-    fn py_fetch_issue(
-        &mut self,
-        repo: &str,
-        number: u64,
-        element_id: Option<&str>,
-        lines: Option<&str>,
-        grep: Option<&str>,
-        context: usize,
-        refresh: bool,
-    ) -> String {
-        self.fetch_issue(repo, number, element_id, lines, grep, context, refresh)
-    }
-
-    /// Compact a discussion dict and store cache entries. Python-only —
-    /// `compact::compact_discussion` returns `Result<_, String>`; we
-    /// map that to a `PyValueError` for the Python side.
-    #[pyo3(name = "compact_and_store", signature = (repo, number, discussion_json))]
-    fn py_compact_and_store(
-        &mut self,
-        repo: &str,
-        number: u64,
-        discussion_json: &str,
-    ) -> PyResult<String> {
-        let cache_json = serde_json::to_string(&serde_json::json!({"_n": 0})).unwrap();
-        let (compacted_json, cache_out) =
-            compact::compact_discussion(discussion_json, Some(&cache_json), None, None)
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        if let Some(ref cache_str) = cache_out {
-            self.store_elements(repo, number, cache_str);
-        }
-        Ok(compacted_json)
-    }
-}
-
-// --- Internal grep helpers (no PyO3, pure Rust) ---
 
 fn grep_lines_internal(text_lines: &[&str], regex: &Regex, context: usize) -> Value {
     let mut raw: Vec<(usize, usize, usize)> = Vec::new();

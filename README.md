@@ -1,26 +1,51 @@
 # mcp-methods
 
-Shared Rust-powered utilities for MCP servers. Pip-installable library that provides fast file search, GitHub integration, and text processing — the common building blocks needed when writing MCP tool servers. Ships an `mcp-server` binary on PATH for the YAML+CLI MCP-server workflow.
+Shared Rust-powered utilities for MCP servers. Pip-installable Python library AND a native Rust crate — they're the same set of primitives reachable through whichever interface fits your project. Fast file search, GitHub integration, text compaction, and an rmcp-backed MCP server framework. The common building blocks needed when writing MCP tool servers.
 
-## Install
+The Rust library is the source of truth; the Python wheel is a thin PyO3 binding over it. Rust consumers see zero Python in their dep tree.
+
+## Install — Python
 
 ```bash
 pip install mcp-methods
 ```
 
-After install, `mcp-server` is on PATH:
-
-```bash
-mcp-server --help
-mcp-server --source-root ./my-project
+```python
+from mcp_methods import ElementCache, ripgrep, list_dir, github_issues, read_file, html_to_text
 ```
 
-For local development (requires Rust toolchain + maturin):
+Single abi3 wheel per OS — works on Python 3.10 through 3.13 without reinstall.
+
+## Install — Rust library
+
+```toml
+[dependencies]
+mcp-methods = "0.3"
+```
+
+```rust
+use mcp_methods::cache::ElementCache;
+use mcp_methods::{github, files, grep, list_dir, compact, html};
+use mcp_methods::server::{McpServer, ServerOptions, Manifest}; // with default `server` feature
+```
+
+Zero pyo3 in the dep tree. The `server` feature (default-on) adds the rmcp-backed framework; disable with `default-features = false` for the bare primitives.
+
+## Install — `mcp-server` CLI
 
 ```bash
-make dev-with-bin       # builds binary + installs editable wheel
-# or, without the binary on PATH:
-make dev                # cdylib + python source only
+cargo install mcp-server
+```
+
+Generic MCP server binary that loads YAML manifests and serves the protocol over stdio. Separate crate; not bundled in the Python wheel.
+
+## Local development
+
+```bash
+make dev           # build + install editable wheel
+make test          # python tests
+make test-rust     # rust library tests
+make test-rust-all # all workspace tests
 ```
 
 ## What's included
@@ -198,56 +223,34 @@ app.run(transport="stdio")
 
 Each helper is a thin (~10-line) wrapper over the existing Rust PyO3 surface — there's no logic duplication between the YAML-driven binary and these helpers, so agent behaviour is identical regardless of which path booted the server. `graph` is any object exposing `describe()` / `cypher()` / `save()`; kglite's `KnowledgeGraph` satisfies it. A runnable end-to-end stub lives at `examples/fastmcp_demo.py`.
 
-## Deployment — `mcp-server` binary
+## Deployment — `mcp-server` CLI
 
-`pip install mcp-methods` puts the `mcp-server` binary on PATH —
-nothing else needed. The wheel ships the native Rust binary under
-`mcp_methods/_bin/`, and a Python launcher (`mcp_methods._cli:main`)
-execs it.
-
-If you'd rather build from source with a Rust toolchain:
+Get the binary via crates.io:
 
 ```bash
-cargo install --path . --features server
+cargo install mcp-server
 # → ~/.cargo/bin/mcp-server
 ```
 
-The binary is domain-agnostic — source tools + GitHub access + a
-manifest-driven tool surface. Downstream Rust crates (e.g.
-`kglite-mcp-server`) depend on `mcp-methods` and re-use
-`mcp_methods::server::McpServer::new(...)` to layer graph-specific
-tools on top while reusing the boot sequence, `.env` loading, workspace
-mode, watch mode, and embedder lifecycle.
+Generic MCP server, domain-agnostic: source tools + GitHub access + a manifest-driven tool surface. Reads YAML manifests and serves the MCP protocol over stdio.
+
+Downstream Rust crates (e.g. `kglite-mcp-server`) depend on `mcp-methods` directly and re-use `mcp_methods::server::McpServer::new(...)` to layer domain-specific tools on top while reusing the boot sequence, `.env` loading, workspace mode, and watch mode.
 
 ### Cargo features
 
-The framework is gated behind two opt-out features:
-
 | Feature | What it enables | Default |
 |---|---|---|
-| `python` | PyO3 + the `_mcp_methods` cdylib + Python-callable surface (read_file, ripgrep, list_dir, …) + manifest-declared `python:` tools and `embedder:` blocks. | on |
-| `server` | The `mcp-server` framework: rmcp + tokio + clap + manifest + tool routing + the `[[bin]]` target. | on |
-| `python-extension` | Wheel-build path — implies `python`, adds `pyo3/extension-module`. | off (maturin sets it) |
+| `server` | The MCP server framework: rmcp + tokio + clap + manifest + tool routing + the `mcp_methods::server` module tree. | on |
 
-Downstream Rust binaries that want only the pure primitives opt out:
+PyO3 bindings live in a **separate crate** (`mcp-methods-py`) and are only built by maturin for the Python wheel — they don't live in `mcp-methods`'s source or dep tree. `cargo add mcp-methods` is zero-Python:
 
 ```toml
-mcp-methods = { git = "...", default-features = false }
+# Pure-Rust framework (default):
+mcp-methods = "0.3"
+
+# Just the primitives — no rmcp / tokio:
+mcp-methods = { version = "0.3", default-features = false }
 ```
-
-Adds back what you need:
-
-```toml
-# Just the framework (no Python interop, no libpython link):
-mcp-methods = { git = "...", default-features = false, features = ["server"] }
-
-# Just the Python wheel surface (no rmcp / tokio):
-mcp-methods = { git = "...", default-features = false, features = ["python"] }
-```
-
-A `--no-default-features` build (or `--features server` alone) produces a
-binary with **no libpython link** — useful for distributing a static
-binary that doesn't have to match the operator's Python version.
 
 ### Operating modes (set via CLI flag or the YAML manifest)
 

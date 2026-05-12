@@ -1,0 +1,62 @@
+[package]
+name = "mcp-methods"
+version = "0.3.26"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Reusable utility methods for MCP servers — pure-Rust library"
+
+[lib]
+name = "mcp_methods"
+crate-type = ["rlib"]
+
+# Feature surface: `server` is the only non-default opt-in. The
+# pure-Rust subset (cache, compact, github, git_refs, html, files,
+# grep, json_grep, list_dir) is always available. The `server` feature
+# adds the rmcp framework + tokio runtime — the same code that the
+# `mcp-server` binary depends on. No `python` feature here; PyO3
+# bindings live in the sibling `mcp-methods-py` crate.
+[features]
+default = ["server"]
+server = [
+    "dep:rmcp",
+    "dep:tokio",
+    "dep:serde_yaml",
+    "dep:schemars",
+    "dep:anyhow",
+    "dep:thiserror",
+    "dep:clap",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:notify",
+    "dep:notify-debouncer-mini",
+]
+
+[dependencies]
+# --- always-on (primitives) ---
+regex = "1"
+fancy-regex = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+# ripgrep crates
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+
+# --- server feature ---
+rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "schemars"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
+schemars = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+notify = { version = "8", optional = true }
+notify-debouncer-mini = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

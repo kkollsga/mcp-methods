@@ -1,5 +1,3 @@
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 use regex::Regex;
 
 /// Convert HTML to clean, readable text optimized for LLM consumption.
@@ -7,7 +5,6 @@ use regex::Regex;
 /// Strips tags, converts headings to markdown `#` prefixes, list items to
 /// `- ` bullets, bold to `**text**`, images to `[image: alt]`, tables to
 /// tab-separated text, and decodes HTML entities.
-#[cfg_attr(feature = "python", pyfunction)]
 pub fn html_to_text(html: &str) -> String {
     html_to_text_impl(html)
 }

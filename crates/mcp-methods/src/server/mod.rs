@@ -1,13 +1,12 @@
 //! Reusable building blocks for Rust-native MCP servers.
 //!
-//! The `mcp-server` binary in this crate is a complete generic MCP
-//! server: source navigation, GitHub access (issues + REST API with
-//! drill-down), workspace mode (github clone-and-track or local
-//! directory bind), watch mode, manifest-driven `python:` tools, and
-//! a lifecycle-aware embedder loader. Downstream crates that want the
-//! same framework with extra domain-specific tools layered on top
-//! depend on this crate as a library and call into the public modules
-//! below.
+//! The `mcp-server` binary (in the sibling `crates/mcp-server` crate)
+//! is a complete generic MCP server: source navigation, GitHub access
+//! (issues + REST API with drill-down), workspace mode (github
+//! clone-and-track or local directory bind), watch mode, and
+//! manifest-driven Cypher / tool registration. Downstream crates that
+//! want the same framework with domain-specific tools layered on top
+//! depend on `mcp-methods` and call into the public modules below.
 //!
 //! Typical layering pattern:
 //! 1. Construct [`server::ServerOptions`] from a manifest, optionally
@@ -22,17 +21,17 @@
 //!
 //! See `kglite-mcp-server` for a real example: it adds `cypher_query`,
 //! `graph_overview`, and `save_graph` tools that close over an active
-//! `KnowledgeGraph` PyObject and fire after the framework's
-//! workspace/watch hooks rebuild the graph. Python authors running a
-//! FastMCP server instead of this binary can compose the same tools
-//! via the `mcp_methods.fastmcp` helper submodule on the Python side.
+//! graph handle. Python authors running a FastMCP server can compose
+//! tools via the `mcp_methods.fastmcp` helper submodule (Python-side).
+//!
+//! **Note:** the legacy `embedder:` / `tools[].python:` extension hooks
+//! that lived here in 0.3.25 have been removed. They required PyO3 in
+//! the framework's source, which violated the pure-Rust constraint of
+//! this crate. Downstream Python-aware servers (kglite, etc.) implement
+//! their equivalent via a thin pyo3 wrapper in their own cdylib.
 
-#[cfg(feature = "python")]
-pub mod embedder;
 pub mod env;
 pub mod manifest;
-#[cfg(feature = "python")]
-pub mod python;
 pub mod runtime;
 // `server` inside the `server` feature module — the inner module is
 // the rmcp `ServerHandler` impl. Rename would churn every downstream
@@ -44,19 +43,13 @@ pub mod watch;
 pub mod workspace;
 
 // Re-export the most commonly used types so downstream crates can
-// `use mcp_server::{Manifest, ServerOptions, McpServer};` without
-// chasing the module hierarchy.
-#[cfg(feature = "python")]
-pub use embedder::{spawn_idle_watch as spawn_embedder_watch, EmbedderHandle};
+// `use mcp_methods::server::{Manifest, ServerOptions, McpServer};`
+// without chasing the module hierarchy.
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
     EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
     WorkspaceConfig, WorkspaceKind,
 };
-#[cfg(feature = "python")]
-pub use python::build_tool_attr;
-#[cfg(feature = "python")]
-pub use runtime::{apply_python_extensions, PythonExtensions};
 pub use runtime::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots};
 pub use server::{McpServer, RepoProvider, ServerOptions};
 pub use source::SourceRootsProvider;

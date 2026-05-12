@@ -1,103 +1,12 @@
 [workspace]
-members = ["."]
+members = [
+    "crates/mcp-methods",
+    "crates/mcp-methods-py",
+    "crates/mcp-server",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 authors = ["Kristian Kollsgard"]
 license = "MIT"
-
-[package]
-name = "mcp-methods"
-version = "0.3.25"
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-description = "Reusable utility methods for MCP servers — Rust core"
-
-[lib]
-name = "mcp_methods"
-crate-type = ["cdylib", "rlib"]
-
-# Feature surface:
-# - `python`: enables the PyO3 dep + every Python-callable surface
-#   (#[pyfunction], #[pyclass], the `_mcp_methods` PyModule, callback-
-#   based helpers like read_file/grep/list_dir/json_grep). On by default
-#   so `cargo install` of downstream binaries and the wheel build path
-#   both keep PyO3 enabled.
-# - `python-extension`: layers `pyo3/extension-module` on top of
-#   `python`. Set by maturin via pyproject.toml when building the wheel.
-#
-# Downstream Rust consumers that don't need Python interop (e.g.
-# kglite-mcp-server in its pure-Rust distribution) opt out via
-# `default-features = false`. With `python` off, the GIL-bound modules
-# (files, grep, json_grep, list_dir) and the `_mcp_methods` PyModule
-# disappear; the rest of the crate stays available as pure Rust.
-[features]
-default = ["python", "server"]
-# Python interop — see lib.rs header for the surface this gates.
-python = ["dep:pyo3"]
-# Wheel-build path: cdylib that imports as `mcp_methods._mcp_methods`
-# from Python. Implies `python`.
-python-extension = ["python", "pyo3/extension-module"]
-# MCP server framework + binary (formerly in `crates/mcp-server`).
-# Disabling drops the rmcp + tokio + clap dep chain. Bundled binary
-# is built only when this feature is on (gated via required-features).
-server = [
-    "dep:rmcp",
-    "dep:tokio",
-    "dep:serde_yaml",
-    "dep:schemars",
-    "dep:anyhow",
-    "dep:thiserror",
-    "dep:clap",
-    "dep:tracing",
-    "dep:tracing-subscriber",
-    "dep:notify",
-    "dep:notify-debouncer-mini",
-]
-
-# Bundle the `mcp-server` framework binary into the wheel via maturin
-# so `pip install mcp-methods` puts it on PATH. Gated via
-# `required-features = ["server"]` so pure-primitives builds
-# (`--no-default-features`) don't try to compile it.
-[[bin]]
-name = "mcp-server"
-path = "src/bin/mcp-server.rs"
-required-features = ["server"]
-
-[dependencies]
-# --- always-on (primitives) ---
-regex = "1"
-fancy-regex = "0.17"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ureq = { version = "2", features = ["json"] }
-# ripgrep crates
-grep-matcher = "0.1"
-grep-regex = "0.1"
-grep-searcher = "0.1"
-ignore = "0.4"
-
-# --- python feature ---
-# `auto-initialize` lets the standalone `mcp-server` binary embed
-# CPython on first GIL acquisition. In wheel-build mode
-# (`extension-module` via `python-extension`), Python is the parent
-# and `auto-initialize` is harmless / unused.
-pyo3 = { version = "0.28.2", features = ["auto-initialize"], optional = true }
-
-# --- server feature: rmcp framework + binary ---
-rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "schemars"], optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time"], optional = true }
-serde_yaml = { version = "0.9", optional = true }
-schemars = { version = "1", optional = true }
-anyhow = { version = "1", optional = true }
-thiserror = { version = "2", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-notify = { version = "8", optional = true }
-notify-debouncer-mini = { version = "0.6", optional = true }
-
-[dev-dependencies]
-tempfile = "3"

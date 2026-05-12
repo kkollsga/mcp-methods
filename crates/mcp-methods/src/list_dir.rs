@@ -1,6 +1,10 @@
+//! Tree-formatted directory listing with optional per-entry annotation.
+//!
+//! Pure Rust. The Python wrapper in `mcp-methods-py` bridges a Python
+//! callable into the [`ListDirOpts::annotate`] slot.
+
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
-use pyo3::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -56,47 +60,52 @@ impl Entry {
     }
 }
 
+/// Optional knobs for [`list_dir`].
+#[derive(Default)]
+pub struct ListDirOpts<'a> {
+    /// Recursion depth (default 1 = flat ls; 2+ = nested tree).
+    pub depth: Option<usize>,
+    pub glob: Option<&'a str>,
+    pub dirs_only: bool,
+    pub relative_to: Option<&'a str>,
+    /// Respect `.gitignore` / `.git/info/exclude` rules (default `true`).
+    pub respect_gitignore: bool,
+    /// Custom directory names to skip. When `None`, a built-in list
+    /// (`.git`, `node_modules`, `target`, …) is used.
+    pub skip_dirs: Option<&'a [String]>,
+    pub include_size: bool,
+    /// Per-entry annotation callback. Receives the entry's path
+    /// relative to `relative_to` (or the root if unset) and returns
+    /// `Some(annotation)` to append after the entry, or `None` to skip.
+    /// Used by the Python wrapper to bridge a Python callable.
+    pub annotate: Option<&'a AnnotateFn>,
+}
+
+/// Closure signature for [`ListDirOpts::annotate`].
+pub type AnnotateFn = dyn Fn(&str) -> Option<String>;
+
 /// List directory contents with tree-formatted output.
-#[pyfunction]
-#[pyo3(signature = (
-    path,
-    *,
-    depth = 1,
-    glob = None,
-    dirs_only = false,
-    relative_to = None,
-    respect_gitignore = true,
-    skip_dirs = None,
-    include_size = false,
-    annotate = None,
-))]
-#[allow(clippy::too_many_arguments)]
-pub fn list_dir(
-    py: Python<'_>,
-    path: &str,
-    depth: usize,
-    glob: Option<&str>,
-    dirs_only: bool,
-    relative_to: Option<&str>,
-    respect_gitignore: bool,
-    skip_dirs: Option<Vec<String>>,
-    include_size: bool,
-    annotate: Option<Py<PyAny>>,
-) -> PyResult<String> {
-    let root = PathBuf::from(path).canonicalize().map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Cannot resolve '{}': {}", path, e))
-    })?;
+pub fn list_dir(path: &str, opts: &ListDirOpts) -> Result<String, String> {
+    let root = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve '{}': {}", path, e))?;
     if !root.is_dir() {
         return Ok(format!("Error: '{}' is not a directory.", path));
     }
 
-    let custom_skip: Option<HashSet<String>> = skip_dirs.map(|dirs| dirs.iter().cloned().collect());
+    let depth = opts.depth.unwrap_or(1);
+    let respect_gitignore = opts.respect_gitignore;
+    let glob = opts.glob;
+    let relative_to = opts.relative_to;
+    let dirs_only = opts.dirs_only;
+    let include_size = opts.include_size;
+
+    let custom_skip: Option<HashSet<String>> =
+        opts.skip_dirs.map(|dirs| dirs.iter().cloned().collect());
 
     let mut tree = Entry::new_dir(dir_display_name(&root, relative_to), root.clone());
     let mut leaf_counts: BTreeMap<PathBuf, (usize, usize)> = BTreeMap::new();
 
-    // Single walk at depth+1: build tree for entries <= depth,
-    // count children for entries at exactly depth+1.
     {
         let mut builder = WalkBuilder::new(&root);
         builder.max_depth(Some(depth + 1));
@@ -107,15 +116,9 @@ pub fn list_dir(
 
         if let Some(glob_pat) = glob {
             let mut overrides = OverrideBuilder::new(&root);
-            overrides
-                .add("*/")
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
-            overrides
-                .add(glob_pat)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
-            let built = overrides
-                .build()
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+            overrides.add("*/").map_err(|e| format!("{}", e))?;
+            overrides.add(glob_pat).map_err(|e| format!("{}", e))?;
+            let built = overrides.build().map_err(|e| format!("{}", e))?;
             builder.overrides(built);
         }
 
@@ -182,7 +185,7 @@ pub fn list_dir(
     }
 
     // Collect annotations if callback provided
-    let annotations = if let Some(ref annotate_fn) = annotate {
+    let annotations = if let Some(annotate_fn) = opts.annotate {
         let mut map = HashMap::new();
         // Use relative_to base (canonicalized) so callback receives paths like
         // "networkx/algorithms/bridges.py" instead of just "bridges.py".
@@ -190,7 +193,7 @@ pub fn list_dir(
         let base = relative_to
             .and_then(|r| PathBuf::from(r).canonicalize().ok())
             .unwrap_or_else(|| root.clone());
-        collect_annotations(py, &tree, &base, annotate_fn, &mut map)?;
+        collect_annotations(&tree, &base, annotate_fn, &mut map);
         map
     } else {
         HashMap::new()
@@ -211,12 +214,11 @@ pub fn list_dir(
 
 /// Recursively collect annotations for all entries in the tree.
 fn collect_annotations(
-    py: Python<'_>,
     entry: &Entry,
     base: &Path,
-    annotate_fn: &Py<PyAny>,
+    annotate_fn: &AnnotateFn,
     map: &mut HashMap<PathBuf, String>,
-) -> PyResult<()> {
+) {
     for child in entry.children.values() {
         let rel_path = child
             .full_path
@@ -224,16 +226,13 @@ fn collect_annotations(
             .unwrap_or(&child.full_path)
             .to_string_lossy()
             .to_string();
-        let result = annotate_fn.call1(py, (rel_path,))?;
-        if !result.is_none(py) {
-            let annotation: String = result.extract(py)?;
+        if let Some(annotation) = annotate_fn(&rel_path) {
             map.insert(child.full_path.clone(), annotation);
         }
         if child.is_dir && !child.children.is_empty() {
-            collect_annotations(py, child, base, annotate_fn, map)?;
+            collect_annotations(child, base, annotate_fn, map);
         }
     }
-    Ok(())
 }
 
 fn insert_entry(

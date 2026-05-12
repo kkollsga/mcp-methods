@@ -57,9 +57,6 @@ use mcp_methods::server::{
     ServerOptions,
 };
 
-#[cfg(feature = "python")]
-use mcp_methods::server::{apply_python_extensions, PythonExtensions};
-
 /// Operating mode picked from the CLI flags and the manifest's
 /// optional `workspace:` block. Manifest declarations win over CLI
 /// flags (same precedence rule as `source_root:`).
@@ -324,32 +321,16 @@ async fn main() -> Result<()> {
     if !source_roots.is_empty() {
         options = options.with_static_source_roots(source_roots.clone());
     }
-    let mut server = McpServer::new(options);
-
-    #[cfg(feature = "python")]
-    let python_tool_count = {
-        let py_ext = match manifest.as_ref() {
-            Some(m) => apply_python_extensions(&mut server, m, cli.trust_tools)?,
-            None => PythonExtensions::default(),
-        };
-        if py_ext.embedder.is_some() {
-            let cooldown = py_ext
-                .embedder_cooldown
-                .map(|d| format!("{}s", d.as_secs()))
-                .unwrap_or_else(|| "never".to_string());
-            tracing::info!(
-                embedder_cooldown = %cooldown,
-                "embedder factory loaded (no consumer in framework binary)"
-            );
-        }
-        py_ext.python_tool_count
-    };
-    #[cfg(not(feature = "python"))]
+    let server = McpServer::new(options);
+    // Python tool / embedder extension hooks were removed in 0.3.26 — they
+    // required PyO3 in the framework's source and violated the pure-Rust
+    // contract of `mcp-methods`. Manifest entries declaring `python:`
+    // tools or `embedder:` still parse, but the framework binary no
+    // longer instantiates them. Downstream binaries (kglite, etc.) that
+    // need a Python extension layer add a pyo3 wrapper in their own
+    // cdylib + binary. Warn if the manifest uses either so operators
+    // aren't silently ignored.
     let python_tool_count: usize = {
-        // Without the `python` feature, manifest-declared `python:` tools
-        // and `embedder:` blocks are silently no-ops. Warn if either was
-        // present so operators know why their YAML didn't take effect.
-        let _ = &mut server;
         if let Some(m) = manifest.as_ref() {
             let py_count = m
                 .tools
@@ -359,8 +340,9 @@ async fn main() -> Result<()> {
             if py_count > 0 || m.embedder.is_some() {
                 tracing::warn!(
                     "manifest declares Python extensions ({py_count} python tool(s), \
-                     embedder={}); binary was built with --no-default-features, so those \
-                     declarations are ignored",
+                     embedder={}); the mcp-server binary in 0.3.26+ no longer \
+                     instantiates them. Use a downstream binary with its own pyo3 \
+                     wrapper layer if you need this surface.",
                     m.embedder.is_some()
                 );
             }

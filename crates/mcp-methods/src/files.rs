@@ -1,6 +1,44 @@
-use pyo3::prelude::*;
+//! Safe file reading with allowed-dir sandbox + optional grep / section /
+//! row / line-range slicing.
+//!
+//! Pure Rust — Python bindings are in the sibling `mcp-methods-py`
+//! crate and wrap [`read_file`] with the legacy `transform=…` /
+//! `section=…` keyword arguments. The wrapper translates a Python
+//! callable into the `&dyn Fn(&str) -> String` slot on
+//! [`ReadFileOpts::transform`].
+
 use regex::Regex;
 use std::path::PathBuf;
+
+/// Optional knobs for [`read_file`]. Default-constructible.
+#[derive(Default)]
+pub struct ReadFileOpts<'a> {
+    /// Extract an HTML element by `id` attribute (returns the balanced
+    /// open/close fragment).
+    pub section: Option<&'a str>,
+    /// Slice the file to lines `start_line..=end_line` (1-indexed).
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    /// CSV-style row slicing: `(start, end)` zero-indexed against the
+    /// data rows (after the header).
+    pub rows: Option<(usize, usize)>,
+    /// Cap the output at this many characters.
+    pub max_chars: Option<usize>,
+    /// Apply the built-in HTML → markdown transform via
+    /// [`crate::html::html_to_text_impl`].
+    pub html_transform: bool,
+    /// Apply a caller-supplied transform to the raw file content (run
+    /// before section/grep). Used by the Python wrapper to bridge
+    /// `transform=callable` to a Rust closure that re-enters Python.
+    pub transform: Option<&'a dyn Fn(&str) -> String>,
+    /// Filter selected lines to those matching the regex (within the
+    /// selected line range / section).
+    pub grep: Option<&'a str>,
+    /// Lines of context around each grep match (default 2).
+    pub grep_context: Option<usize>,
+    /// Cap the number of matches returned.
+    pub max_matches: Option<usize>,
+}
 
 /// Return type for grep_lines: total matches found, matches shown, formatted lines.
 struct GrepResult {
@@ -15,7 +53,6 @@ fn grep_lines(
     context: usize,
     max_matches: Option<usize>,
 ) -> GrepResult {
-    // Find matching indices within the slice
     let match_indices: Vec<usize> = lines
         .iter()
         .enumerate()
@@ -33,14 +70,12 @@ fn grep_lines(
         };
     }
 
-    // Apply max_matches limit
     let used = match max_matches {
         Some(limit) => &match_indices[..limit.min(total)],
         None => &match_indices[..],
     };
     let shown = used.len();
 
-    // Expand each match ±context, merge overlapping windows
     let mut windows: Vec<(usize, usize)> = Vec::new();
     for &mi in used {
         let start = mi.saturating_sub(context);
@@ -54,7 +89,6 @@ fn grep_lines(
         windows.push((start, end));
     }
 
-    // Format: line numbers + content, with `--` separator between windows
     let mut output: Vec<String> = Vec::new();
     for (wi, (start, end)) in windows.iter().enumerate() {
         if wi > 0 {
@@ -77,15 +111,9 @@ fn grep_lines(
 ///
 /// Returns `None` if no element with the given id is found.
 fn extract_section(html: &str, section_id: &str) -> Option<String> {
-    // Build pattern: <tagname ... id="section_id" ...>
-    // We need to find an opening tag containing id="section_id"
     let id_attr = format!("id=\"{}\"", section_id);
     let pos = html.find(&id_attr)?;
-
-    // Walk backwards to find the '<' that opens this tag
     let tag_start = html[..pos].rfind('<')?;
-
-    // Extract the tag name (first word after '<')
     let after_lt = &html[tag_start + 1..];
     let tag_name: String = after_lt
         .chars()
@@ -98,7 +126,6 @@ fn extract_section(html: &str, section_id: &str) -> Option<String> {
     let open_tag = format!("<{}", tag_name);
     let close_tag = format!("</{}>", tag_name);
 
-    // Track depth from tag_start to find the balanced closing tag
     let mut depth: usize = 0;
     let mut i = tag_start;
     let bytes = html.as_bytes();
@@ -125,50 +152,21 @@ fn extract_section(html: &str, section_id: &str) -> Option<String> {
         }
     }
 
-    // Unclosed tag — return from opening tag to end
     Some(html[tag_start..].to_string())
 }
 
 /// Read a file with path-traversal protection.
 ///
 /// Returns the file content as a formatted string with line numbers.
-#[pyfunction]
-#[pyo3(signature = (
-    file_path,
-    allowed_dirs,
-    *,
-    section = None,
-    start_line = None,
-    end_line = None,
-    rows = None,
-    max_chars = None,
-    transform = None,
-    grep = None,
-    grep_context = None,
-    max_matches = None,
-))]
-#[allow(clippy::too_many_arguments)]
-pub fn read_file(
-    py: Python<'_>,
-    file_path: &str,
-    allowed_dirs: Vec<String>,
-    section: Option<String>,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    rows: Option<Vec<usize>>,
-    max_chars: Option<usize>,
-    transform: Option<Py<PyAny>>,
-    grep: Option<String>,
-    grep_context: Option<usize>,
-    max_matches: Option<usize>,
-) -> PyResult<String> {
-    // Pre-canonicalize allowed directories once, reuse across both loops.
+/// Every code path returns a status string — invalid path, read failure,
+/// successful content — all surface as `String`; pyo3 wrappers convert
+/// to `Py<str>` automatically.
+pub fn read_file(file_path: &str, allowed_dirs: &[String], opts: &ReadFileOpts) -> String {
     let canon_dirs: Vec<PathBuf> = allowed_dirs
         .iter()
         .filter_map(|d| PathBuf::from(d).canonicalize().ok())
         .collect();
 
-    // Resolve file against allowed directories
     let mut resolved: Option<PathBuf> = None;
 
     for (i, d) in allowed_dirs.iter().enumerate() {
@@ -183,7 +181,6 @@ pub fn read_file(
         }
     }
 
-    // Try as absolute path
     if resolved.is_none() {
         let abs_path = PathBuf::from(file_path);
         if let Ok(canon) = abs_path.canonicalize() {
@@ -199,67 +196,39 @@ pub fn read_file(
     let resolved = match resolved {
         Some(p) => p,
         None => {
-            return Ok(format!(
-                "Error: file not found or access denied: {}",
-                file_path
-            ));
+            return format!("Error: file not found or access denied: {}", file_path);
         }
     };
 
-    // Read file
     let raw = match std::fs::read_to_string(&resolved) {
         Ok(s) => s,
-        Err(e) => return Ok(format!("Error reading file: {}", e)),
+        Err(e) => return format!("Error reading file: {}", e),
     };
 
-    // Determine transform type: string name → built-in, callable → user function
-    let html_transform = if let Some(ref tf) = transform {
-        match tf.extract::<String>(py) {
-            Ok(name) => match name.as_str() {
-                "html" => true,
-                other => {
-                    return Ok(format!(
-                        "Error: unknown transform '{}'. Available: html",
-                        other
-                    ))
-                }
-            },
-            Err(_) => false, // not a string → treat as callable below
-        }
-    } else {
-        false
-    };
-
-    // Apply callable transform (before section extraction, preserving existing behaviour)
-    let raw = if !html_transform {
-        if let Some(ref tf) = transform {
-            let result: String = tf.call1(py, (raw,))?.extract(py)?;
-            result
-        } else {
-            raw
-        }
+    // Apply caller-supplied transform first (e.g. Python callable via the
+    // wrapper crate). HTML transform is a flag, applied below.
+    let raw = if let Some(tf) = opts.transform {
+        tf(&raw)
     } else {
         raw
     };
 
     // HTML section extraction by id
-    if let Some(ref sid) = section {
+    if let Some(sid) = opts.section {
         return match extract_section(&raw, sid) {
             Some(fragment) => {
-                // Apply html transform after section extraction (ids still present in raw HTML)
-                let fragment = if html_transform {
+                let fragment = if opts.html_transform {
                     crate::html::html_to_text_impl(&fragment)
                 } else {
                     fragment
                 };
 
-                // If grep is active, search within the section content
-                if let Some(ref pattern) = grep {
+                if let Some(pattern) = opts.grep {
                     let re = match Regex::new(pattern) {
                         Ok(r) => r,
-                        Err(e) => return Ok(format!("Error: invalid grep pattern: {}", e)),
+                        Err(e) => return format!("Error: invalid grep pattern: {}", e),
                     };
-                    let ctx = grep_context.unwrap_or(2);
+                    let ctx = opts.grep_context.unwrap_or(2);
                     let section_lines: Vec<&str> = fragment.lines().collect();
                     let section_total = section_lines.len();
                     let numbered: Vec<(usize, &str)> = section_lines
@@ -268,7 +237,7 @@ pub fn read_file(
                         .map(|(i, line)| (i + 1, *line))
                         .collect();
 
-                    let gr = grep_lines(&numbered, &re, ctx, max_matches);
+                    let gr = grep_lines(&numbered, &re, ctx, opts.max_matches);
 
                     let match_label = if gr.shown < gr.total {
                         format!("showing {} of {} matches", gr.shown, gr.total)
@@ -281,12 +250,12 @@ pub fn read_file(
                     );
 
                     if gr.lines.is_empty() {
-                        return Ok(header);
+                        return header;
                     }
 
                     let mut text = format!("{}\n{}", header, gr.lines.join("\n"));
 
-                    if let Some(mc) = max_chars {
+                    if let Some(mc) = opts.max_chars {
                         if text.len() > mc {
                             let mut end = mc;
                             while end > 0 && !text.is_char_boundary(end) {
@@ -300,12 +269,11 @@ pub fn read_file(
                         }
                     }
 
-                    return Ok(text);
+                    return text;
                 }
 
-                // Non-grep section path
                 let mut fragment = fragment;
-                if let Some(mc) = max_chars {
+                if let Some(mc) = opts.max_chars {
                     if fragment.len() > mc {
                         let mut end = mc;
                         while end > 0 && !fragment.is_char_boundary(end) {
@@ -315,52 +283,45 @@ pub fn read_file(
                         fragment.push_str(&format!("\n\n[... truncated at {} chars]", mc));
                     }
                 }
-                Ok(fragment)
+                fragment
             }
-            None => Ok(format!(
-                "Error: section '{}' not found in {}",
-                sid, file_path
-            )),
+            None => format!("Error: section '{}' not found in {}", sid, file_path),
         };
     }
 
-    // CSV row slicing
-    if let Some(ref row_range) = rows {
-        if row_range.len() == 2 {
-            let all_lines: Vec<&str> = raw.lines().collect();
-            let header = all_lines.first().copied().unwrap_or("");
-            let start = row_range[0] + 1; // shift for header row
-            let end = row_range[1] + 2;
-            let selected: Vec<&str> = all_lines
-                .get(start..end.min(all_lines.len()))
-                .unwrap_or(&[])
-                .to_vec();
-            let mut text = format!("{}\n{}", header, selected.join("\n"));
-            let total_data_rows = if all_lines.is_empty() {
-                0
-            } else {
-                all_lines.len() - 1
-            };
-            text.push_str(&format!(
-                "\n\n[rows {}-{} of {} total]",
-                row_range[0], row_range[1], total_data_rows
-            ));
-            if let Some(mc) = max_chars {
-                if text.len() > mc {
-                    let mut end = mc;
-                    while end > 0 && !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                    text.push_str(&format!("\n\n[... truncated at {} chars]", mc));
+    if let Some((row_start, row_end)) = opts.rows {
+        let all_lines: Vec<&str> = raw.lines().collect();
+        let header = all_lines.first().copied().unwrap_or("");
+        let start = row_start + 1;
+        let end = row_end + 2;
+        let selected: Vec<&str> = all_lines
+            .get(start..end.min(all_lines.len()))
+            .unwrap_or(&[])
+            .to_vec();
+        let mut text = format!("{}\n{}", header, selected.join("\n"));
+        let total_data_rows = if all_lines.is_empty() {
+            0
+        } else {
+            all_lines.len() - 1
+        };
+        text.push_str(&format!(
+            "\n\n[rows {}-{} of {} total]",
+            row_start, row_end, total_data_rows
+        ));
+        if let Some(mc) = opts.max_chars {
+            if text.len() > mc {
+                let mut end = mc;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
                 }
+                text.truncate(end);
+                text.push_str(&format!("\n\n[... truncated at {} chars]", mc));
             }
-            return Ok(text);
         }
+        return text;
     }
 
-    // Apply html transform for non-section, non-CSV path
-    let raw = if html_transform {
+    let raw = if opts.html_transform {
         crate::html::html_to_text_impl(&raw)
     } else {
         raw
@@ -369,9 +330,9 @@ pub fn read_file(
     let all_lines: Vec<&str> = raw.lines().collect();
     let total = all_lines.len();
 
-    let (selected, s, e) = if start_line.is_some() || end_line.is_some() {
-        let s = start_line.unwrap_or(1).max(1);
-        let e = end_line.unwrap_or(total).min(total);
+    let (selected, s, e) = if opts.start_line.is_some() || opts.end_line.is_some() {
+        let s = opts.start_line.unwrap_or(1).max(1);
+        let e = opts.end_line.unwrap_or(total).min(total);
         let sel: Vec<&str> = all_lines
             .get(s.saturating_sub(1)..e.min(all_lines.len()))
             .unwrap_or(&[])
@@ -381,22 +342,20 @@ pub fn read_file(
         (all_lines.clone(), 1, total)
     };
 
-    // Grep filtering (operates on the selected line range)
-    if let Some(ref pattern) = grep {
+    if let Some(pattern) = opts.grep {
         let re = match Regex::new(pattern) {
             Ok(r) => r,
-            Err(e) => return Ok(format!("Error: invalid grep pattern: {}", e)),
+            Err(e) => return format!("Error: invalid grep pattern: {}", e),
         };
-        let ctx = grep_context.unwrap_or(2);
+        let ctx = opts.grep_context.unwrap_or(2);
 
-        // Build (absolute_line_number, content) pairs
         let numbered_lines: Vec<(usize, &str)> = selected
             .iter()
             .enumerate()
             .map(|(i, line)| (s + i, *line))
             .collect();
 
-        let gr = grep_lines(&numbered_lines, &re, ctx, max_matches);
+        let gr = grep_lines(&numbered_lines, &re, ctx, opts.max_matches);
 
         let match_label = if gr.shown < gr.total {
             format!("showing {} of {} matches", gr.shown, gr.total)
@@ -406,12 +365,12 @@ pub fn read_file(
         let header = format!("{}  ({} in {} lines)", file_path, match_label, total);
 
         if gr.lines.is_empty() {
-            return Ok(header);
+            return header;
         }
 
         let mut text = format!("{}\n{}", header, gr.lines.join("\n"));
 
-        if let Some(mc) = max_chars {
+        if let Some(mc) = opts.max_chars {
             if text.len() > mc {
                 let mut end = mc;
                 while end > 0 && !text.is_char_boundary(end) {
@@ -427,7 +386,7 @@ pub fn read_file(
             }
         }
 
-        return Ok(text);
+        return text;
     }
 
     let numbered: Vec<String> = selected
@@ -436,7 +395,7 @@ pub fn read_file(
         .map(|(i, line)| format!("{:>5}  {}", s + i, line))
         .collect();
 
-    let header = if start_line.is_some() || end_line.is_some() {
+    let header = if opts.start_line.is_some() || opts.end_line.is_some() {
         format!(
             "{}:{}-{}  ({} of {} lines)",
             file_path,
@@ -451,7 +410,7 @@ pub fn read_file(
 
     let mut text = format!("{}\n{}", header, numbered.join("\n"));
 
-    if let Some(mc) = max_chars {
+    if let Some(mc) = opts.max_chars {
         if text.len() > mc {
             let mut end = mc;
             while end > 0 && !text.is_char_boundary(end) {
@@ -466,5 +425,5 @@ pub fn read_file(
         }
     }
 
-    Ok(text)
+    text
 }

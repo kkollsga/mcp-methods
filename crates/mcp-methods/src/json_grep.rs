@@ -1,5 +1,8 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+//! Walk a parsed JSON structure, grep within string values.
+//!
+//! Pure Rust. The Python wrapper in `mcp-methods-py` converts the
+//! returned `Vec<JsonGrepMatch>` into a Python list of dicts.
+
 use regex::Regex;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -22,55 +25,31 @@ fn get_or_compile_regex(pattern: &str) -> Result<Regex, regex::Error> {
     })
 }
 
-/// Walk a parsed JSON structure, grep within string values.
-/// Returns a list of match dicts with field, lines, context_start, context_end, content.
-#[pyfunction]
-#[pyo3(signature = (json_str, pattern, context))]
+/// One grep match within a JSON structure.
+#[derive(Debug, Clone)]
+pub struct JsonGrepMatch {
+    /// Dotted JSON path to the field where the match occurred.
+    pub field: String,
+    /// 1-indexed line numbers of matching lines within the field's value.
+    pub lines: Vec<usize>,
+    pub context_start: usize,
+    pub context_end: usize,
+    pub content: String,
+}
+
+/// Grep within string values of a parsed JSON structure. Returns one
+/// match per merged context window per field.
 pub fn ripgrep_json_fields(
-    py: Python<'_>,
     json_str: &str,
     pattern: &str,
     context: usize,
-) -> PyResult<Py<PyAny>> {
-    let regex = match get_or_compile_regex(pattern) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid regex: {}",
-                e
-            )));
-        }
-    };
-
-    let data: Value = serde_json::from_str(json_str)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
-
-    let matches = grep_value(&data, &regex, context, "");
-    let result = PyList::empty(py);
-
-    for m in matches {
-        let dict = PyDict::new(py);
-        dict.set_item("field", m.field)?;
-        let lines_list = PyList::new(py, &m.lines)?;
-        dict.set_item("lines", lines_list)?;
-        dict.set_item("context_start", m.context_start)?;
-        dict.set_item("context_end", m.context_end)?;
-        dict.set_item("content", m.content)?;
-        result.append(dict)?;
-    }
-
-    Ok(result.into_any().unbind())
+) -> Result<Vec<JsonGrepMatch>, String> {
+    let regex = get_or_compile_regex(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+    let data: Value = serde_json::from_str(json_str).map_err(|e| format!("Invalid JSON: {}", e))?;
+    Ok(grep_value(&data, &regex, context, ""))
 }
 
-struct GrepMatch {
-    field: String,
-    lines: Vec<usize>,
-    context_start: usize,
-    context_end: usize,
-    content: String,
-}
-
-fn grep_value(data: &Value, regex: &Regex, context: usize, path: &str) -> Vec<GrepMatch> {
+fn grep_value(data: &Value, regex: &Regex, context: usize, path: &str) -> Vec<JsonGrepMatch> {
     match data {
         Value::String(s) => {
             let text = s.replace("\r\n", "\n");
@@ -106,7 +85,7 @@ fn grep_lines_internal(
     regex: &Regex,
     context: usize,
     field: &str,
-) -> Vec<GrepMatch> {
+) -> Vec<JsonGrepMatch> {
     let mut raw: Vec<(usize, usize, usize)> = Vec::new();
     for (idx, line) in text_lines.iter().enumerate() {
         if regex.is_match(line) {
@@ -116,7 +95,6 @@ fn grep_lines_internal(
         }
     }
 
-    // Merge overlapping windows
     struct Group {
         lines: Vec<usize>,
         start: usize,
@@ -142,7 +120,7 @@ fn grep_lines_internal(
         .into_iter()
         .map(|g| {
             let content = text_lines[g.start..g.end].join("\n");
-            GrepMatch {
+            JsonGrepMatch {
                 field: field.to_string(),
                 lines: g.lines,
                 context_start: g.start + 1,

@@ -34,9 +34,3 @@ venv/
 
 # Inbox
 inbox/
-
-# Bundled binary location — populated at wheel-build time by the
-# `bundle-bin` Makefile target / the CI workflow. Not checked in
-# (would pollute git with platform-specific compiled binaries).
-python/mcp_methods/_bin/mcp-server
-python/mcp_methods/_bin/mcp-server.exe

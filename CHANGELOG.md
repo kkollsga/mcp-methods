@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.3.26
+
+The polars / pydantic-core distribution shape. `mcp-methods` is now a
+pure-Rust library with zero PyO3 in source or deps; the Python wheel
+is built from a separate `mcp-methods-py` binding crate. `cargo add
+mcp-methods` from Rust sees no traces of Python anywhere.
+
+### Workspace restructure
+
+Three-crate workspace (one was four-crate-ish in 0.3.25 with bundled-
+binary machinery; that's gone too):
+
+- **`crates/mcp-methods`** — pure-Rust library (rlib only). Contains
+  every primitive (`cache`, `compact`, `files`, `git_refs`, `github`,
+  `grep`, `html`, `json_grep`, `list_dir`) plus the `server`
+  framework module behind the default-on `server` feature. **No
+  `pyo3`, no `#[pyfunction]`, no `Py<…>`, no `PyResult` anywhere in
+  the source.** CI verifies via `cargo tree -p mcp-methods | grep pyo3`
+  as a fail-on-leak gate.
+- **`crates/mcp-methods-py`** — PyO3 bindings crate (cdylib only).
+  Depends on `mcp-methods` and provides `#[pyfunction]` / `#[pyclass]`
+  wrappers around the library functions. `PyElementCache` is a newtype
+  wrapper over `mcp_methods::cache::ElementCache`. The wheel is built
+  from this crate via `pyproject.toml`'s `manifest-path` setting.
+- **`crates/mcp-server`** — standalone CLI binary. Depends on
+  `mcp-methods` with `features = ["server"]`. Published to crates.io
+  alongside the library; install via `cargo install mcp-server`.
+
+### Distribution
+
+| Audience | Command | Result |
+|---|---|---|
+| Rust library users | `cargo add mcp-methods` | Pure-Rust crate. No pyo3 in dep tree. |
+| Python users | `pip install mcp-methods` | **One abi3 wheel per OS** (3 total) — works on Python 3.10 through 3.13 without reinstall. Down from 12 per-Python-version wheels in 0.3.25. |
+| CLI users | `cargo install mcp-server` | Binary on PATH. No libpython link. |
+
+The bundled-binary mechanism from 0.3.25 is gone: no more
+`mcp_methods/_bin/`, no `_cli.py` Python launcher, no
+`[project.scripts]` entry, no maturin `include` for the binary, no
+`make bundle-bin`. `pip install mcp-methods` ships only the cdylib
+and Python wrapper; the binary lives in its own crate.
+
+### Python `embedder:` / `tools[].python:` removed
+
+The legacy framework hooks for loading Python embedder classes and
+Python tool callables were removed. They required PyO3 in the
+framework's source — incompatible with the pure-Rust contract. No
+deployed manifest uses `tools[].python:`, and the lone embedder
+consumer (kglite's sodir / norwegian_law / petrel servers) migrated
+to fastembed-rs in 0.9.18. Downstream binaries that need Python
+extension hooks add a pyo3 wrapper layer in their own cdylib.
+
+### API shape changes
+
+Callback-bound functions kept their Python-side surface (the wheel's
+`read_file(transform=…)`, `list_dir(annotate=…)`, `ripgrep_files(transform=…)`
+still take callables). On the Rust side, the callback is now a
+generic `&dyn Fn(...)` parameter on a `ReadFileOpts` / `ListDirOpts`
+/ `RipgrepFilesOpts` struct. Pure-Rust callers default-construct
+the opts and skip the callback; the binding crate bridges
+`Py<PyAny>` → Rust closure that re-enters Python via `Python::attach`.
+
+`compact_discussion` returns `Result<(String, Option<String>), String>`
+in Rust; the binding crate's wrapper maps to `PyValueError`.
+`ripgrep_lines` and `ripgrep_json_fields` return typed
+`Vec<RipgrepLinesGroup>` / `Vec<JsonGrepMatch>`; the wrapper converts
+to Python lists of dicts.
+
+### Migration
+
+**For Python users:** zero changes. `from mcp_methods import …`
+imports identical. Wheel layout (`mcp_methods/_mcp_methods.so`)
+preserved.
+
+**For Rust library consumers (kglite, etc.):** Cargo.toml stays the
+same — `mcp-methods = { …, features = ["server"] }` still works
+because we kept the `server` feature default-on. Source paths are
+unchanged: `mcp_methods::server::McpServer`, `mcp_methods::cache::ElementCache`,
+`mcp_methods::github::fetch_issue_internal`, etc. — all in the same
+locations. Two things to know about:
+- `mcp_methods::server::embedder` and `mcp_methods::server::python`
+  modules are gone. kglite stopped using them in 0.9.18; if a future
+  consumer needed them, they re-implement in their own pyo3 crate.
+- `mcp_methods::server::apply_python_extensions` and
+  `PythonExtensions` are gone for the same reason.
+
+**For CLI users:** the binary distribution changed. Old: `pip
+install mcp-methods` put it on PATH. New: `cargo install mcp-server`.
+Reflects the binary's actual nature (a Rust CLI tool, not a
+Python package).
+
+### Tests
+
+87 cargo unit tests + 7 mcp-methods integration tests + 7 mcp-server
+binary tests + 176 python tests = 277 total. `cargo tree -p mcp-methods
+| grep pyo3` is a CI gate; if it ever returns non-zero, the build fails.
+
 ## 0.3.25
 
 Structural consolidation + the long-tail of the PyO3 decoupling work.

@@ -15,22 +15,25 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
-      # Default build (python + server features both on) — covers the
-      # standard `cargo install` path and the wheel build path.
-      - run: cargo build
-      - run: cargo test
-      # Pure-Rust primitives — no pyo3, no rmcp, no tokio. Downstream
-      # consumers that want only the cache/github/git_refs/compact/html
-      # subset must continue to build cleanly. This is what guards
-      # kglite's pyo3-free path against future pyo3 leaks.
-      - run: cargo build --no-default-features
-      - run: cargo test --no-default-features
-      # Pure-Rust server (no python, with rmcp framework) — the binary
-      # downstream consumers ship in their own wheel without libpython
-      # linkage. Verifies the cfg gating across both axes.
-      - run: cargo build --no-default-features --features server
-      - run: cargo test --no-default-features --features server
+      - run: cargo clippy --workspace -- -D warnings
+      # Workspace-wide build covers all three crates (mcp-methods,
+      # mcp-methods-py, mcp-server). mcp-methods-py is a cdylib that
+      # only links cleanly inside maturin, so we skip cargo-direct test
+      # for it and let the wheel-build job exercise that path.
+      - run: cargo build -p mcp-methods -p mcp-server
+      - run: cargo test -p mcp-methods
+      - run: cargo test -p mcp-server
+      # Verify the pure-Rust library has zero pyo3 in its dep tree.
+      # If pyo3 ever leaks back in (e.g. via a transitive dep), this
+      # fails fast.
+      - name: Verify no pyo3 in mcp-methods dep tree
+        run: |
+          if cargo tree -p mcp-methods -e all | grep -q pyo3; then
+            echo "FAIL: pyo3 leaked into mcp-methods deps:"
+            cargo tree -p mcp-methods -e all | grep pyo3
+            exit 1
+          fi
+          echo "OK: no pyo3 in mcp-methods deps"
 
   python-checks:
     name: Python checks

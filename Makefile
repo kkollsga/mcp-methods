@@ -1,30 +1,26 @@
-.PHONY: dev dev-with-bin bundle-bin test lint fmt clean
+.PHONY: dev test test-rust test-rust-all lint fmt clean
 
-# Standard dev install — cdylib only, no bundled binary on PATH.
+# Build + install the Python wheel into the active env. The wheel
+# contains the `_mcp_methods` cdylib only; the `mcp-server` CLI is a
+# separate crate — install it via `cargo install --path crates/mcp-server`
+# if you need it on PATH.
 dev:
 	maturin develop --release
-
-# Dev install with the bundled `mcp-server` binary on PATH. Builds the
-# binary via cargo first, copies it into the python package's _bin/
-# directory (where the launcher in _cli.py looks for it), then runs
-# `maturin develop`. The same sequence is what CI runs at wheel-build
-# time. Use this if you want `which mcp-server` to resolve to the
-# wheel-installed binary during local development.
-dev-with-bin: bundle-bin
-	maturin develop --release
-
-# Build the binary and copy it into the python package. Idempotent.
-bundle-bin:
-	cargo build --release --features server --bin mcp-server
-	mkdir -p python/mcp_methods/_bin
-	cp target/release/mcp-server python/mcp_methods/_bin/mcp-server
 
 test:
 	pytest tests/ -v
 
+# Run the Rust library tests (pure Rust, no Python).
+test-rust:
+	cargo test -p mcp-methods
+
+# Run all Rust tests across the workspace.
+test-rust-all:
+	cargo test --workspace
+
 lint:
 	cargo fmt -- --check
-	cargo clippy -- -D warnings
+	cargo clippy --workspace -- -D warnings
 	ruff check .
 
 fmt:
@@ -35,4 +31,3 @@ fmt:
 clean:
 	cargo clean
 	rm -rf wheels/ dist/ *.egg-info build/
-	rm -f python/mcp_methods/_bin/mcp-server python/mcp_methods/_bin/mcp-server.exe

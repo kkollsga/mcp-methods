@@ -1,5 +1,3 @@
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -85,13 +83,11 @@ fn auth_token() -> Option<String> {
 }
 
 /// Check if a GitHub token is available in the environment.
-#[cfg_attr(feature = "python", pyfunction)]
 pub fn has_git_token() -> bool {
     auth_token().is_some()
 }
 
 /// Auto-detect `org/repo` from the git remote in *cwd*.
-#[cfg_attr(feature = "python", pyfunction)]
 pub fn detect_git_repo(cwd: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -1139,14 +1135,6 @@ pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
 // Pure-Rust callers use the `*_internal` / `*_rust` companions directly.
 // ---------------------------------------------------------------------------
 
-/// Read-only GET against any GitHub REST API endpoint. Returns JSON.
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (repo, path, *, truncate_at=80_000))]
-pub fn git_api(_py: Python<'_>, repo: &str, path: &str, truncate_at: usize) -> String {
-    git_api_internal(repo, path, truncate_at)
-}
-
 /// Pure-Rust dispatcher for the github_issues tool.
 ///
 /// Returns a user-facing string for all logical conditions (invalid repo,
@@ -1191,42 +1179,6 @@ pub fn github_issues_rust(
             labels,
         ),
     }
-}
-
-/// Fetch, search, or list GitHub issues/PRs/Discussions.
-///
-/// Mode determined by parameters:
-/// - `number` given → FETCH a single issue/PR/Discussion
-/// - `query` given → SEARCH via GitHub search API
-/// - neither → LIST recent items
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(signature = (
-    *,
-    repo = None,
-    number = None,
-    query = None,
-    kind = "all",
-    state = "open",
-    sort = None,
-    limit = 20,
-    labels = None,
-))]
-#[allow(clippy::too_many_arguments)]
-pub fn github_issues(
-    _py: Python<'_>,
-    repo: Option<&str>,
-    number: Option<u64>,
-    query: Option<&str>,
-    kind: &str,
-    state: &str,
-    sort: Option<&str>,
-    limit: usize,
-    labels: Option<&str>,
-) -> PyResult<String> {
-    Ok(github_issues_rust(
-        repo, number, query, kind, state, sort, limit, labels,
-    ))
 }
 
 // ---------------------------------------------------------------------------

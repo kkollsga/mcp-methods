@@ -2,7 +2,8 @@ name: Build and Publish Python Wheels
 on:
   push:
     paths:
-      - 'Cargo.toml'
+      - 'crates/mcp-methods/Cargo.toml'
+      - 'crates/mcp-methods-py/Cargo.toml'
   workflow_dispatch:
 
 jobs:
@@ -17,7 +18,7 @@ jobs:
       - name: Extract version from Cargo.toml
         id: get_version
         run: |
-          VERSION=$(grep -m 1 "version" Cargo.toml | cut -d '"' -f 2)
+          VERSION=$(grep -m 1 "version" crates/mcp-methods/Cargo.toml | cut -d '"' -f 2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Package version: $VERSION"
       - name: Check if version exists on PyPI
@@ -46,7 +47,7 @@ jobs:
           wait-interval: 10
 
   build:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build abi3 wheel on ${{ matrix.os }}
     needs: [version, ci-gate]
     if: needs.version.outputs.should_publish == 'true'
     runs-on: ${{ matrix.os }}
@@ -54,78 +55,36 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      # abi3 wheels work across all supported Python versions, so the
+      # matrix is OS-only — no per-Python-version axis. One wheel per
+      # OS instead of the 12-wheel cp310/cp311/cp312/cp313 matrix we
+      # shipped pre-0.3.26.
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            python-version: '3.10'
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            python-version: '3.11'
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            python-version: '3.12'
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            python-version: '3.13'
           - os: macos-latest
             target: aarch64-apple-darwin
-            python-version: '3.10'
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            python-version: '3.11'
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            python-version: '3.12'
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            python-version: '3.13'
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            python-version: '3.10'
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            python-version: '3.11'
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            python-version: '3.12'
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            python-version: '3.13'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.10"
       - run: python -m pip install --upgrade pip
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - run: pip install maturin
-      # Build the bundled `mcp-server` binary first and copy it into
-      # the python package's `_bin/` directory. Maturin's `include`
-      # config (in pyproject.toml) then force-packages the binary into
-      # the wheel — without this step the wheel ships with an
-      # unresolvable `[project.scripts]` entry point that points at a
-      # missing file.
-      - name: Build + bundle mcp-server binary
-        run: |
-          cargo build --release --target ${{ matrix.target }} --features server --bin mcp-server
-          if (!(Test-Path -Path "python/mcp_methods/_bin")) { New-Item -ItemType Directory -Path "python/mcp_methods/_bin" -Force }
-          if ($IsWindows) {
-            Copy-Item "target/${{ matrix.target }}/release/mcp-server.exe" "python/mcp_methods/_bin/mcp-server.exe"
-          } else {
-            Copy-Item "target/${{ matrix.target }}/release/mcp-server" "python/mcp_methods/_bin/mcp-server"
-          }
-        shell: pwsh
-      - name: Build wheels
+      - name: Build wheel
         run: |
           if (!(Test-Path -Path "wheels")) { New-Item -ItemType Directory -Path "wheels" }
           maturin build --release --target ${{ matrix.target }} --out wheels
         shell: pwsh
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          name: wheels-${{ matrix.os }}
           path: wheels/*.whl
 
   publish:
