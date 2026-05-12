@@ -5,6 +5,16 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Reusable utility methods for MCP servers — pure-Rust library"
+repository = "https://github.com/kkollsga/mcp-methods"
+homepage = "https://github.com/kkollsga/mcp-methods"
+documentation = "https://docs.rs/mcp-methods"
+readme = "../../README.md"
+keywords = ["mcp", "model-context-protocol", "ai", "rmcp"]
+categories = ["development-tools", "api-bindings"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+features = ["server"]
 
 [lib]
 name = "mcp_methods"

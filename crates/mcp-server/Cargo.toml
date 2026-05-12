@@ -1,17 +1,22 @@
 [package]
 name = "mcp-server"
-version = "0.0.2"
+version = "0.3.29"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Generic Rust-native MCP server CLI — built on the mcp-methods framework"
+repository = "https://github.com/kkollsga/mcp-methods"
+homepage = "https://github.com/kkollsga/mcp-methods"
+readme = "../../README.md"
+keywords = ["mcp", "model-context-protocol", "cli", "ai", "rmcp"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "mcp-server"
 path = "src/main.rs"
 
 [dependencies]
-mcp-methods = { path = "../mcp-methods", features = ["server"] }
+mcp-methods = { version = "0.3.29", path = "../mcp-methods", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "1.6", features = ["server", "macros", "transport-io"] }
