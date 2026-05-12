@@ -39,3 +39,6 @@ inbox/
 python/mcp_methods/_bin/
 examples/downstream_binary/target/
 examples/downstream_binary/Cargo.lock
+
+# Sphinx build output (Read the Docs builds this itself; local previews only)
+docs/_build/
