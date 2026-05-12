@@ -1,0 +1,40 @@
+# Sample YAML manifest for the `greeter` example.
+#
+# This manifest exercises the framework's standard fields. The
+# `greeter` binary in `src/main.rs` doesn't actually load a manifest
+# (it boots with `ServerOptions::from_manifest(None, ...)` for
+# simplicity), but the file is here to show the YAML shape that real
+# downstream binaries — and the generic `mcp-server` CLI — accept.
+#
+# To wire the greeter binary up to read this manifest, add:
+#
+#     use mcp_methods::server::manifest;
+#     let m = manifest::load(Path::new("manifest.yaml"))?;
+#     let options = ServerOptions::from_manifest(Some(&m), "Greeter Server");
+#
+# in `main.rs` before `McpServer::new(options)`.
+
+name: Greeter Server
+instructions: |
+  A minimal MCP server demonstrating the mcp-methods downstream-binary
+  pattern. Exposes a single `greet` tool that takes a `name` argument
+  and returns a friendly greeting with a per-session counter.
+
+# No source_roots — the greeter doesn't need file access.
+
+trust:
+  allow_python_tools: false
+  allow_embedder: false
+  allow_query_preprocessor: false
+
+builtins:
+  save_graph: false
+  temp_cleanup: never
+
+# The `extensions:` block is opaque passthrough — the framework
+# validates the top-level keys but leaves the inner content for
+# downstream binaries to interpret. Use this for domain-specific
+# config that isn't part of the framework's schema.
+extensions:
+  greeter:
+    log_each_greeting: false

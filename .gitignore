@@ -37,3 +37,5 @@ inbox/
 
 # Bundled mcp-server binary (built by `make bundle-bin` or the wheel CI step)
 python/mcp_methods/_bin/
+examples/downstream_binary/target/
+examples/downstream_binary/Cargo.lock

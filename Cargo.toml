@@ -4,6 +4,10 @@ members = [
     "crates/mcp-methods-py",
     "crates/mcp-server",
 ]
+# Example downstream crates are self-contained and consume
+# `mcp-methods` from crates.io — keep them out of the workspace so
+# they exercise the *external-consumer* dep path.
+exclude = ["examples/downstream_binary"]
 resolver = "2"
 
 [workspace.package]

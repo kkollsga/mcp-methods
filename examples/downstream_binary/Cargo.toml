@@ -1,0 +1,23 @@
+[package]
+name = "greeter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal downstream-binary example built on mcp-methods"
+
+[[bin]]
+name = "greeter"
+path = "src/main.rs"
+
+[dependencies]
+# Depend on the published mcp-methods 0.3 with the `server` feature
+# enabled — this is exactly the shape a downstream Rust binary would
+# use. `default-features = false` not needed because `server` is the
+# default; we list it explicitly for clarity.
+mcp-methods = { version = "0.3", features = ["server"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "1.6", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
