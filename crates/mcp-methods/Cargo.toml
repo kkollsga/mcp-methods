@@ -9,7 +9,7 @@ repository = "https://github.com/kkollsga/mcp-methods"
 homepage = "https://github.com/kkollsga/mcp-methods"
 documentation = "https://docs.rs/mcp-methods"
 readme = "../../README.md"
-keywords = ["mcp", "model-context-protocol", "ai", "rmcp"]
+keywords = ["mcp", "ai", "rmcp", "agent", "stdio"]
 categories = ["development-tools", "api-bindings"]
 
 [package.metadata.docs.rs]

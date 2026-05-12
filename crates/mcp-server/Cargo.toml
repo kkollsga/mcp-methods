@@ -8,7 +8,7 @@ description = "Generic Rust-native MCP server CLI — built on the mcp-methods f
 repository = "https://github.com/kkollsga/mcp-methods"
 homepage = "https://github.com/kkollsga/mcp-methods"
 readme = "../../README.md"
-keywords = ["mcp", "model-context-protocol", "cli", "ai", "rmcp"]
+keywords = ["mcp", "cli", "ai", "rmcp", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
