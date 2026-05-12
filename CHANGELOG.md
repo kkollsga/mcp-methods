@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.29 — 2026-05-12
+
+### Added
+- `trust.allow_query_preprocessor` — third advisory trust gate
+  alongside `allow_python_tools` and `allow_embedder`. The framework
+  parses the bool and surfaces it through `TrustConfig` and
+  `Manifest::to_json()`; downstream consumers enforce. Mirrors the
+  existing `allow_embedder` pattern: the framework records the
+  operator's declared trust, the consumer (e.g. `kglite-mcp-server`)
+  refuses to boot the corresponding extension hook when the flag is
+  false. Driven by the mcp-servers-operator's 0.9.25 Cypher
+  preprocessor spec.
+
+### JSON shape
+- `Manifest::to_json()` now emits `trust.allow_query_preprocessor`.
+  Non-breaking field addition; consumers that ignore unknown keys are
+  unaffected. The `to_json_shape_is_stable` snapshot test has been
+  updated to expect the new key.
+
+### Tests
+- `allow_query_preprocessor_trust_parses` — positive case.
+- `allow_query_preprocessor_rejects_non_bool` — type validation.
+
 ## 0.3.28 — 2026-05-12
 
 ### Fixed

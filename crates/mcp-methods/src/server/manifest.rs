@@ -46,7 +46,11 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
 ];
 const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch"];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
-const ALLOWED_TRUST_KEYS: &[&str] = &["allow_python_tools", "allow_embedder"];
+const ALLOWED_TRUST_KEYS: &[&str] = &[
+    "allow_python_tools",
+    "allow_embedder",
+    "allow_query_preprocessor",
+];
 const ALLOWED_TOOL_KEYS: &[&str] = &[
     "name",
     "description",
@@ -86,6 +90,13 @@ impl ManifestError {
 pub struct TrustConfig {
     pub allow_python_tools: bool,
     pub allow_embedder: bool,
+    /// Advisory gate: the manifest declares that an extension-defined
+    /// query preprocessor hook is permitted to run. The framework does
+    /// not parse or execute the preprocessor itself — it lives in the
+    /// opaque `extensions:` passthrough — but downstream consumers
+    /// (e.g. kglite-mcp-server) read this flag and refuse to boot the
+    /// hook when it is false. Same pattern as `allow_embedder`.
+    pub allow_query_preprocessor: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +242,7 @@ impl Manifest {
             "trust": {
                 "allow_python_tools": self.trust.allow_python_tools,
                 "allow_embedder": self.trust.allow_embedder,
+                "allow_query_preprocessor": self.trust.allow_query_preprocessor,
             },
             "tools": self.tools.iter().map(|t| match t {
                 ToolSpec::Cypher(c) => serde_json::json!({
@@ -519,6 +531,11 @@ fn build_trust(
         cfg.allow_embedder = v
             .as_bool()
             .ok_or_else(|| ManifestError::at(yaml_path, "trust.allow_embedder must be a bool"))?;
+    }
+    if let Some(v) = map.get("allow_query_preprocessor") {
+        cfg.allow_query_preprocessor = v.as_bool().ok_or_else(|| {
+            ManifestError::at(yaml_path, "trust.allow_query_preprocessor must be a bool")
+        })?;
     }
     Ok(cfg)
 }
@@ -932,6 +949,24 @@ mod tests {
     }
 
     #[test]
+    fn allow_query_preprocessor_trust_parses() {
+        let f = write_tmp("trust:\n  allow_query_preprocessor: true\n");
+        let m = load(f.path()).unwrap();
+        assert!(m.trust.allow_query_preprocessor);
+        assert!(!m.trust.allow_embedder);
+        assert!(!m.trust.allow_python_tools);
+    }
+
+    #[test]
+    fn allow_query_preprocessor_rejects_non_bool() {
+        let f = write_tmp("trust:\n  allow_query_preprocessor: \"yes\"\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err
+            .message
+            .contains("allow_query_preprocessor must be a bool"));
+    }
+
+    #[test]
     fn find_sibling_works() {
         let dir = tempfile::tempdir().unwrap();
         let graph = dir.path().join("demo.kgl");
@@ -1088,7 +1123,11 @@ builtins:
             "instructions": null,
             "overview_prefix": null,
             "source_roots": ["src", "lib"],
-            "trust": { "allow_python_tools": false, "allow_embedder": true },
+            "trust": {
+                "allow_python_tools": false,
+                "allow_embedder": true,
+                "allow_query_preprocessor": false,
+            },
             "tools": [],
             "embedder": {
                 "module": "kglite.embed",
