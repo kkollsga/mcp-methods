@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.3.31 — 2026-05-13
+
+### Added — `tools[].bundled:` override shape
+
+Manifest `tools:` arrays now accept a third entry kind alongside
+`cypher:` and `python:`: `bundled:` entries customise the
+agent-facing surface of a bundled tool the downstream binary
+provides natively (e.g. `cypher_query`, `repo_management`,
+`graph_overview`).
+
+```yaml
+tools:
+  - bundled: repo_management        # name in the value, no `name:` line
+    description: |                  # override the agent-visible description
+      FIRST STEP for this server. Call repo_management('org/repo')
+      to clone + build a repo before any other tool.
+
+  - bundled: ping                   # hide a tool from tools/list AND
+    hidden: true                    # reject calls to it
+
+  - name: similar_sessions          # existing cypher-tool shape unchanged
+    cypher: |
+      MATCH ...
+```
+
+Field semantics:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `bundled:` | string | (required) | The bundled tool's name. Must match `^[a-zA-Z_][a-zA-Z0-9_]*$`. The framework does NOT validate against an actual catalogue (it doesn't know what bundled tools the downstream binary provides); the consumer is responsible for "unknown tool name" errors at boot. |
+| `description:` | string | None | Replaces the bundled tool's default agent-facing description. `None` means "keep the default." |
+| `hidden:` | bool | false | When true, the downstream consumer should omit the tool from `tools/list` AND reject calls to it. |
+
+Mutually exclusive with `cypher:` / `python:` / `name:` /
+`parameters:` / `function:`. The parser surfaces clear errors at
+boot for combinations that don't fit.
+
+### Motivation
+
+The pre-0.3.31 customisation surface for bundled tools was the
+manifest's global `instructions:` block — useful for first-message
+agent orientation, but a single blob detached from individual
+tools. Operators wanting to teach agents that `repo_management` is
+the FIRST STEP, or hide `ping` from a production server, had to
+stuff that into the global instructions and hope the agent
+correlates it. Bundled overrides attach those concerns to the
+tools directly: descriptions ride the `tools/list` response next
+to the schemas, and `hidden:true` is the surgical opt-out for
+"this tool is in the bundled catalogue but my agent shouldn't see
+it."
+
+The downstream `kglite-mcp-server` is the first consumer; it ships
+bundled-override support in its next release after this lands. The
+framework half of the work is small (~150 LoC parser + struct +
+to_json variant + 11 tests) and entirely additive — pre-existing
+`tools[].cypher` and `tools[].python` entries parse unchanged.
+
+### JSON shape addition
+
+`Manifest::to_json()` emits bundled override entries as:
+
+```json
+{
+  "kind": "bundled",
+  "name": "repo_management",
+  "description": "FIRST STEP for this server...",
+  "hidden": false
+}
+```
+
+Non-breaking field addition to the existing `tools[]` array shape.
+Consumers that ignore unknown `kind` values stay safe; consumers
+that want bundled-override support match on `kind == "bundled"`.
+
+### Tests
+
+11 new parser tests in `crates/mcp-methods/src/server/manifest.rs::tests`:
+
+- `bundled_override_with_description_parses`
+- `bundled_override_with_hidden_parses`
+- `bundled_override_alongside_cypher_tools_parses`
+- `rejects_bundled_with_cypher_kind`
+- `rejects_bundled_with_name_field`
+- `rejects_bundled_with_parameters_field`
+- `rejects_bundled_with_non_bool_hidden`
+- `rejects_hidden_on_cypher_tool`
+- `rejects_duplicate_bundled_overrides`
+- `rejects_bundled_with_invalid_identifier`
+- `bundled_override_to_json_shape`
+
+Plus the existing 93 mcp-methods tests stay green (additive change;
+no behaviour shift on the cypher / python paths).
+
 ## 0.3.30 — 2026-05-12
 
 ### Distribution shape — bundled binary in the pip wheel

@@ -58,6 +58,8 @@ const ALLOWED_TOOL_KEYS: &[&str] = &[
     "cypher",
     "python",
     "function",
+    "bundled",
+    "hidden",
 ];
 const ALLOWED_EMBEDDER_KEYS: &[&str] = &["module", "class", "kwargs"];
 const ALLOWED_BUILTIN_KEYS: &[&str] = &["save_graph", "temp_cleanup"];
@@ -103,6 +105,22 @@ pub struct TrustConfig {
 pub enum ToolSpec {
     Cypher(CypherTool),
     Python(PythonTool),
+    /// Override the agent-facing surface of a bundled tool (one the
+    /// downstream binary provides natively — `cypher_query`,
+    /// `graph_overview`, `read_source`, etc.). The framework parses
+    /// the override but does not enforce that the named tool exists;
+    /// the downstream consumer (e.g. `kglite-mcp-server`) is
+    /// responsible for validating the name against its bundled
+    /// catalogue at boot time and applying the override when
+    /// emitting `tools/list`.
+    ///
+    /// Pre-0.3.31 the only customisation path for the bundled tool
+    /// surface was the manifest's global `instructions:` block —
+    /// useful for first-message orientation but not attached to
+    /// individual tools. Bundled overrides let operators rewrite a
+    /// specific tool's `description` (what the agent sees in
+    /// `tools/list`) or `hidden`-flag it out entirely.
+    Bundled(BundledOverride),
 }
 
 impl ToolSpec {
@@ -110,6 +128,7 @@ impl ToolSpec {
         match self {
             ToolSpec::Cypher(t) => &t.name,
             ToolSpec::Python(t) => &t.name,
+            ToolSpec::Bundled(t) => &t.name,
         }
     }
 }
@@ -129,6 +148,23 @@ pub struct PythonTool {
     pub function: String,
     pub description: Option<String>,
     pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundledOverride {
+    /// Name of the bundled tool to override (e.g. `cypher_query`,
+    /// `repo_management`). Validation against the downstream
+    /// binary's actual catalogue happens at the consumer's boot
+    /// time — the framework only checks shape here.
+    pub name: String,
+    /// New agent-facing description that replaces the bundled
+    /// tool's default. `None` means "do not override; keep the
+    /// default."
+    pub description: Option<String>,
+    /// When true, the downstream consumer should omit this tool
+    /// from `tools/list` AND reject calls to it. Defaults to
+    /// false (visible).
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +295,12 @@ impl Manifest {
                     "function": p.function,
                     "description": p.description,
                     "parameters": p.parameters,
+                }),
+                ToolSpec::Bundled(b) => serde_json::json!({
+                    "kind": "bundled",
+                    "name": b.name,
+                    "description": b.description,
+                    "hidden": b.hidden,
                 }),
             }).collect::<Vec<_>>(),
             "embedder": self.embedder.as_ref().map(|e| serde_json::json!({
@@ -576,6 +618,43 @@ fn build_tool(
         .ok_or_else(|| ManifestError::at(yaml_path, format!("tools[{idx}] must be a mapping")))?;
     check_keys(map, ALLOWED_TOOL_KEYS, "tool keys", yaml_path)?;
 
+    // Kind detection. `cypher` and `python` are tool-creation kinds
+    // (operator declares a new named tool); `bundled` is a tool-
+    // override kind (operator picks a bundled tool name and customises
+    // its agent-facing surface). Exactly one must be present.
+    let has_cypher = map.contains_key("cypher");
+    let has_python = map.contains_key("python");
+    let has_bundled = map.contains_key("bundled");
+    let kinds_present: Vec<&str> = [
+        ("cypher", has_cypher),
+        ("python", has_python),
+        ("bundled", has_bundled),
+    ]
+    .into_iter()
+    .filter(|(_, p)| *p)
+    .map(|(k, _)| k)
+    .collect();
+    if kinds_present.is_empty() {
+        return Err(ManifestError::at(
+            yaml_path,
+            format!("tools[{idx}] needs exactly one of: [\"cypher\", \"python\", \"bundled\"]"),
+        ));
+    }
+    if kinds_present.len() > 1 {
+        return Err(ManifestError::at(
+            yaml_path,
+            format!("tools[{idx}] has multiple kinds set ({kinds_present:?}); pick exactly one"),
+        ));
+    }
+
+    // The `bundled` kind takes its name from the `bundled:` value
+    // itself (e.g. `bundled: cypher_query`) and forbids the
+    // tool-creation fields. Branch early so we don't run the
+    // tool-creation `name:` requirement against an override entry.
+    if has_bundled {
+        return build_bundled_override(map, idx, yaml_path);
+    }
+
     let name = map
         .get("name")
         .and_then(|v| v.as_str())
@@ -588,23 +667,15 @@ fn build_tool(
         })?
         .to_string();
 
-    let has_cypher = map.contains_key("cypher");
-    let has_python = map.contains_key("python");
-    let kinds_present: Vec<&str> = [("cypher", has_cypher), ("python", has_python)]
-        .into_iter()
-        .filter(|(_, p)| *p)
-        .map(|(k, _)| k)
-        .collect();
-    if kinds_present.is_empty() {
+    // `hidden:` is only valid on bundled overrides (`hidden:`-flagging
+    // a tool you're declaring inline doesn't make sense — just don't
+    // declare it). Reject early so the operator gets a clear error.
+    if map.contains_key("hidden") {
         return Err(ManifestError::at(
             yaml_path,
-            format!("tools[{idx}] ({name:?}) needs exactly one of: [\"cypher\", \"python\"]"),
-        ));
-    }
-    if kinds_present.len() > 1 {
-        return Err(ManifestError::at(
-            yaml_path,
-            format!("tools[{idx}] ({name:?}) has multiple kinds set ({kinds_present:?}); pick one"),
+            format!(
+                "tools[{idx}] ({name:?}) `hidden:` is only valid on `bundled:` override entries"
+            ),
         ));
     }
 
@@ -681,6 +752,74 @@ fn build_tool(
         function,
         description,
         parameters,
+    }))
+}
+
+/// Parse a `bundled:` override entry from `tools[idx]`. The caller
+/// (`build_tool`) has already established that the entry has
+/// `bundled:` set as the kind discriminator.
+fn build_bundled_override(
+    map: &serde_yaml::Mapping,
+    idx: usize,
+    yaml_path: &Path,
+) -> Result<ToolSpec, ManifestError> {
+    let name = map
+        .get("bundled")
+        .and_then(|v| v.as_str())
+        .filter(|s| valid_identifier(s))
+        .ok_or_else(|| {
+            ManifestError::at(
+                yaml_path,
+                format!(
+                    "tools[{idx}] `bundled:` must be a string naming a bundled tool \
+                     (must match ^[a-zA-Z_][a-zA-Z0-9_]*$)"
+                ),
+            )
+        })?
+        .to_string();
+
+    // Tool-creation fields are forbidden on override entries — the
+    // override only customises an existing bundled tool's surface,
+    // it doesn't declare a new tool. Catch these at parse time so
+    // operators get a clear error rather than silent confusion.
+    for forbidden in ["name", "parameters", "function"] {
+        if map.contains_key(forbidden) {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!(
+                    "tools[{idx}] bundled override {name:?} cannot set `{forbidden}:` \
+                     (only `description:` and `hidden:` are permitted on overrides)"
+                ),
+            ));
+        }
+    }
+
+    let description = match map.get("description") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!("tools[{idx}] bundled override {name:?}.description must be a string"),
+            ))
+        }
+    };
+
+    let hidden = match map.get("hidden") {
+        None | Some(serde_yaml::Value::Null) => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!("tools[{idx}] bundled override {name:?}.hidden must be a bool"),
+            ))
+        }
+    };
+
+    Ok(ToolSpec::Bundled(BundledOverride {
+        name,
+        description,
+        hidden,
     }))
 }
 
@@ -913,6 +1052,148 @@ mod tests {
             "tools:\n  - name: same\n    cypher: 'MATCH (n) RETURN n'\n  - name: same\n    cypher: 'MATCH (m) RETURN m'\n",
         );
         assert!(load(f.path()).unwrap_err().message.contains("duplicate"));
+    }
+
+    // ─── Bundled override shape (0.3.31) ────────────────────────
+
+    #[test]
+    fn bundled_override_with_description_parses() {
+        let f =
+            write_tmp("tools:\n  - bundled: repo_management\n    description: \"FIRST STEP\"\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.tools.len(), 1);
+        match &m.tools[0] {
+            ToolSpec::Bundled(b) => {
+                assert_eq!(b.name, "repo_management");
+                assert_eq!(b.description.as_deref(), Some("FIRST STEP"));
+                assert!(!b.hidden);
+            }
+            _ => panic!("expected bundled override"),
+        }
+    }
+
+    #[test]
+    fn bundled_override_with_hidden_parses() {
+        let f = write_tmp("tools:\n  - bundled: ping\n    hidden: true\n");
+        let m = load(f.path()).unwrap();
+        match &m.tools[0] {
+            ToolSpec::Bundled(b) => {
+                assert_eq!(b.name, "ping");
+                assert!(b.hidden);
+                assert!(b.description.is_none());
+            }
+            _ => panic!("expected bundled override"),
+        }
+    }
+
+    #[test]
+    fn bundled_override_alongside_cypher_tools_parses() {
+        let f = write_tmp(
+            "tools:\n\
+             \x20\x20- bundled: cypher_query\n\
+             \x20\x20\x20\x20description: \"Custom server description\"\n\
+             \x20\x20- name: lookup\n\
+             \x20\x20\x20\x20cypher: \"MATCH (n) RETURN n\"\n",
+        );
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.tools.len(), 2);
+        assert!(matches!(m.tools[0], ToolSpec::Bundled(_)));
+        assert!(matches!(m.tools[1], ToolSpec::Cypher(_)));
+    }
+
+    #[test]
+    fn rejects_bundled_with_cypher_kind() {
+        let f =
+            write_tmp("tools:\n  - bundled: cypher_query\n    cypher: \"MATCH (n) RETURN n\"\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("multiple kinds"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_bundled_with_name_field() {
+        let f = write_tmp("tools:\n  - bundled: ping\n    name: ping\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("cannot set `name:`"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_bundled_with_parameters_field() {
+        let f =
+            write_tmp("tools:\n  - bundled: cypher_query\n    parameters:\n      type: object\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("cannot set `parameters:`"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_bundled_with_non_bool_hidden() {
+        let f = write_tmp("tools:\n  - bundled: ping\n    hidden: yes-please\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("hidden must be a bool"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_hidden_on_cypher_tool() {
+        let f = write_tmp(
+            "tools:\n  - name: lookup\n    cypher: \"MATCH (n) RETURN n\"\n    hidden: true\n",
+        );
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message
+                .contains("`hidden:` is only valid on `bundled:` override entries"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_bundled_overrides() {
+        // The dedup check is on tool name; two `bundled: ping` entries
+        // share the same name and should be rejected the same way
+        // duplicate cypher tools are.
+        let f = write_tmp(
+            "tools:\n  - bundled: ping\n    hidden: true\n  - bundled: ping\n    description: \"x\"\n",
+        );
+        assert!(load(f.path()).unwrap_err().message.contains("duplicate"));
+    }
+
+    #[test]
+    fn rejects_bundled_with_invalid_identifier() {
+        let f = write_tmp("tools:\n  - bundled: \"123-bad\"\n    hidden: true\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("must be a string"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn bundled_override_to_json_shape() {
+        let f = write_tmp(
+            "tools:\n  - bundled: repo_management\n    description: \"FIRST STEP\"\n    hidden: false\n",
+        );
+        let m = load(f.path()).unwrap();
+        let v = m.to_json();
+        assert_eq!(v["tools"][0]["kind"], "bundled");
+        assert_eq!(v["tools"][0]["name"], "repo_management");
+        assert_eq!(v["tools"][0]["description"], "FIRST STEP");
+        assert_eq!(v["tools"][0]["hidden"], false);
     }
 
     #[test]
