@@ -93,6 +93,31 @@ that want bundled-override support match on `kind == "bundled"`.
 Plus the existing 93 mcp-methods tests stay green (additive change;
 no behaviour shift on the cypher / python paths).
 
+### Fixed — `repo_management` cross-binary surface drift
+
+The generic `mcp-server` CLI used to always register `repo_management`
+in `tools/list`, regardless of whether a workspace was bound. Without
+a workspace, calls to the tool returned `"repo_management requires
+--workspace mode."` — but the tool was still visible to the agent.
+
+Downstream binaries (e.g. `kglite-mcp-server`) gate the same tool
+out of `tools/list` entirely when no workspace is bound. The
+inconsistency surfaced when operators ran the same YAML against
+`mcp-server` (saw the tool) and `kglite-mcp-server` (didn't see it).
+
+`McpServer::new` now calls `tool_router.remove_route("repo_management")`
+when `options.workspace.is_none()`. Tool surface matches downstream
+gating; agents only see the tool when it can do something useful.
+
+Two new tests anchor the behaviour:
+- `repo_management_gated_to_workspace_mode` — bare framework,
+  no workspace, tool is absent from `list_all()`.
+- `repo_management_present_when_workspace_bound` — with a workspace,
+  tool is present.
+
+Reported by kglite while comparing the two binaries against the
+same YAML post-0.9.25 deployment.
+
 ## 0.3.30 — 2026-05-12
 
 ### Distribution shape — bundled binary in the pip wheel

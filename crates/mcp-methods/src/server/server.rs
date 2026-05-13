@@ -352,7 +352,21 @@ impl McpServer {
         };
         server.register_github_tools_if_authorized();
         server.register_local_workspace_tools();
+        server.gate_workspace_tools();
         server
+    }
+
+    /// Drop `repo_management` from the router when no workspace is
+    /// bound — `tools/list` should reflect the actual surface, not a
+    /// tool whose handler immediately errors out with "requires
+    /// --workspace mode." Mirrors the gating downstream binaries
+    /// (e.g. `kglite-mcp-server`) apply to the same tool. Operators
+    /// comparing the bare framework against a downstream binary's
+    /// surface see consistent behaviour now.
+    fn gate_workspace_tools(&mut self) {
+        if self.options.workspace.is_none() {
+            self.tool_router.remove_route("repo_management");
+        }
     }
 
     /// Register `set_root_dir` when the bound workspace is local-flavoured.
@@ -815,6 +829,36 @@ mod tests {
     fn no_provider_returns_empty_roots() {
         let server = McpServer::new(ServerOptions::default());
         assert!(server.current_source_roots().is_empty());
+    }
+
+    #[test]
+    fn repo_management_gated_to_workspace_mode() {
+        // Bare (no workspace): repo_management should NOT be in the
+        // router. Mirrors the gating downstream binaries apply.
+        let server = McpServer::new(ServerOptions::default());
+        let tools = server.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            !names.contains(&"repo_management"),
+            "repo_management should be gated out without a workspace; tools were {names:?}"
+        );
+    }
+
+    #[test]
+    fn repo_management_present_when_workspace_bound() {
+        // With a workspace handle bound, repo_management should be
+        // registered.
+        use crate::server::workspace::Workspace;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        let opts = ServerOptions::default().with_workspace(ws);
+        let server = McpServer::new(opts);
+        let tools = server.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"repo_management"),
+            "repo_management should be registered with a workspace; tools were {names:?}"
+        );
     }
 
     #[test]
