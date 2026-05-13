@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.3.32 — 2026-05-14
+
+### Changed — `find_workspace_manifest` parent-walk fallback (opt-in)
+
+`find_workspace_manifest(workspace_dir)` now also looks one level up
+for `workspace_mcp.yaml`, but only when the parent manifest *declares*
+it applies to the given workspace dir via a new field:
+
+```yaml
+# open_source/workspace_mcp.yaml
+workspace:
+  kind: github
+  applies_to: ./repos    # opt-in: parent-walk auto-detection allowed
+                         # for `--workspace open_source/repos/`
+```
+
+When the operator passes `--workspace open_source/repos/`:
+1. Primary location (`open_source/repos/workspace_mcp.yaml`) is
+   checked first; if present, it wins unconditionally.
+2. If absent, the parent (`open_source/workspace_mcp.yaml`) is
+   considered — but only if it declares `workspace.applies_to: ./repos`
+   AND that path canonicalises to the actual `workspace_dir`.
+
+Without the declaration (or with a mismatched path), the framework
+refuses to auto-detect — operator must pass `--mcp-config` explicitly.
+The opt-in eliminates the accidental-discovery footgun where a
+project-root manifest would silently attach to any sibling dir an
+operator happened to pass to `--workspace`.
+
+#### Why opt-in
+
+The original design considered an unconditional parent-walk fallback.
+That would have introduced a regression: an operator with
+`~/proj/workspace_mcp.yaml` (for their real workspace) accidentally
+running `mcp-server --workspace ~/proj/some_other_dir/` would silently
+inherit the wrong manifest. The opt-in eliminates this entirely — the
+manifest author *declares* which child the manifest covers, and the
+framework only matches that declaration.
+
+The natural layout this enables:
+
+```text
+open_source/
+├── workspace_mcp.yaml     # declares workspace.applies_to: ./repos
+└── repos/                 # --workspace points here; auto-detect works
+```
+
+Operators in this layout no longer pass `--mcp-config` for every
+workspace launch.
+
+#### New schema field
+
+`workspace.applies_to: <relative path>` — optional string, must be
+non-empty when set. Resolved against the manifest's parent
+directory. Unset = no parent-walk discovery for this manifest (the
+safe default for existing manifests).
+
+`Manifest::to_json()` emits the new field under `workspace.applies_to`
+(string or null). Non-breaking JSON shape addition under the existing
+stability guarantee.
+
+#### Logging
+
+When the parent-walk fallback is considered, the framework emits a
+`tracing` log at INFO level explaining the discovery outcome:
+
+- `"manifest discovered via parent-walk fallback (workspace.applies_to matched)"` — on success
+- `"parent-walk manifest does not declare workspace.applies_to; ignoring"` — declaration absent
+- `"parent-walk manifest's workspace.applies_to does not match this workspace_dir; ignoring"` — mismatch
+
+Operators with `RUST_LOG=info` (or any tracing subscriber wired up by
+their binary, which `mcp-server`'s `init_tracing` does by default)
+see exactly why discovery did or did not succeed.
+
+### Tests
+
+Six tests under `find_workspace_*`:
+
+- `find_workspace_works` — primary location (existing).
+- `find_workspace_walks_one_level_up_with_applies_to` — opt-in
+  match returns the parent manifest.
+- `find_workspace_ignores_parent_without_applies_to` — parent
+  manifest without declaration is NOT auto-detected.
+- `find_workspace_ignores_parent_with_mismatched_applies_to` —
+  declaration that doesn't match is rejected.
+- `find_workspace_returns_none_when_missing_everywhere` — no
+  manifest in child or parent → None.
+- `find_workspace_primary_wins_over_parent_fallback` — primary
+  always preempts even when both could match.
+
+111 unit tests pass (was 108 at 0.3.31 head; +3 net after refactor —
+two new opt-in tests, the existing walks-up test renamed to make the
+opt-in requirement explicit).
+
+### Origin
+
+kglite operator audit during the 0.6.x → 0.9.x migration: workspace
+manifests sitting next to (not inside) the workspace dir required
+`--mcp-config` for every launch. They proposed and implemented the
+parent-walk in their local tree; we picked the opt-in shape over
+their unconditional version to eliminate the accidental-discovery
+risk.
+
 ## 0.3.31 — 2026-05-13
 
 ### Added — `tools[].bundled:` override shape

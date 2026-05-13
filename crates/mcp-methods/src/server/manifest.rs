@@ -44,7 +44,7 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "workspace",
     "extensions",
 ];
-const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch"];
+const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch", "applies_to"];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
 const ALLOWED_TRUST_KEYS: &[&str] = &[
     "allow_python_tools",
@@ -225,6 +225,18 @@ pub struct WorkspaceConfig {
     /// Local-mode only: wire the framework's file watcher to `root`
     /// (debounced rebuild trigger via the post-activate hook).
     pub watch: bool,
+    /// Optional opt-in for the [`find_workspace_manifest`] parent-walk
+    /// fallback. When set, this manifest is auto-discovered by
+    /// ``mcp-server --workspace DIR`` (and similar callers) only when
+    /// ``DIR`` canonicalises to ``applies_to`` resolved against the
+    /// manifest's parent directory. When unset, the parent-walk
+    /// fallback NEVER fires for this manifest — operators must pass
+    /// ``--mcp-config`` explicitly.
+    ///
+    /// Eliminates the accidental-discovery footgun where a workspace
+    /// manifest is auto-picked-up by an unrelated sibling dir. The
+    /// manifest's own declaration is the opt-in.
+    pub applies_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +329,7 @@ impl Manifest {
                 "kind": w.kind.as_str(),
                 "root": w.root,
                 "watch": w.watch,
+                "applies_to": w.applies_to,
             })),
             "extensions": self.extensions,
         })
@@ -335,12 +348,127 @@ pub fn find_sibling_manifest(graph_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Auto-detect ``workspace_mcp.yaml`` inside a workspace directory.
+/// Auto-detect ``workspace_mcp.yaml`` for a workspace directory.
+///
+/// Checks two locations in strict priority order:
+///
+/// 1. **Primary** — ``<workspace_dir>/workspace_mcp.yaml``. The
+///    documented and recommended location. If this exists, it is
+///    returned unconditionally; the parent-walk fallback is NOT
+///    consulted even if a parent manifest also exists. No opt-in
+///    declaration required — the manifest sitting inside the
+///    workspace dir is itself the operator's intent.
+/// 2. **Parent-walk fallback** —
+///    ``<workspace_dir>/../workspace_mcp.yaml``. Triggered only when
+///    the primary is absent AND the parent manifest *declares* it
+///    applies to this specific workspace dir via the
+///    ``workspace.applies_to:`` field:
+///
+///    ```yaml
+///    # open_source/workspace_mcp.yaml
+///    workspace:
+///      kind: github
+///      applies_to: ./repos     # required for parent-walk discovery
+///    ```
+///
+///    The framework loads the parent manifest, canonicalises
+///    ``manifest.workspace.applies_to`` against the manifest's parent
+///    directory, and compares it to the actual ``workspace_dir``.
+///    Match → manifest is returned. No declaration or path mismatch
+///    → discovery returns ``None`` (operator must pass
+///    ``--mcp-config`` explicitly).
+///
+///    The natural layout for github-clone-tracker workspaces is:
+///
+///    ```text
+///    open_source/
+///    ├── workspace_mcp.yaml     # config sits beside the sandbox; declares
+///    │                          # workspace.applies_to: ./repos
+///    └── repos/                 # --workspace points here
+///    ```
+///
+///    The ``applies_to`` opt-in eliminates the accidental-discovery
+///    footgun where a manifest in a project root would auto-attach to
+///    any unrelated sibling dir. Operators who didn't author the
+///    manifest get the safe default (no auto-detection); operators
+///    who did get the ergonomic UX (no ``--mcp-config`` boilerplate).
+///
+/// Bounded to one level up; will not walk past the filesystem root.
+/// Symlink-safe via canonicalisation. Added per kglite operator
+/// feedback after the 0.6.x → 0.9.x migration audit.
 pub fn find_workspace_manifest(workspace_dir: &Path) -> Option<PathBuf> {
-    let candidate = workspace_dir.join("workspace_mcp.yaml");
-    if candidate.is_file() {
-        Some(candidate)
+    let primary = workspace_dir.join("workspace_mcp.yaml");
+    if primary.is_file() {
+        return Some(primary);
+    }
+    // Parent-walk fallback. Compare against canonicalised paths to
+    // handle "/" (where parent == self) and symlinks consistently.
+    let parent = workspace_dir.parent()?;
+    let workspace_resolved = workspace_dir.canonicalize().ok()?;
+    let parent_resolved = parent.canonicalize().ok()?;
+    if parent_resolved == workspace_resolved {
+        // No real parent (filesystem root).
+        return None;
+    }
+    let fallback = parent.join("workspace_mcp.yaml");
+    if !fallback.is_file() {
+        return None;
+    }
+
+    // The fallback manifest must declare workspace.applies_to and
+    // that declaration must canonicalise to the actual workspace_dir.
+    // Otherwise the discovery is unsafe (could be accidental).
+    let manifest = match load(&fallback) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                manifest = %fallback.display(),
+                error = %e,
+                "parent-walk manifest exists but failed to parse; ignoring"
+            );
+            return None;
+        }
+    };
+    let declared = manifest
+        .workspace
+        .as_ref()
+        .and_then(|w| w.applies_to.as_ref());
+    let Some(declared_path) = declared else {
+        tracing::info!(
+            manifest = %fallback.display(),
+            "parent-walk manifest does not declare workspace.applies_to; \
+             ignoring (set workspace.applies_to: <relative path> to opt in)"
+        );
+        return None;
+    };
+    let manifest_dir = fallback.parent()?;
+    let declared_abs = match manifest_dir.join(declared_path).canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                manifest = %fallback.display(),
+                applies_to = %declared_path,
+                error = %e,
+                "parent-walk manifest's workspace.applies_to cannot be resolved; ignoring"
+            );
+            return None;
+        }
+    };
+    if declared_abs == workspace_resolved {
+        tracing::info!(
+            workspace_dir = %workspace_dir.display(),
+            manifest = %fallback.display(),
+            "manifest discovered via parent-walk fallback (workspace.applies_to matched)"
+        );
+        Some(fallback)
     } else {
+        tracing::info!(
+            workspace_dir = %workspace_resolved.display(),
+            manifest = %fallback.display(),
+            declared = %declared_abs.display(),
+            "parent-walk manifest's workspace.applies_to does not match \
+             this workspace_dir; ignoring"
+        );
         None
     }
 }
@@ -499,6 +627,16 @@ fn build_workspace(
             ))
         }
     };
+    let applies_to = match map.get("applies_to") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            return Err(ManifestError::at(
+                yaml_path,
+                "workspace.applies_to must be a non-empty string (a relative path)",
+            ))
+        }
+    };
     if kind == WorkspaceKind::Local && root.is_none() {
         return Err(ManifestError::at(
             yaml_path,
@@ -511,7 +649,12 @@ fn build_workspace(
             "workspace.watch is only valid with workspace.kind: local",
         ));
     }
-    Ok(Some(WorkspaceConfig { kind, root, watch }))
+    Ok(Some(WorkspaceConfig {
+        kind,
+        root,
+        watch,
+        applies_to,
+    }))
 }
 
 fn check_keys(
@@ -1378,6 +1521,122 @@ mod tests {
         let manifest = dir.path().join("workspace_mcp.yaml");
         std::fs::write(&manifest, "name: ws\n").unwrap();
         assert_eq!(find_workspace_manifest(dir.path()), Some(manifest));
+    }
+
+    #[test]
+    fn find_workspace_walks_one_level_up_with_applies_to() {
+        // Layout: <tmp>/parent/workspace_mcp.yaml (declares
+        // workspace.applies_to: ./repos) + <tmp>/parent/repos/.
+        // Discovery from <tmp>/parent/repos/ should walk up one level
+        // and find the sibling manifest because applies_to matches.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(
+            &manifest,
+            "workspace:\n  kind: github\n  applies_to: ./repos\n",
+        )
+        .unwrap();
+        let repos = parent.join("repos");
+        std::fs::create_dir(&repos).unwrap();
+
+        // Primary location still works.
+        assert_eq!(find_workspace_manifest(&parent), Some(manifest.clone()));
+
+        // Parent-walk fallback resolves to the same manifest. Compare
+        // canonicalised paths to handle macOS /private/var vs /var.
+        let found = find_workspace_manifest(&repos).expect("parent fallback should fire");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            manifest.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn find_workspace_ignores_parent_without_applies_to() {
+        // Parent manifest exists but does NOT declare workspace.applies_to.
+        // The parent-walk fallback must refuse to auto-detect it —
+        // otherwise an unrelated workspace_mcp.yaml in a sibling dir
+        // could surprise-attach to whatever --workspace path the
+        // operator passes. Safe default: require the opt-in.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(&manifest, "name: not for repos\n").unwrap();
+        let repos = parent.join("repos");
+        std::fs::create_dir(&repos).unwrap();
+
+        assert_eq!(
+            find_workspace_manifest(&repos),
+            None,
+            "parent manifest without workspace.applies_to must NOT auto-attach"
+        );
+    }
+
+    #[test]
+    fn find_workspace_ignores_parent_with_mismatched_applies_to() {
+        // Parent manifest declares applies_to: ./repos but the
+        // actual --workspace path is ./other_dir. The mismatch must
+        // suppress auto-detection.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(
+            &manifest,
+            "workspace:\n  kind: github\n  applies_to: ./repos\n",
+        )
+        .unwrap();
+        let other = parent.join("other_dir");
+        std::fs::create_dir(&other).unwrap();
+
+        assert_eq!(
+            find_workspace_manifest(&other),
+            None,
+            "applies_to: ./repos must NOT match --workspace ./other_dir"
+        );
+    }
+
+    #[test]
+    fn find_workspace_returns_none_when_missing_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        // No manifest in either child or its parent (tmpdir root).
+        assert_eq!(find_workspace_manifest(&child), None);
+    }
+
+    #[test]
+    fn find_workspace_primary_wins_over_parent_fallback() {
+        // Both primary AND parent-fallback exist. The primary must
+        // win — this anchors the precedence rule documented on
+        // `find_workspace_manifest`. The parent declares applies_to
+        // matching the child dir, so it WOULD be a valid fallback —
+        // but the primary preempts it. If a future refactor swaps
+        // the order, this test fails loudly.
+        let dir = tempfile::tempdir().unwrap();
+        let parent_manifest = dir.path().join("workspace_mcp.yaml");
+        std::fs::write(
+            &parent_manifest,
+            "workspace:\n  kind: github\n  applies_to: ./repos\n",
+        )
+        .unwrap();
+        let child = dir.path().join("repos");
+        std::fs::create_dir(&child).unwrap();
+        let child_manifest = child.join("workspace_mcp.yaml");
+        std::fs::write(&child_manifest, "name: child\n").unwrap();
+
+        // Discovery from `child` should return the child manifest,
+        // NOT the parent's. Compare canonicalised to handle the
+        // macOS /private/var vs /var symlink consistently.
+        let found = find_workspace_manifest(&child).expect("primary should resolve");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            child_manifest.canonicalize().unwrap(),
+            "primary location must win when both primary and parent fallback exist"
+        );
     }
 
     #[test]
