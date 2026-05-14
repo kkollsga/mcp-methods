@@ -1,0 +1,74 @@
+---
+name: github_issues
+description: Methodology for the `github_issues` tool — when to FETCH vs. SEARCH vs. LIST, the compact-response model, and ElementCache drill-down via `element_id`.
+applies_to:
+  mcp_methods: ">=0.3.35"
+references_tools:
+  - github_issues
+references_arguments:
+  - github_issues.number
+  - github_issues.query
+  - github_issues.kind
+  - github_issues.state
+  - github_issues.element_id
+  - github_issues.lines
+  - github_issues.grep
+  - github_issues.refresh
+auto_inject_hint: true
+---
+
+# `github_issues` methodology
+
+`github_issues` is a *three-mode tool*: FETCH (a specific issue, PR, or discussion by number), SEARCH (free-text across the repo's issues, PRs, and discussions), and LIST (recent open items). Choosing the right mode is the difference between a one-call answer and a ten-call wild goose chase.
+
+## Mode dispatch — what triggers what
+
+- **FETCH** when `number=N` is set. Returns the full conversation for that issue/PR/discussion, with smart compaction (see below).
+- **SEARCH** when `query="..."` is set (and `number` is not). Returns a list of matches across the repo. Use this when you have a *topic* (e.g. "rate limiting", "ipv6 support") but not a number.
+- **LIST** when neither `number` nor `query` is set. Returns recent items, filtered by `state` (default "open") and `kind` (default "all"). Useful for triage and "what's been happening recently?" questions.
+
+`kind` ∈ `"issue"` / `"pr"` / `"discussion"` / `"all"` (default). Most workflows touch all three — leave it as `"all"` unless you specifically want to scope down.
+
+## FETCH compaction and `element_id` drill-down
+
+When you FETCH an issue or PR, the response collapses large content to keep the agent's context window healthy:
+
+- **Code blocks** longer than ~30 lines collapse to `[cb_N: collapsed N-line code block]`.
+- **Diff patches** in PRs collapse to `[patch_N: collapsed N-line patch]`.
+- **Long maintainer comments** keep their head + tail; long non-maintainer comments truncate harder.
+- **Bot comments** filter out by default.
+
+Each collapsed element has a stable ID (`cb_1`, `cb_2`, `patch_1`, `comment_3`, …). To drill into one:
+
+```
+github_issues(number=42, element_id="cb_1")
+```
+
+That returns *just* the named element, uncompressed. Add `lines="10-25"` to slice within a code block, or `grep="pattern"` to filter to matching lines inside it. The `comment_N` IDs work the same way.
+
+The whole-response cap is also enforced: if the FETCH itself exceeded the budget, the result ends with `element_id="overflow"` — call back with that to read the spilled tail.
+
+## SEARCH efficiency
+
+- Quote multi-word phrases: `query="\"rate limiting\""` finds the phrase, not the loose union.
+- Combine with `state`: `state="closed"` when looking for prior resolutions; `state="all"` when you want history regardless.
+- `labels="bug,help-wanted"` (comma-separated) filters server-side. Cheaper than scrolling LIST output.
+- `limit=10` (default 20) when you only need a handful of strong matches.
+
+## When `github_issues` is the wrong tool
+
+- **Reading the actual code that a PR touches?** FETCH the PR for the conversation and rationale, then use `read_source` / `grep` against the local checkout for the actual file content. Don't try to read code via the PR comments alone.
+- **Anything beyond issues/PRs/Discussions** (commits, branches, releases, repo metadata) → use `github_api`. `github_issues` is scoped to those three types.
+- **Authoring or commenting on issues** → out of scope. `github_issues` is read-only.
+
+## Common patterns
+
+- **"What's been broken lately?"**: `github_issues()` with default args (LIST recent open).
+- **"How was this handled before?"**: `github_issues(query="<topic>", state="closed")`.
+- **"Read PR 1234"**: `github_issues(number=1234)`. Then `element_id="patch_1"` for the diff.
+- **"What's in that big code block from the bug report?"**: drill via `element_id="cb_2"` with optional `lines=` / `grep=`.
+- **"Force a re-fetch"**: `refresh=true` bypasses the ElementCache (rare; use when the issue is being actively updated and you need fresh state).
+
+## Authorisation
+
+The tool is registered only when `GITHUB_TOKEN` is reachable at boot. If you don't see it in `tools/list`, the server doesn't have a token — that's a deployment issue, not a usage issue.

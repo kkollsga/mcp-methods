@@ -489,12 +489,13 @@ pub fn project_skills_dir(yaml_path: &Path) -> PathBuf {
 
 /// Return the framework's own bundled skills.
 ///
-/// Phase 1b returns an empty Vec — the actual SKILL.md files are
-/// added in Phase 1d. The function signature is stable so downstream
-/// binaries can call `.merge_framework_defaults()` against it from
-/// Phase 1b onward without rebuilding when Phase 1d lands.
+/// The five SKILL.md files are embedded at compile time via the
+/// [`bundled_skills_index`](crate::server::bundled_skills_index)
+/// submodule. Downstream binaries call this through
+/// [`Registry::merge_framework_defaults`] when they want the
+/// framework defaults at the bottom of their three-layer stack.
 pub fn library_bundled_skills() -> Vec<BundledSkill> {
-    Vec::new()
+    crate::server::bundled_skills_index::library_bundled_skills()
 }
 
 // ─── Registry builder ─────────────────────────────────────────────
@@ -1212,11 +1213,14 @@ Body.\n";
 
     #[test]
     fn registry_library_bundled_skills_returns_vec() {
-        // Phase 1b stub: empty Vec. Phase 1d populates this.
+        // Five framework defaults ship from Phase 1d onward. The
+        // exhaustive shape + uniqueness checks live in
+        // `bundled_skills_index::tests`; here we just confirm the
+        // re-export points downstream callers at the populated Vec.
         let skills = library_bundled_skills();
         assert!(
-            skills.is_empty(),
-            "Phase 1b ships with no framework bundled skills yet"
+            !skills.is_empty(),
+            "library_bundled_skills should return framework defaults from Phase 1d onward"
         );
     }
 
