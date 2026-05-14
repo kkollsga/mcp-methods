@@ -31,6 +31,7 @@
 //! their equivalent via a thin pyo3 wrapper in their own cdylib.
 
 pub mod bundled_skills_index;
+pub mod cli;
 pub mod env;
 pub mod manifest;
 pub mod runtime;

@@ -47,14 +47,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
 use mcp_methods::server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
 use mcp_methods::server::{
-    init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots, workspace, McpServer,
-    ServerOptions,
+    cli as skills_cli, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
+    workspace, McpServer, ServerOptions,
 };
 
 /// Operating mode picked from the CLI flags and the manifest's
@@ -135,6 +135,50 @@ struct Cli {
     /// Workspace mode only: auto-sweep repos idle for more than N days.
     #[arg(long = "stale-after-days", default_value_t = 7)]
     stale_after_days: u32,
+
+    /// Optional skills-related subcommand. When set, runs the named
+    /// command and exits without booting the MCP server.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Skills-related subcommands. Stay opt-in so the default invocation
+/// (`mcp-server --workspace …`) keeps its existing semantics. Clap
+/// inflects each variant to a hyphenated subcommand (e.g.
+/// `Command::SkillsLint` → `mcp-server skills-lint`); the common
+/// `Skills` prefix is intentional and visible to operators.
+#[derive(Subcommand, Debug)]
+#[allow(clippy::enum_variant_names)]
+enum Command {
+    /// Validate every SKILL.md in `path` against the framework's
+    /// schema (frontmatter, required fields, size limits). Exits 0 on
+    /// clean, 1 on any hard error.
+    SkillsLint {
+        /// Directory containing SKILL.md files.
+        path: PathBuf,
+    },
+    /// List resolved skills for a manifest. Three-layer composition
+    /// (project → domain-pack → bundled) is applied; output shows
+    /// which layer each skill came from.
+    SkillsList {
+        /// Manifest YAML path.
+        #[arg(long = "mcp-config")]
+        mcp_config: PathBuf,
+        /// Skip bundled framework defaults from the listing.
+        #[arg(long = "no-bundled")]
+        no_bundled: bool,
+    },
+    /// Print the full body of one resolved skill.
+    SkillsShow {
+        /// Manifest YAML path.
+        #[arg(long = "mcp-config")]
+        mcp_config: PathBuf,
+        /// Name of the skill to show.
+        name: String,
+        /// Skip bundled framework defaults when resolving.
+        #[arg(long = "no-bundled")]
+        no_bundled: bool,
+    },
 }
 
 fn pick_mode(cli: &Cli) -> Mode {
@@ -225,11 +269,56 @@ fn print_boot_summary(
     eprintln!("mcp-server: {}", parts.join("; "));
 }
 
+/// Dispatch a skills subcommand and return — server boot is skipped
+/// when a subcommand was supplied. Each branch prints to stdout (lint
+/// also flips the process exit code on hard errors).
+fn run_skills_command(cmd: &Command) -> Result<()> {
+    match cmd {
+        Command::SkillsLint { path } => {
+            let report = skills_cli::skills_lint(path)
+                .with_context(|| format!("skills-lint on {path:?}"))?;
+            print!("{}", report.format());
+            if report.has_errors {
+                std::process::exit(1);
+            }
+        }
+        Command::SkillsList {
+            mcp_config,
+            no_bundled,
+        } => {
+            let output = skills_cli::skills_list(mcp_config, !no_bundled)
+                .map_err(|e| anyhow::anyhow!(e))
+                .with_context(|| format!("skills-list on {mcp_config:?}"))?;
+            print!("{output}");
+        }
+        Command::SkillsShow {
+            mcp_config,
+            name,
+            no_bundled,
+        } => {
+            let output = skills_cli::skills_show(mcp_config, name, !no_bundled)
+                .map_err(|e| anyhow::anyhow!(e))
+                .with_context(|| format!("skills-show '{name}' on {mcp_config:?}"))?;
+            print!("{output}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+
+    // Skills-related subcommands short-circuit the server boot — they
+    // do their work, print, and exit. The skills helpers live in
+    // `mcp-methods::server::cli` so downstream binaries can wire the
+    // same surface into their own CLIs.
+    if let Some(cmd) = &cli.command {
+        return run_skills_command(cmd);
+    }
+
     let mut mode = pick_mode(&cli);
 
     if let Mode::SourceRoot { dir } = &mode {
