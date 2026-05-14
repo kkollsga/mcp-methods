@@ -43,6 +43,7 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "env_file",
     "workspace",
     "extensions",
+    "skills",
 ];
 const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch", "applies_to"];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
@@ -287,6 +288,50 @@ pub enum AppliesTo {
     Patterns(Vec<String>),
 }
 
+/// One source of skills declared by the manifest. Either the magic
+/// "library bundled" token (rendered as the YAML boolean `true`), or
+/// a filesystem path resolved against the manifest's parent dir.
+///
+/// Path conventions match the rest of the manifest:
+/// - `./foo` or `foo` — relative to the manifest's parent dir
+/// - `~/foo` — home-relative (POSIX `$HOME` expansion)
+/// - `/foo` — absolute
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillSource {
+    /// The compile-time bundled skills shipped with `mcp-methods` plus
+    /// any added by the downstream binary at registry-build time.
+    /// In YAML: a bare `true` token in the `skills:` list.
+    Bundled,
+    /// A filesystem path containing `*.md` skill files. Walked at
+    /// boot. Path resolution happens at registry-build time, not parse
+    /// time — `SkillSource::Path` stores the raw operator-declared
+    /// string for round-tripping through `Manifest::to_json()`.
+    Path(String),
+}
+
+/// The parsed value of the `skills:` field in the manifest.
+///
+/// Skills are opt-in. `SkillsSource::Disabled` is the default and
+/// matches verbatim-current MCP behavior: no `prompts/list`, no
+/// methodology surface, identical context cost to pre-skills
+/// deployments. Existing kglite manifests work unchanged.
+///
+/// When enabled, the [`crate::server::skills::Registry`] walks each
+/// source in declaration order, layering them against the
+/// project-local `<basename>.skills/` directory which is always
+/// auto-detected as the top-priority layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SkillsSource {
+    /// `skills: false` or no declaration. Skills disabled entirely.
+    #[default]
+    Disabled,
+    /// One or more sources, walked in declaration order at registry
+    /// build time. First-match-per-skill-name wins across the root
+    /// layer; the auto-detected project layer (`<basename>.skills/`
+    /// adjacent to the YAML) preempts the entire root layer.
+    Sources(Vec<SkillSource>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub yaml_path: PathBuf,
@@ -316,6 +361,18 @@ pub struct Manifest {
     /// letting consumers add their own configuration namespace without
     /// per-key framework round-trips.
     pub extensions: serde_json::Map<String, serde_json::Value>,
+    /// Opt-in skills declaration. `SkillsSource::Disabled` is the
+    /// default and preserves current MCP behavior (no `prompts/`
+    /// surface). When set to any non-`Disabled` value, downstream
+    /// binaries pass this to [`crate::server::skills::Registry`] for
+    /// loading + composition; the framework then exposes the
+    /// resulting skill set via `prompts/list` and `prompts/get`.
+    ///
+    /// Three-layer composition: the operator-declared sources here
+    /// form the root layer; the project-local `<basename>.skills/`
+    /// directory (auto-detected) preempts them. See
+    /// `dev-documentation/skills-aware-mcp.md` for the full design.
+    pub skills: SkillsSource,
 }
 
 impl Manifest {
@@ -386,7 +443,36 @@ impl Manifest {
                 }),
             })),
             "extensions": self.extensions,
+            "skills": self.skills_to_json(),
         })
+    }
+
+    /// JSON shape for the parsed `skills:` field. Emits the operator-
+    /// declared shape unchanged (modulo normalisation), suitable for
+    /// downstream pyo3 wrappers that need to introspect what the
+    /// manifest declared without re-running the parser.
+    ///
+    /// Phase 1a (this file) emits the raw declaration only. Phase 1b
+    /// adds a separate accessor on the resolved registry that exposes
+    /// the *post-resolution* skill list with provenance — that's the
+    /// per-skill `{path, origin, frontmatter}` shape kglite asked for
+    /// in their feedback. The two surfaces are intentionally
+    /// distinct: this method describes the manifest, the
+    /// registry method describes the runtime resolution.
+    fn skills_to_json(&self) -> serde_json::Value {
+        match &self.skills {
+            SkillsSource::Disabled => serde_json::Value::Bool(false),
+            SkillsSource::Sources(sources) => {
+                let arr: Vec<serde_json::Value> = sources
+                    .iter()
+                    .map(|s| match s {
+                        SkillSource::Bundled => serde_json::Value::Bool(true),
+                        SkillSource::Path(p) => serde_json::Value::String(p.clone()),
+                    })
+                    .collect();
+                serde_json::Value::Array(arr)
+            }
+        }
     }
 }
 
@@ -597,6 +683,7 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
     let builtins = build_builtins(raw.get("builtins"), yaml_path)?;
     let workspace = build_workspace(raw.get("workspace"), yaml_path)?;
     let extensions = build_extensions(raw.get("extensions"), yaml_path)?;
+    let skills = build_skills(raw.get("skills"), yaml_path)?;
 
     Ok(Manifest {
         yaml_path: yaml_path.to_path_buf(),
@@ -611,7 +698,91 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
         env_file: optional_str(raw, "env_file", yaml_path)?,
         workspace,
         extensions,
+        skills,
     })
+}
+
+/// Parse the polymorphic `skills:` field. Accepts:
+///
+/// - **Absent or `false`** → [`SkillsSource::Disabled`]. Pure-current
+///   MCP behavior. This is the default and what existing deployments
+///   resolve to without any YAML change.
+/// - **`skills: true`** → single bundled source. Sugar for
+///   `skills: [true]`.
+/// - **`skills: <path-string>`** → single path source. Sugar for
+///   `skills: [<path>]`.
+/// - **`skills: [bool, string, ...]`** → ordered list. Booleans MUST
+///   be `true` (the bundled marker); `false` is rejected at parse
+///   time as nonsense in list context. Each path is stored verbatim
+///   as the operator wrote it; resolution against the manifest's
+///   parent dir happens at registry-build time, not here.
+///
+/// Empty lists are accepted and parsed as `SkillsSource::Sources(vec![])`;
+/// the registry treats them as "skills opted in but no root layer,"
+/// meaning the project-local `<basename>.skills/` auto-detection
+/// still fires while the bundled + custom-path layers stay empty.
+/// Useful for operators who want to rely solely on adjacent project
+/// skills.
+fn build_skills(
+    raw: Option<&serde_yaml::Value>,
+    yaml_path: &Path,
+) -> Result<SkillsSource, ManifestError> {
+    use serde_yaml::Value;
+
+    match raw {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(SkillsSource::Disabled),
+        Some(Value::Bool(true)) => Ok(SkillsSource::Sources(vec![SkillSource::Bundled])),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                return Err(ManifestError::at(
+                    yaml_path,
+                    "skills: path must be a non-empty string",
+                ));
+            }
+            Ok(SkillsSource::Sources(vec![SkillSource::Path(s.clone())]))
+        }
+        Some(Value::Sequence(seq)) => {
+            let mut sources = Vec::with_capacity(seq.len());
+            for (idx, item) in seq.iter().enumerate() {
+                match item {
+                    Value::Bool(true) => sources.push(SkillSource::Bundled),
+                    Value::Bool(false) => {
+                        return Err(ManifestError::at(
+                            yaml_path,
+                            format!(
+                                "skills[{idx}]: `false` is not a valid entry in a `skills:` \
+                                 list (only `true` for bundled, or a path string)"
+                            ),
+                        ));
+                    }
+                    Value::String(s) => {
+                        if s.is_empty() {
+                            return Err(ManifestError::at(
+                                yaml_path,
+                                format!("skills[{idx}]: path must be a non-empty string"),
+                            ));
+                        }
+                        sources.push(SkillSource::Path(s.clone()));
+                    }
+                    _ => {
+                        return Err(ManifestError::at(
+                            yaml_path,
+                            format!(
+                                "skills[{idx}]: each entry must be `true` (for bundled) or a \
+                                 path string"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(SkillsSource::Sources(sources))
+        }
+        Some(_) => Err(ManifestError::at(
+            yaml_path,
+            "skills must be `false`, `true`, a path string, or a list of \
+             (true | path string) entries",
+        )),
+    }
 }
 
 fn build_extensions(
@@ -2057,6 +2228,7 @@ builtins:
             "env_file": null,
             "workspace": null,
             "extensions": {},
+            "skills": false,
         });
         assert_eq!(actual, expected);
     }
@@ -2103,5 +2275,132 @@ extensions:
         assert_eq!(v["tools"][1]["python"], "tools.py");
         assert_eq!(v["tools"][1]["function"], "run");
         assert_eq!(v["extensions"]["kglite"]["flavour"], "standard");
+    }
+
+    // ─── Skills schema (Phase 1a — manifest-level only) ───────────
+
+    #[test]
+    fn skills_disabled_by_default() {
+        let f = write_tmp("name: x\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.skills, SkillsSource::Disabled);
+        assert_eq!(m.to_json()["skills"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn skills_explicit_false_disabled() {
+        let f = write_tmp("name: x\nskills: false\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.skills, SkillsSource::Disabled);
+    }
+
+    #[test]
+    fn skills_bool_true_parses_to_single_bundled() {
+        let f = write_tmp("name: x\nskills: true\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.skills, SkillsSource::Sources(vec![SkillSource::Bundled]));
+        // JSON shape: list with one boolean true.
+        let v = m.to_json();
+        assert_eq!(v["skills"], serde_json::json!([true]));
+    }
+
+    #[test]
+    fn skills_path_string_parses_to_single_path() {
+        let f = write_tmp("name: x\nskills: ./local-skills/\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(
+            m.skills,
+            SkillsSource::Sources(vec![SkillSource::Path("./local-skills/".into())])
+        );
+        // JSON round-trip preserves the operator-declared path verbatim.
+        let v = m.to_json();
+        assert_eq!(v["skills"], serde_json::json!(["./local-skills/"]));
+    }
+
+    #[test]
+    fn skills_list_polymorphic_parses() {
+        let f =
+            write_tmp("name: x\nskills:\n  - true\n  - ./local-overrides/\n  - ~/shared-skills/\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(
+            m.skills,
+            SkillsSource::Sources(vec![
+                SkillSource::Bundled,
+                SkillSource::Path("./local-overrides/".into()),
+                SkillSource::Path("~/shared-skills/".into()),
+            ])
+        );
+        // JSON preserves entry types: bool for bundled, string for paths.
+        let v = m.to_json();
+        assert_eq!(
+            v["skills"],
+            serde_json::json!([true, "./local-overrides/", "~/shared-skills/"])
+        );
+    }
+
+    #[test]
+    fn skills_empty_list_parses_as_opt_in_with_no_root_sources() {
+        // Empty list means "opt in but only the auto-detected project
+        // layer fires." The registry treats this as `Sources(vec![])`,
+        // not `Disabled`. Operators relying solely on
+        // `<basename>.skills/` adjacent to the YAML use this form.
+        let f = write_tmp("name: x\nskills: []\n");
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.skills, SkillsSource::Sources(vec![]));
+    }
+
+    #[test]
+    fn skills_false_in_list_rejected() {
+        let f = write_tmp("name: x\nskills:\n  - false\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("skills[0]")
+                && err.message.contains("`false` is not a valid entry"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_invalid_type_rejected() {
+        let f = write_tmp("name: x\nskills: 42\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("skills must be"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_empty_path_string_rejected() {
+        let f = write_tmp("name: x\nskills: \"\"\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("non-empty string"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_field_is_purely_additive_on_existing_manifests() {
+        // A manifest written before the skills field existed (i.e. no
+        // `skills:` declaration) must still parse cleanly with
+        // SkillsSource::Disabled. This is the "no impact on existing
+        // MCP servers" guarantee at the schema level.
+        let f = write_tmp(
+            r#"
+name: legacy
+source_roots: [src]
+trust:
+  allow_python_tools: true
+workspace:
+  kind: github
+"#,
+        );
+        let m = load(f.path()).unwrap();
+        assert_eq!(m.skills, SkillsSource::Disabled);
+        assert_eq!(m.to_json()["skills"], serde_json::Value::Bool(false));
     }
 }
