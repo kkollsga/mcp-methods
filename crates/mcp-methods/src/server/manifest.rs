@@ -60,6 +60,10 @@ const ALLOWED_TOOL_KEYS: &[&str] = &[
     "function",
     "bundled",
     "hidden",
+    // 0.3.34: per-deployment rename for bundled tools (the bundled
+    // override block already covers `description` and `hidden`; this
+    // adds the third axis — what the agent sees in `tools/list`).
+    "rename",
 ];
 const ALLOWED_EMBEDDER_KEYS: &[&str] = &["module", "class", "kwargs"];
 const ALLOWED_BUILTIN_KEYS: &[&str] = &["save_graph", "temp_cleanup"];
@@ -165,6 +169,19 @@ pub struct BundledOverride {
     /// from `tools/list` AND reject calls to it. Defaults to
     /// false (visible).
     pub hidden: bool,
+    /// Per-deployment rename: expose the bundled tool to the agent
+    /// under this name instead of its canonical name. `None` keeps
+    /// the canonical name. Lets operators running multiple kglite
+    /// servers (each backed by a different graph) disambiguate
+    /// otherwise-identical tool surfaces — without rename, an agent
+    /// running three servers sees three copies of `cypher_query`,
+    /// each indistinguishable in ToolSearch results. With rename,
+    /// the same servers can expose `legal_cypher_query`,
+    /// `prospect_cypher_query`, `open_source_cypher_query`.
+    /// Must be a valid identifier (`^[a-zA-Z_][a-zA-Z0-9_]*$`);
+    /// validation against duplicates across the manifest's tools is
+    /// the downstream consumer's responsibility.
+    pub rename: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +361,7 @@ impl Manifest {
                     "name": b.name,
                     "description": b.description,
                     "hidden": b.hidden,
+                    "rename": b.rename,
                 }),
             }).collect::<Vec<_>>(),
             "embedder": self.embedder.as_ref().map(|e| serde_json::json!({
@@ -1060,7 +1078,7 @@ fn build_bundled_override(
                 yaml_path,
                 format!(
                     "tools[{idx}] bundled override {name:?} cannot set `{forbidden}:` \
-                     (only `description:` and `hidden:` are permitted on overrides)"
+                     (only `description:`, `hidden:`, and `rename:` are permitted on overrides)"
                 ),
             ));
         }
@@ -1088,10 +1106,37 @@ fn build_bundled_override(
         }
     };
 
+    // 0.3.34: optional per-deployment rename. Validated as an
+    // identifier here; cross-tool collision check is the consumer's
+    // job (it knows what other names — bundled, cypher, python — it
+    // has in scope).
+    let rename = match map.get("rename") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) => {
+            if !valid_identifier(s) {
+                return Err(ManifestError::at(
+                    yaml_path,
+                    format!(
+                        "tools[{idx}] bundled override {name:?}.rename must be a valid identifier \
+                         (^[a-zA-Z_][a-zA-Z0-9_]*$), got {s:?}"
+                    ),
+                ));
+            }
+            Some(s.clone())
+        }
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!("tools[{idx}] bundled override {name:?}.rename must be a string"),
+            ))
+        }
+    };
+
     Ok(ToolSpec::Bundled(BundledOverride {
         name,
         description,
         hidden,
+        rename,
     }))
 }
 
@@ -1452,6 +1497,87 @@ mod tests {
             err.message.contains("must be a string"),
             "got: {}",
             err.message
+        );
+    }
+
+    // 0.3.34 — `tools[].bundled: rename:` per-deployment override
+    #[test]
+    fn bundled_rename_parses_when_valid_identifier() {
+        let f = write_tmp("tools:\n  - bundled: cypher_query\n    rename: legal_cypher_query\n");
+        let m = load(f.path()).unwrap();
+        match &m.tools[0] {
+            ToolSpec::Bundled(b) => {
+                assert_eq!(b.name, "cypher_query");
+                assert_eq!(b.rename.as_deref(), Some("legal_cypher_query"));
+                assert!(!b.hidden);
+                assert!(b.description.is_none());
+            }
+            _ => panic!("expected bundled override"),
+        }
+    }
+
+    #[test]
+    fn bundled_rename_alongside_description_parses() {
+        let f = write_tmp(
+            "tools:\n  - bundled: cypher_query\n    rename: legal_cypher_query\n    description: \"Legal-corpus cypher\"\n",
+        );
+        let m = load(f.path()).unwrap();
+        match &m.tools[0] {
+            ToolSpec::Bundled(b) => {
+                assert_eq!(b.rename.as_deref(), Some("legal_cypher_query"));
+                assert_eq!(b.description.as_deref(), Some("Legal-corpus cypher"));
+            }
+            _ => panic!("expected bundled override"),
+        }
+    }
+
+    #[test]
+    fn bundled_rename_defaults_to_none() {
+        let f = write_tmp("tools:\n  - bundled: cypher_query\n    description: \"x\"\n");
+        let m = load(f.path()).unwrap();
+        match &m.tools[0] {
+            ToolSpec::Bundled(b) => assert!(b.rename.is_none()),
+            _ => panic!("expected bundled override"),
+        }
+    }
+
+    #[test]
+    fn rejects_bundled_rename_with_invalid_identifier() {
+        let f = write_tmp("tools:\n  - bundled: cypher_query\n    rename: \"123-bad\"\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("rename must be a valid identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_bundled_rename_with_non_string_value() {
+        let f = write_tmp("tools:\n  - bundled: cypher_query\n    rename: 42\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("rename must be a string"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn bundled_rename_serialises_to_json() {
+        let f = write_tmp("tools:\n  - bundled: cypher_query\n    rename: legal_cypher_query\n");
+        let m = load(f.path()).unwrap();
+        let json = m.to_json();
+        let tools = json.get("tools").and_then(|t| t.as_array()).unwrap();
+        let entry = &tools[0];
+        assert_eq!(entry.get("kind").and_then(|v| v.as_str()), Some("bundled"));
+        assert_eq!(
+            entry.get("name").and_then(|v| v.as_str()),
+            Some("cypher_query")
+        );
+        assert_eq!(
+            entry.get("rename").and_then(|v| v.as_str()),
+            Some("legal_cypher_query")
         );
     }
 

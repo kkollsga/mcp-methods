@@ -1,5 +1,115 @@
 # Changelog
 
+## 0.3.34 — 2026-05-14
+
+### Added — `tools[].bundled: rename:` per-deployment tool aliasing
+
+The bundled-override shape from 0.3.31 gains a third axis:
+
+```yaml
+tools:
+  - bundled: cypher_query
+    rename: legal_cypher_query           # expose to agent under a different name
+    description: "Cypher against the legal corpus knowledge graph."
+  - bundled: graph_overview
+    rename: legal_graph_overview
+  - bundled: ping
+    hidden: true
+```
+
+Use case: when an operator runs multiple downstream servers each
+backed by a different data source (e.g. three kglite-mcp-servers
+for `open_source`, `legal`, `prospect`), the bundled tool names
+collide across servers and MCP `ToolSearch` results rank them
+near-identically. The agent can't disambiguate which `cypher_query`
+to use. Rename lets each deployment expose distinct names —
+`open_source_cypher_query`, `legal_cypher_query`,
+`prospect_cypher_query` — so search ranking and tool selection
+behave correctly.
+
+The rename composes with the existing `description:` and `hidden:`
+axes; an override can use any combination.
+
+### Schema
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `rename:` | string | unset | Replaces the bundled tool's agent-facing name. Must be a valid identifier (`^[a-zA-Z_][a-zA-Z0-9_]*$`). `None` means "keep the original bundled name." |
+
+Permitted alongside `bundled:`, `description:`, `hidden:`. Forbidden
+on tool-creation (`cypher:` / `python:`) entries — the override-only
+constraint from 0.3.31 still applies.
+
+### Framework records, consumer enforces
+
+The framework parses `rename:` and surfaces it via `BundledOverride.rename`
+and `Manifest::to_json()`. It does **not** validate that the renamed
+name collides with another tool (bundled, cypher, or python) in the
+manifest — the framework doesn't know the downstream binary's full
+bundled-tool catalogue, so collision detection has to live in the
+consumer.
+
+The kglite consumer landing in 0.9.30 does this check at boot:
+"rename doesn't shadow any other registered tool" → exit cleanly
+with a clear error if it does. Same pattern as advisory trust
+gates: framework declares, consumer enforces.
+
+### JSON shape addition
+
+`Manifest::to_json()` emits the new field on bundled entries:
+
+```json
+{
+  "kind": "bundled",
+  "name": "cypher_query",
+  "rename": "legal_cypher_query",   // null when not declared
+  "description": "...",
+  "hidden": false
+}
+```
+
+Non-breaking under the existing JSON-shape stability guarantee —
+consumers that ignore unknown keys keep working; consumers that
+want rename support match on the `rename` key.
+
+### Rust API change (heads up)
+
+`BundledOverride` struct gains a `rename: Option<String>` field.
+Consumers destructuring this struct will get a compile error and
+need to handle the new field:
+
+```rust
+// Before 0.3.34
+let BundledOverride { name, description, hidden } = &override_spec;
+// After 0.3.34 — compile error: field `rename` missing
+let BundledOverride { name, description, hidden, rename } = &override_spec;
+```
+
+Non-exhaustive struct attribute isn't applied — additions remain
+visible at consumer-build time, which is the right failure mode
+for adding new fields to a public struct.
+
+### Tests
+
+Six new tests in `manifest.rs::tests` under the `bundled_*` family:
+
+- `bundled_rename_parses_when_valid_identifier` — happy path
+- `bundled_rename_alongside_description_parses` — composes with `description:`
+- `bundled_rename_defaults_to_none` — omitting `rename:` produces None
+- `rejects_bundled_rename_with_invalid_identifier` — `123-bad` rejected
+- `rejects_bundled_rename_with_non_string_value` — `42` rejected
+- `bundled_rename_serialises_to_json` — JSON shape addition verified
+
+123 mcp-methods unit tests pass (was 117 at 0.3.33; +6 net). 7
+deployed_manifests + 7 mcp-server tests unchanged.
+
+### Origin
+
+Reported by the mcp-servers operator's post-0.9.29 ToolSearch audit:
+multiple kglite servers with identical tool surfaces caused ranking
+ambiguity. kglite implemented the framework half and pushed it to
+this tree; reviewed, no design changes needed.
+
 ## 0.3.33 — 2026-05-14
 
 ### Changed — `workspace.applies_to` now accepts glob patterns + lists
