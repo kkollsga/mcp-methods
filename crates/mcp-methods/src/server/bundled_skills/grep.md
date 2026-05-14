@@ -14,7 +14,19 @@ auto_inject_hint: true
 
 # `grep` methodology
 
-`grep` runs a regex across the configured source roots and returns line-level matches. It is the *broad sweep* tool — use it when you don't yet know which file holds what you're looking for. Once you've narrowed to a specific file, switch to `read_source` for slices and `list_source` for directory layout.
+## Overview
+
+`grep` runs a regex across the configured source roots and returns line-level matches. It is the **broad sweep** tool — use it when you don't yet know which file holds what you're looking for. Once you've narrowed to a specific file, switch to `read_source` for slices and `list_source` for directory layout.
+
+## Quick Reference
+
+| Task | Approach |
+|---|---|
+| Find a function definition | `pattern: "fn foo\\b\|def foo\\b"`, glob the language |
+| Find call sites of a known function | `pattern: "\\bfoo\\("` — word boundary plus opening paren |
+| Find every error path | `pattern: "return Err\\("`, glob to the module |
+| Trim a huge match set | Add `glob: "src/**/*.rs"` or `glob: "!vendor/**"` |
+| Hit `max_results` cap | Tighten the pattern — don't raise the cap blindly |
 
 ## Choosing a good pattern
 
@@ -41,6 +53,18 @@ Negation patterns matter: large repos have generated code, vendored deps, and lo
 1. Pick the most specific match (best file path, most unique line).
 2. Open it with `read_source(file_path, start_line=…, end_line=…)`. Choose a window that covers the match plus 10-20 lines on each side.
 3. If you need more context, expand the window. Don't re-grep with a slightly different pattern when you already know the line.
+
+## Common Pitfalls
+
+❌ Running `grep` with a generic pattern and getting 200+ matches → tighten the regex, don't read everything.
+
+❌ Re-grepping with slightly different patterns when you've already found the file → switch to `read_source` and expand the window.
+
+❌ Searching for `Foo` when you mean the function call `Foo()` — add the parens; word boundaries alone won't help.
+
+✅ Glob early. A 10-character glob saves the agent from reading 100 KB of vendored junk.
+
+✅ Reach for `cypher_query` (or your domain's graph tool) when the question is structural. Grep is text-only.
 
 ## When `grep` is the wrong tool
 

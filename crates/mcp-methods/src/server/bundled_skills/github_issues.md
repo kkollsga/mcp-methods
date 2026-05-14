@@ -19,7 +19,46 @@ auto_inject_hint: true
 
 # `github_issues` methodology
 
-`github_issues` is a *three-mode tool*: FETCH (a specific issue, PR, or discussion by number), SEARCH (free-text across the repo's issues, PRs, and discussions), and LIST (recent open items). Choosing the right mode is the difference between a one-call answer and a ten-call wild goose chase.
+## Overview
+
+`github_issues` is a **three-mode tool**: FETCH (a specific issue, PR, or discussion by number), SEARCH (free-text across the repo's issues, PRs, and discussions), and LIST (recent open items). Choosing the right mode is the difference between a one-call answer and a ten-call wild goose chase.
+
+## Quick Reference
+
+| Task | Approach |
+|---|---|
+| "Read PR 1234" / "show issue #42" | FETCH: `number=N`. Then `element_id="patch_1"` for the diff. |
+| "What's been broken lately?" | LIST: no args, defaults to `state="open"`, `kind="all"`. |
+| "How was this handled before?" | SEARCH: `query="<topic>", state="closed"`. |
+| "Anything tagged `bug` and `help-wanted`?" | LIST or SEARCH with `labels="bug,help-wanted"`. |
+| Drill into a collapsed code block | FETCH again with `element_id="cb_1"`, optional `lines=` / `grep=`. |
+| Output got truncated | FETCH again with `element_id="overflow"` for the spilled tail. |
+| Bypass the ElementCache | `refresh=true` (rare — use when the issue is actively updated). |
+
+## Mode dispatch — decision tree
+
+```
+What do you want?
+
+1. A specific issue/PR/discussion you already have a number for?
+   └── FETCH: github_issues(number=N).
+       Optional: kind="pr" if you want only PRs and ambiguity is possible.
+
+2. To search by topic / keyword?
+   └── SEARCH: github_issues(query="rate limiting", state="closed").
+       Quote multi-word phrases. Use state="all" if recency matters
+       less than completeness.
+
+3. To browse recent open items (triage, "what's happening"?)
+   └── LIST: github_issues() — no args.
+       Narrow with kind="pr" or labels="..." when you know what
+       you're after.
+
+4. You FETCHed something and the response had [cb_N] / [patch_N]
+   / [comment_N] / element_id="overflow" markers?
+   └── Drill: github_issues(number=N, element_id="cb_1",
+                            lines="10-25", grep="...").
+```
 
 ## Mode dispatch — what triggers what
 
@@ -54,6 +93,20 @@ The whole-response cap is also enforced: if the FETCH itself exceeded the budget
 - Combine with `state`: `state="closed"` when looking for prior resolutions; `state="all"` when you want history regardless.
 - `labels="bug,help-wanted"` (comma-separated) filters server-side. Cheaper than scrolling LIST output.
 - `limit=10` (default 20) when you only need a handful of strong matches.
+
+## Common Pitfalls
+
+❌ Calling `github_issues(query="...")` *and* `number=N` in the same call → `number` wins; SEARCH is silently ignored.
+
+❌ Reading the actual code a PR touches via the PR comments → use `read_source` / `grep` against the local checkout. The PR tells you *why*; the code tells you *what*.
+
+❌ Treating `[cb_3]` as the answer — it's a marker. Drill with `element_id="cb_3"` to get the actual content.
+
+❌ Re-FETCHing the same issue between drills → the ElementCache already has it. Drills are cheap; the only reason to refresh is when the upstream issue has changed.
+
+✅ FETCH once, drill many times. The cache is per-issue and survives across `element_id=` calls.
+
+✅ When SEARCH returns nothing, broaden the query before broadening the state filter — closed issues are usually irrelevant noise unless the topic is historical.
 
 ## When `github_issues` is the wrong tool
 

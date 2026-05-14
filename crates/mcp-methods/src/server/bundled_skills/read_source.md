@@ -17,7 +17,19 @@ auto_inject_hint: true
 
 # `read_source` methodology
 
-`read_source` reads a file from the configured source root(s), with optional line slicing and in-file regex filtering. It is the *focused read* tool — once `grep` or a graph query has pointed you at a specific file, use this to pull the actual content.
+## Overview
+
+`read_source` reads a file from the configured source root(s), with optional line slicing and in-file regex filtering. It is the **focused read** tool — once `grep` or a graph query has pointed you at a specific file, use this to pull the actual content.
+
+## Quick Reference
+
+| Task | Approach |
+|---|---|
+| Read a small whole file | `file_path: "src/lib.rs"` — anything under ~300 lines is fine whole |
+| Read around a known line | `file_path, start_line=120, end_line=170` — N±20 lines window |
+| Read a function whose name you know | Locate with `grep` or a graph query first, then read the window |
+| Filter a large file to a pattern | `grep="impl Display", grep_context=5` |
+| Path traversal rejected | The root binding is wrong, not the path; ask, don't work around |
 
 ## Path semantics
 
@@ -48,6 +60,18 @@ Use this when the file is large and you only need the methodology-relevant parts
 
 - `max_chars` caps the returned content. Default is generous; you rarely need to set it. When you do, prefer narrowing `start_line`/`end_line` first — clipping at `max_chars` mid-content is a worse experience than reading the right window.
 - `max_matches` caps grep-matched lines (when `grep=` is set). Same logic: tighten the regex before tightening the cap.
+
+## Common Pitfalls
+
+❌ Pulling the whole file when you only need 20 lines around a match — wasteful of the agent's context.
+
+❌ Passing absolute paths or `../` to escape the configured root — the framework rejects them, and trying to work around the rejection means the root binding is wrong (server-config issue, not a read issue).
+
+❌ Calling `read_source` to "find" something — that's `grep`'s job. `read_source` shows you what's at a known path.
+
+✅ Read once, expand if needed. A tight window then a wider one beats reading the whole file speculatively.
+
+✅ When in doubt about the file's size, slice first. You can always expand; you can't un-read 2000 lines.
 
 ## When `read_source` is the wrong tool
 

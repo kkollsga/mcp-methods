@@ -15,9 +15,11 @@ auto_inject_hint: true
 
 # `repo_management` methodology
 
-`repo_management` is the workspace-mode control surface: it clones GitHub repos into a workspace directory, swaps which repo is currently active, updates clones to latest, and tears them down on a TTL. It's only registered when the server is started in workspace mode — `tools/list` will not include it otherwise.
+## Overview
 
-## Actions at a glance
+`repo_management` is the workspace-mode control surface: it clones GitHub repos into a workspace directory, swaps which repo is currently active, updates clones to latest, and tears them down on a TTL. It's only registered when the server is started in workspace mode (`--workspace DIR` with `kind: github`); `tools/list` won't include it otherwise.
+
+## Quick Reference
 
 | Action | Effect |
 |---|---|
@@ -59,6 +61,20 @@ The workspace's `expire_days` setting controls when inactive clones get cleaned 
 - **What do I have?**: `repo_management(action="list")` — returns the inventory.
 - **Drop a clone**: `repo_management(action="delete", name="org/repo")`. Reclaims disk; removes from inventory.
 - **Stale graph despite same git state**: `repo_management(action="force_rebuild", name="org/repo")`. Bypasses the SHA gate.
+
+## Common Pitfalls
+
+❌ Calling `force_rebuild` to "just be sure" — it bypasses the SHA gate and re-runs the post-activate hook. Use `update` first; only force-rebuild when git state matches but derived state is genuinely stale.
+
+❌ Calling `delete` on the active repo and expecting the next tool call to "just work" — the source tools return "no active source" until a new `set` happens.
+
+❌ Trying to `set` a path on disk that isn't a GitHub repo → that's `set_root_dir` in a local-mode workspace, not `repo_management`.
+
+❌ Using `repo_management(action="update")` when you really wanted to read the latest code → `update` pulls *and* re-runs the hook; if you just want to peek at HEAD, fetch the file via `github_api` instead.
+
+✅ `set` then `update` is the standard flow. The SHA-gate makes `update` cheap when nothing has changed.
+
+✅ `list` is free and idempotent — call it whenever you've lost track of what's bound or what's been touched recently.
 
 ## When `repo_management` is the wrong tool
 

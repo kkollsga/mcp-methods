@@ -13,7 +13,19 @@ auto_inject_hint: true
 
 # `list_source` methodology
 
-`list_source` returns a tree-formatted directory listing under the configured source root(s). It is the *layout discovery* tool — use it when you need to see how a repository is organised before deciding where to look.
+## Overview
+
+`list_source` returns a tree-formatted directory listing under the configured source root(s). It is the **layout discovery** tool — use it when you need to see how a repository is organised before deciding where to look.
+
+## Quick Reference
+
+| Task | Approach |
+|---|---|
+| Top-level survey of a new repo | `path: "."` with default `depth: 1` |
+| Drill into source / crates | `path: "src/"` or `"crates/"`, `depth: 2` |
+| Confirm a path exists | `path: "docs/guides/"` with `depth: 0` |
+| Spot conventions (monorepo, tests, migrations) | Top-level survey + skim the directory names |
+| Avoid noise from `node_modules`/`target` | Don't list those directly; drill into a subset |
 
 ## When to reach for `list_source`
 
@@ -40,6 +52,18 @@ auto_inject_hint: true
 - **Documentation directories** (`docs/`, `book/`, `dev-documentation/`) — operator-facing context often lives here.
 
 If a directory contains hundreds of entries (vendored deps, generated code, lockfiles), the listing will be long. Consider drilling into a subset rather than reading the full tree at depth 2+ of a `node_modules/` or `target/`.
+
+## Common Pitfalls
+
+❌ Running `list_source` on `node_modules/`, `target/`, or `vendor/` — these have thousands of entries and the listing is unreadable.
+
+❌ Running `depth: 3+` on the repo root — most repos at that depth produce more noise than signal. Drill into a specific subdir instead.
+
+❌ Using `list_source` to find a known file by name — that's a job for `grep` (pattern-by-filename) or, if you really do mean directory layout, `list_source` on the suspected parent.
+
+✅ Survey first, drill second. One `path: "."` call tells you the shape; subsequent calls go where the shape pointed you.
+
+✅ When a path doesn't exist (typo, wrong convention), `list_source` is the cheapest probe. Pass `depth: 0` to just check existence.
 
 ## When `list_source` is the wrong tool
 
