@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.35 — unreleased
+## 0.3.35 — 2026-05-14
 
 ### Added — skills-aware MCP via the `prompts/` namespace
 
