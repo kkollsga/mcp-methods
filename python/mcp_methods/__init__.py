@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from mcp_methods._mcp_methods import (
     ElementCache,
+    Skill,
+    SkillRegistry,
     collapse_code_blocks,
     compact_discussion,
     compact_text,
@@ -103,6 +105,8 @@ __all__ = [
     "has_git_token",
     "detect_git_repo",
     "ElementCache",
+    "Skill",
+    "SkillRegistry",
     # Python
     "timed",
     "load_env",

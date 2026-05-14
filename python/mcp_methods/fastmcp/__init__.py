@@ -34,12 +34,14 @@ from ._csv_http import serve_csv_via_http
 from ._cypher import register_cypher_query
 from ._overview import register_overview
 from ._save import register_save_graph
+from ._skills import register_skills_as_prompts
 from ._source import register_source_tools
 
 __all__ = [
     "register_cypher_query",
     "register_overview",
     "register_save_graph",
+    "register_skills_as_prompts",
     "register_source_tools",
     "serve_csv_via_http",
 ]

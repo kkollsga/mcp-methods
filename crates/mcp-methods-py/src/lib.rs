@@ -11,6 +11,8 @@
 //! `pyo3/abi3-py310` feature collapses the per-Python-version wheel
 //! matrix to a single abi3 wheel per OS.
 
+use std::path::PathBuf;
+
 use mcp_methods::cache::ElementCache as CoreCache;
 use mcp_methods::files::{read_file as core_read_file, ReadFileOpts};
 use mcp_methods::grep::{
@@ -18,6 +20,10 @@ use mcp_methods::grep::{
 };
 use mcp_methods::json_grep::ripgrep_json_fields as core_ripgrep_json_fields;
 use mcp_methods::list_dir::{list_dir as core_list_dir, ListDirOpts};
+use mcp_methods::server::skills::{
+    Registry as SkillsRegistry, ResolvedRegistry as CoreResolvedRegistry, Skill as CoreSkill,
+};
+use mcp_methods::server::{find_sibling_manifest, load_manifest};
 use mcp_methods::{compact, git_refs, github, html};
 
 use pyo3::exceptions::PyValueError;
@@ -482,6 +488,179 @@ fn list_dir(
 }
 
 // ---------------------------------------------------------------------------
+// Skills — `#[pyclass]` thin wrappers around `ResolvedRegistry` / `Skill`
+// ---------------------------------------------------------------------------
+
+/// A single resolved skill — frontmatter metadata plus the markdown body.
+/// Python consumers (FastMCP authors) read these off a [`SkillRegistry`]
+/// and register them as prompts on whatever server they're hosting.
+#[pyclass(name = "Skill", skip_from_py_object)]
+#[derive(Clone)]
+struct PySkill {
+    name: String,
+    description: String,
+    body: String,
+    provenance: String,
+    auto_inject_hint: bool,
+    references_tools: Vec<String>,
+}
+
+impl PySkill {
+    fn from_core(skill: &CoreSkill) -> Self {
+        use mcp_methods::server::SkillProvenance;
+        let provenance = match &skill.provenance {
+            SkillProvenance::Project => "project".to_string(),
+            SkillProvenance::DomainPack(path) => {
+                format!("domain_pack:{}", path.display())
+            }
+            SkillProvenance::Bundled => "bundled".to_string(),
+        };
+        Self {
+            name: skill.name().to_string(),
+            description: skill.description().to_string(),
+            body: skill.body.clone(),
+            provenance,
+            auto_inject_hint: skill.frontmatter.auto_inject_hint,
+            references_tools: skill.frontmatter.references_tools.clone(),
+        }
+    }
+}
+
+#[pymethods]
+impl PySkill {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    #[getter]
+    fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Where the skill came from — one of:
+    /// - `"project"` — auto-detected `<basename>.skills/` adjacent to the manifest.
+    /// - `"domain_pack:<path>"` — operator-declared path from the manifest's `skills:` list.
+    /// - `"bundled"` — compile-time bundled (framework or downstream binary).
+    #[getter]
+    fn provenance(&self) -> &str {
+        &self.provenance
+    }
+
+    #[getter]
+    fn auto_inject_hint(&self) -> bool {
+        self.auto_inject_hint
+    }
+
+    #[getter]
+    fn references_tools(&self) -> Vec<String> {
+        self.references_tools.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Skill(name='{}', provenance='{}', body_bytes={})",
+            self.name,
+            self.provenance,
+            self.body.len()
+        )
+    }
+}
+
+/// Resolved skill set — the output of three-layer composition
+/// (project → domain pack → bundled). Construct via
+/// [`SkillRegistry.from_manifest`] for the common path; downstream
+/// binaries with more bespoke layering should call into the Rust
+/// `Registry` builder via their own pyo3 wrappers.
+#[pyclass(name = "SkillRegistry")]
+struct PySkillRegistry {
+    inner: CoreResolvedRegistry,
+}
+
+#[pymethods]
+impl PySkillRegistry {
+    /// Build a registry from a manifest YAML file.
+    ///
+    /// Walks the manifest's `skills:` declaration (auto-detected
+    /// `<basename>.skills/` project layer, operator-declared paths,
+    /// optional bundled framework defaults) and returns the resolved
+    /// set. Pass `include_bundled=False` to skip framework defaults
+    /// — useful for tests or when a downstream binary supplies its
+    /// own bundled layer.
+    #[staticmethod]
+    #[pyo3(signature = (manifest_path, *, include_bundled=true))]
+    fn from_manifest(manifest_path: PathBuf, include_bundled: bool) -> PyResult<Self> {
+        let manifest = load_manifest(&manifest_path)
+            .map_err(|e| PyValueError::new_err(format!("manifest load failed: {e}")))?;
+        let mut builder = SkillsRegistry::new();
+        if include_bundled {
+            builder = builder.merge_framework_defaults();
+        }
+        builder = builder.auto_detect_project_layer(&manifest_path);
+        builder = builder
+            .layer_dirs(&manifest.skills, &manifest_path)
+            .map_err(|e| PyValueError::new_err(format!("skill layer load failed: {e}")))?;
+        let resolved = builder
+            .finalise()
+            .map_err(|e| PyValueError::new_err(format!("skill registry finalise failed: {e}")))?;
+        Ok(Self { inner: resolved })
+    }
+
+    /// Resolve a manifest path from a graph/data path the way the
+    /// `mcp-server` binary does — given e.g. `/path/foo.kdb`, looks
+    /// for `/path/foo_mcp.yaml` and returns it if present, or raises
+    /// `ValueError` if no sibling exists.
+    #[staticmethod]
+    fn find_sibling(graph_path: PathBuf) -> PyResult<PathBuf> {
+        find_sibling_manifest(&graph_path).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "no sibling `<stem>_mcp.yaml` found next to {}",
+                graph_path.display()
+            ))
+        })
+    }
+
+    /// All resolved skill names, sorted alphabetically.
+    fn skill_names(&self) -> Vec<String> {
+        self.inner.skill_names()
+    }
+
+    /// Look up a single skill by name. Returns `None` if no skill
+    /// of that name was resolved.
+    fn get(&self, name: &str) -> Option<PySkill> {
+        self.inner.get(name).map(PySkill::from_core)
+    }
+
+    /// Iterate every resolved skill. Order matches `skill_names()`
+    /// (alphabetical) so output is stable.
+    fn skills(&self) -> Vec<PySkill> {
+        self.inner
+            .skill_names()
+            .iter()
+            .filter_map(|name| self.inner.get(name))
+            .map(PySkill::from_core)
+            .collect()
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __contains__(&self, name: &str) -> bool {
+        self.inner.get(name).is_some()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SkillRegistry(skills={})", self.inner.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module init
 // ---------------------------------------------------------------------------
 
@@ -512,5 +691,8 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(github_issues, m)?)?;
     // cache
     m.add_class::<PyElementCache>()?;
+    // skills
+    m.add_class::<PySkill>()?;
+    m.add_class::<PySkillRegistry>()?;
     Ok(())
 }

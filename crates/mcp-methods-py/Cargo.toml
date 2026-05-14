@@ -12,7 +12,13 @@ name = "_mcp_methods"
 crate-type = ["cdylib"]
 
 [dependencies]
-mcp-methods = { path = "../mcp-methods", default-features = false }
+# Pulls in the `server` feature so the pyo3 layer can wrap the
+# manifest parser and skills registry. The `mcp-methods` crate itself
+# stays pyo3-free (CI gate: `cargo tree -p mcp-methods -e all | grep
+# pyo3` returns empty); the heavier server-side deps (rmcp, tokio)
+# compile in here but are largely dead-code-eliminated since the
+# Python wrappers don't call into them.
+mcp-methods = { path = "../mcp-methods", default-features = false, features = ["server"] }
 # `auto-initialize` for the rare case the cdylib is embedded somewhere
 # without a Python parent; `extension-module` for the wheel build path
 # (Python loads the .so, libpython stays unlinked). `abi3-py310`
