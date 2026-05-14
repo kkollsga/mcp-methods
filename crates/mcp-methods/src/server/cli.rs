@@ -17,9 +17,12 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use std::path::PathBuf;
+
 use crate::server::manifest::load as load_manifest;
 use crate::server::skills::{
-    load_skill_from_file, Registry, ResolvedRegistry, Skill, SkillError, SkillProvenance,
+    load_skill_from_file, write_skill_template, Registry, ResolvedRegistry, Skill, SkillError,
+    SkillProvenance,
 };
 
 /// Result of [`skills_lint`] — a one-line report per file and a
@@ -133,6 +136,29 @@ pub fn skills_lint(dir: &Path) -> Result<LintReport, SkillError> {
 pub fn skills_list(manifest_path: &Path, include_bundled: bool) -> Result<String, String> {
     let registry = build_registry(manifest_path, include_bundled)?;
     Ok(format_skill_list(&registry))
+}
+
+/// Scaffold a starter SKILL.md at `dest` and return the resolved
+/// path written. Thin wrapper around
+/// [`write_skill_template`](crate::server::skills::write_skill_template)
+/// that bubbles errors as `String` for symmetric handling alongside
+/// [`skills_list`] / [`skills_show`].
+///
+/// `description` is required — Anthropic's published guidance is that
+/// skills with weak descriptions undertrigger badly, so the template
+/// makes the operator commit to one rather than leaving a `<TODO>`
+/// placeholder in the discovery-critical field.
+pub fn skills_new(dest: &Path, name: &str, description: &str) -> Result<PathBuf, String> {
+    if name.trim().is_empty() {
+        return Err("skill name must not be empty".to_string());
+    }
+    if description.trim().is_empty() {
+        return Err(
+            "description must not be empty — it's the agent's only signal for triggering"
+                .to_string(),
+        );
+    }
+    write_skill_template(dest, name, description).map_err(|e| format!("template write failed: {e}"))
 }
 
 /// Look up a single skill by name and return its full body, prefixed
@@ -322,5 +348,38 @@ mod tests {
         fs::write(&manifest, "name: t\n").unwrap();
         let output = skills_list(&manifest, false).unwrap();
         assert!(output.contains("no skills resolved"));
+    }
+
+    #[test]
+    fn skills_new_scaffolds_into_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = skills_new(dir.path(), "custom", "A short description.").unwrap();
+        assert_eq!(dest, dir.path().join("custom.md"));
+        let content = fs::read_to_string(&dest).unwrap();
+        assert!(content.contains("name: custom"));
+        assert!(content.contains("# `custom` methodology"));
+    }
+
+    #[test]
+    fn skills_new_rejects_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = skills_new(dir.path(), "", "A description.").unwrap_err();
+        assert!(err.contains("name must not be empty"));
+    }
+
+    #[test]
+    fn skills_new_rejects_empty_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = skills_new(dir.path(), "custom", "   ").unwrap_err();
+        assert!(err.contains("description must not be empty"));
+    }
+
+    #[test]
+    fn skills_new_bubbles_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-create the file to trigger the AlreadyExists branch.
+        fs::write(dir.path().join("custom.md"), "x").unwrap();
+        let err = skills_new(dir.path(), "custom", "description").unwrap_err();
+        assert!(err.contains("template write failed"));
     }
 }

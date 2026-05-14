@@ -179,6 +179,22 @@ enum Command {
         #[arg(long = "no-bundled")]
         no_bundled: bool,
     },
+    /// Scaffold a starter SKILL.md at the chosen destination. If
+    /// `dest` is a directory (existing or to-be-created), the file
+    /// is written to `<dest>/<name>.md`. If `dest` ends in `.md`,
+    /// it is used verbatim. Refuses to overwrite an existing file.
+    SkillsNew {
+        /// Destination directory or explicit `.md` path.
+        dest: PathBuf,
+        /// Skill name. Becomes the lookup key for `prompts/get` and
+        /// the filename when `dest` is a directory.
+        name: String,
+        /// Description shown in `prompts/list`. Required — the agent's
+        /// only signal for triggering. Aim for 80-140 words with
+        /// explicit TRIGGER / SKIP language; see the
+        /// writing-effective-skills guide.
+        description: String,
+    },
 }
 
 fn pick_mode(cli: &Cli) -> Mode {
@@ -300,6 +316,16 @@ fn run_skills_command(cmd: &Command) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))
                 .with_context(|| format!("skills-show '{name}' on {mcp_config:?}"))?;
             print!("{output}");
+        }
+        Command::SkillsNew {
+            dest,
+            name,
+            description,
+        } => {
+            let written = skills_cli::skills_new(dest, name, description)
+                .map_err(|e| anyhow::anyhow!(e))
+                .with_context(|| format!("skills-new '{name}' at {dest:?}"))?;
+            println!("Wrote starter skill to {}", written.display());
         }
     }
     Ok(())

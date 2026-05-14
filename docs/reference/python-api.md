@@ -130,6 +130,25 @@ len(reg)                # → int
 "grep" in reg           # → bool
 ```
 
+### `render_skill_template(name, description) -> str`
+
+Returns a starter SKILL.md body as a string, with `name` and `description` filled into the frontmatter and the rest of the optional extension fields emitted as YAML comments. Body follows the anatomy from [Writing Effective Skills](../guides/writing-effective-skills.md).
+
+### `write_skill_template(dest, name, description) -> Path`
+
+Writes a starter SKILL.md to `dest` and returns the resolved path. `dest` can be an existing directory (file lands at `dest/<name>.md`), an explicit `.md` path (used verbatim), or a not-yet-existing directory (created along with parents). Refuses to overwrite existing files — raises `ValueError`.
+
+```python
+from mcp_methods import write_skill_template
+
+path = write_skill_template(
+    "./my_mcp.skills/",
+    name="cypher_query",
+    description="Cypher patterns for graph traversal. TRIGGER when ...",
+)
+print(f"scaffolded {path}")
+```
+
 ### `Skill`
 
 Single resolved skill. Read-only attributes:

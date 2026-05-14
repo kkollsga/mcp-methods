@@ -498,6 +498,127 @@ pub fn library_bundled_skills() -> Vec<BundledSkill> {
     crate::server::bundled_skills_index::library_bundled_skills()
 }
 
+// ─── Authoring template ───────────────────────────────────────────
+
+/// Render a starter SKILL.md body as a string.
+///
+/// The returned text is a complete, parse-valid SKILL.md file with
+/// the supplied `name` and `description` filled into the frontmatter
+/// and the rest of the optional extension fields commented out.
+/// The body follows the anatomy documented in
+/// `docs/guides/writing-effective-skills.md` — Overview, Quick
+/// Reference table, a placeholder major-topic section, Common
+/// Pitfalls, and a "When wrong" section — all with `<TODO>`-style
+/// placeholders the operator fills in.
+///
+/// Use [`write_skill_template`] for the on-disk version.
+pub fn render_skill_template(name: &str, description: &str) -> String {
+    format!(
+        "---\n\
+         name: {name}\n\
+         description: {description}\n\
+         # Optional mcp-methods extension fields (uncomment as needed):\n\
+         # applies_to:\n\
+         #   mcp_methods: \">=0.3.35\"\n\
+         # references_tools:\n\
+         #   - {name}\n\
+         # references_arguments:\n\
+         #   - {name}.<arg_name>\n\
+         # auto_inject_hint: true\n\
+         ---\n\
+         \n\
+         # `{name}` methodology\n\
+         \n\
+         ## Overview\n\
+         \n\
+         <TODO: 2–3 sentences. What this skill enables, when to reach for it,\n\
+         what comes before and after it in the typical workflow.>\n\
+         \n\
+         ## Quick Reference\n\
+         \n\
+         | Task | Approach |\n\
+         |---|---|\n\
+         | <TODO: common task A> | <TODO: one-line pattern> |\n\
+         | <TODO: common task B> | <TODO: one-line pattern> |\n\
+         \n\
+         ## <TODO: Major topic>\n\
+         \n\
+         <TODO: concrete prose, code blocks, examples.>\n\
+         \n\
+         ## Common Pitfalls\n\
+         \n\
+         ❌ <TODO: specific anti-pattern, framed as a behaviour to avoid>\n\
+         \n\
+         ✅ <TODO: positive guidance, often a heuristic>\n\
+         \n\
+         ## When `{name}` is the wrong tool\n\
+         \n\
+         - **<TODO: scenario>** — use <other tool> because <reason>.\n"
+    )
+}
+
+/// Resolve where a template write should land and write it.
+///
+/// `dest` interpretation:
+/// - If `dest` is an existing directory, the file is written to
+///   `dest/<name>.md`.
+/// - If `dest` ends in `.md`, it is used verbatim and its parent
+///   must already exist.
+/// - Otherwise `dest` is treated as a directory that should be
+///   created (and its parents created with `create_dir_all`) before
+///   writing `dest/<name>.md`.
+///
+/// Existing files are never overwritten — if the destination already
+/// exists, returns a `SkillError::Io` wrapping `AlreadyExists`. The
+/// caller should delete first if they really want to replace.
+pub fn write_skill_template(
+    dest: &Path,
+    name: &str,
+    description: &str,
+) -> Result<PathBuf, SkillError> {
+    let path = resolve_template_dest(dest, name);
+
+    if path.exists() {
+        return Err(SkillError::Io {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "destination already exists; delete it before re-running",
+            ),
+        });
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| SkillError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+    }
+
+    let body = render_skill_template(name, description);
+    fs::write(&path, body).map_err(|e| SkillError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+    Ok(path)
+}
+
+fn resolve_template_dest(dest: &Path, name: &str) -> PathBuf {
+    if dest.is_dir() {
+        return dest.join(format!("{name}.md"));
+    }
+    if dest
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
+    {
+        return dest.to_path_buf();
+    }
+    dest.join(format!("{name}.md"))
+}
+
 // ─── Registry builder ─────────────────────────────────────────────
 
 /// Builder for a skills [`ResolvedRegistry`]. Downstream binaries
@@ -1246,5 +1367,84 @@ Body.\n";
             .unwrap();
 
         assert_eq!(registry.skill_names(), vec!["alpha", "mu", "zeta"]);
+    }
+
+    // ─── Authoring template ───────────────────────────────────────
+
+    #[test]
+    fn render_skill_template_is_parse_valid() {
+        // Round-trip: a freshly-rendered template must parse cleanly
+        // through `parse_skill` so the operator's starting point is
+        // never broken.
+        let body = render_skill_template("custom_method", "A test description for the skill.");
+        let (fm, _body) =
+            parse_skill(&body, &PathBuf::from("test.md")).expect("rendered template must parse");
+        assert_eq!(fm.name, "custom_method");
+        assert_eq!(fm.description, "A test description for the skill.");
+    }
+
+    #[test]
+    fn render_skill_template_substitutes_name_into_body_headings() {
+        let body = render_skill_template("my_skill", "desc");
+        assert!(body.contains("# `my_skill` methodology"));
+        assert!(body.contains("## When `my_skill` is the wrong tool"));
+    }
+
+    #[test]
+    fn write_skill_template_writes_into_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = write_skill_template(dir.path(), "alpha", "First skill.").unwrap();
+        assert_eq!(dest, dir.path().join("alpha.md"));
+        let content = fs::read_to_string(&dest).unwrap();
+        assert!(content.contains("name: alpha"));
+    }
+
+    #[test]
+    fn write_skill_template_writes_to_explicit_md_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("renamed.md");
+        let dest = write_skill_template(&explicit, "alpha", "First skill.").unwrap();
+        assert_eq!(dest, explicit);
+        assert!(explicit.is_file());
+    }
+
+    #[test]
+    fn write_skill_template_creates_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        let dest = write_skill_template(&nested, "alpha", "First skill.").unwrap();
+        assert_eq!(dest, nested.join("alpha.md"));
+        assert!(dest.is_file());
+    }
+
+    #[test]
+    fn write_skill_template_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha.md");
+        fs::write(&path, "existing").unwrap();
+        let err = write_skill_template(dir.path(), "alpha", "Replace me?").unwrap_err();
+        assert!(matches!(err, SkillError::Io { .. }));
+        // Original content preserved.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
+    }
+
+    #[test]
+    fn write_skill_template_round_trips_through_registry() {
+        // End-to-end: write a template, build a registry that
+        // auto-detects it as a project skill, confirm it resolves.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("test_mcp.yaml");
+        fs::write(&yaml, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        write_skill_template(&skills_dir, "custom_method", "Project-layer skill body.").unwrap();
+
+        let registry = Registry::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+        let skill = registry
+            .get("custom_method")
+            .expect("template should resolve");
+        assert_eq!(skill.description(), "Project-layer skill body.");
     }
 }

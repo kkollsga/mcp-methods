@@ -121,6 +121,7 @@ When a `skills-*` subcommand is given on the command line, `mcp-server` runs tha
 mcp-server skills-lint ./mcp-servers/my_mcp.skills/
 mcp-server skills-list --mcp-config ./mcp-servers/my_mcp.yaml
 mcp-server skills-show --mcp-config ./mcp-servers/my_mcp.yaml cypher_query
+mcp-server skills-new ./mcp-servers/my_mcp.skills/ cypher_query "TRIGGER when ..."
 ```
 
 These are operator tools — they don't interact with the server boot path. The same helpers are reachable from Rust as `mcp_methods::server::cli::{skills_lint, skills_list, skills_show}` so downstream binaries can offer the same surface in their own CLIs. See [Skills-Aware Manifests](skills-aware-manifests.md) for examples.

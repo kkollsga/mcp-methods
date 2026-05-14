@@ -192,3 +192,65 @@ def test_register_skills_empty_registry_is_noop(tmp_path: Path) -> None:
     count = register_skills_as_prompts(app, reg)
     assert count == 0
     assert app.prompts == {}
+
+
+# ─── Skill template ────────────────────────────────────────────────
+
+
+def test_render_skill_template_returns_parse_valid_body() -> None:
+    from mcp_methods import render_skill_template
+
+    body = render_skill_template("custom", "A short description.")
+    assert "name: custom" in body
+    assert "description: A short description." in body
+    assert "# `custom` methodology" in body
+    assert "## Quick Reference" in body
+    assert "## Common Pitfalls" in body
+
+
+def test_write_skill_template_writes_into_directory(tmp_path: Path) -> None:
+    from mcp_methods import write_skill_template
+
+    dest = write_skill_template(tmp_path, "custom", "A description.")
+    assert Path(dest) == tmp_path / "custom.md"
+    content = (tmp_path / "custom.md").read_text()
+    assert "name: custom" in content
+
+
+def test_write_skill_template_round_trips_through_registry(tmp_path: Path) -> None:
+    from mcp_methods import write_skill_template
+
+    manifest = tmp_path / "test_mcp.yaml"
+    manifest.write_text("name: t\nskills: true\n")
+    skills_dir = tmp_path / "test_mcp.skills"
+    write_skill_template(skills_dir, "custom_method", "Project-layer skill body.")
+
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    skill = reg.get("custom_method")
+    assert skill is not None
+    assert skill.description == "Project-layer skill body."
+    assert skill.provenance == "project"
+
+
+def test_write_skill_template_rejects_empty_name(tmp_path: Path) -> None:
+    from mcp_methods import write_skill_template
+
+    with pytest.raises(ValueError, match="name must not be empty"):
+        write_skill_template(tmp_path, "", "A description.")
+
+
+def test_write_skill_template_rejects_empty_description(tmp_path: Path) -> None:
+    from mcp_methods import write_skill_template
+
+    with pytest.raises(ValueError, match="description must not be empty"):
+        write_skill_template(tmp_path, "custom", "   ")
+
+
+def test_write_skill_template_refuses_to_overwrite(tmp_path: Path) -> None:
+    from mcp_methods import write_skill_template
+
+    (tmp_path / "custom.md").write_text("existing content")
+    with pytest.raises(ValueError, match="already exists"):
+        write_skill_template(tmp_path, "custom", "Description.")
+    # Original content preserved.
+    assert (tmp_path / "custom.md").read_text() == "existing content"

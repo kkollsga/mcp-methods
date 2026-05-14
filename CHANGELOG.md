@@ -103,6 +103,39 @@ healthy: 4 KB lint-warns, 16 KB hard-fails a single skill, 64 KB caps
 the resolved-set total. The framework's bundled skills round-trip
 through CI tests that pin the limits.
 
+### Bundled-skill rewrite + authoring template
+
+The five bundled skills (`grep`, `read_source`, `list_source`,
+`github_issues`, `repo_management`) ship with rewritten descriptions
+and bodies aligned to the patterns Anthropic publishes for their own
+skills at github.com/anthropics/skills. Descriptions grew from ~15
+words to 80-140 words with explicit TRIGGER / SKIP language (the
+recommended shape for combating Claude's tendency to undertrigger).
+Bodies gained Quick Reference tables, Common Pitfalls sections with
+❌/✅ markers, and (for `github_issues`) an ASCII decision tree
+mapping user phrasings to the three modes.
+
+Operators authoring their own skills get a scaffold helper:
+
+```bash
+mcp-server skills-new ./my.skills/ my_method "TRIGGER when ..."
+```
+
+```python
+mcp_methods.write_skill_template("./my.skills/", name="my_method", description="TRIGGER when ...")
+```
+
+The template emits a parse-valid SKILL.md with the body skeleton
+(Overview → Quick Reference → Common Pitfalls → "When wrong") and
+the optional extension fields commented out. Empty descriptions are
+refused — a blank description guarantees the skill will never
+trigger.
+
+A new docs guide,
+[Writing Effective Skills](docs/guides/writing-effective-skills.md),
+distils the patterns from Anthropic's published skills repo plus
+their best-practices doc.
+
 ## 0.3.34 — 2026-05-14
 
 ### Added — `tools[].bundled: rename:` per-deployment tool aliasing

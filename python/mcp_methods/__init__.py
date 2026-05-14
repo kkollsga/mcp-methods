@@ -17,10 +17,12 @@ from mcp_methods._mcp_methods import (
     html_to_text,
     list_dir,
     read_file,
+    render_skill_template,
     ripgrep_files,
     ripgrep_json_fields,
     ripgrep_lines,
     validate_repo,
+    write_skill_template,
 )
 from mcp_methods._utils import load_env, timed
 
@@ -107,6 +109,8 @@ __all__ = [
     "ElementCache",
     "Skill",
     "SkillRegistry",
+    "render_skill_template",
+    "write_skill_template",
     # Python
     "timed",
     "load_env",

@@ -80,6 +80,31 @@ Same-named skills in higher layers fully replace lower ones — no merging. A pr
 
 These exist because the agent's context window is finite. A 16 KB prompt is already a meaningful chunk of context; respect the agent's budget.
 
+## Scaffold a starter skill
+
+Authoring from a blank file is the worst part of writing skills — operators stare at frontmatter syntax and skip the description because it's the dullest field to draft. Two surfaces help:
+
+```bash
+# CLI — writes <skill_name>.md into the chosen directory.
+mcp-server skills-new ./mcp-servers/my_mcp.skills/ cypher_query \
+  "TRIGGER when the user asks a question about the graph that requires multi-hop traversal..."
+```
+
+```python
+# Python — same behaviour, returns the resolved path.
+from mcp_methods import write_skill_template
+
+write_skill_template(
+    "./mcp-servers/my_mcp.skills/",
+    name="cypher_query",
+    description="TRIGGER when the user asks a question about the graph...",
+)
+```
+
+The template lands with the name + description filled in, the optional extension fields commented out, and a body skeleton (Overview → Quick Reference → Common Pitfalls → "When wrong") with `<TODO>` placeholders the operator fills in. See [Writing Effective Skills](writing-effective-skills.md) for the patterns each section follows.
+
+The helpers refuse to overwrite existing files — delete first if you want to replace. Empty descriptions also refuse: a blank description guarantees undertriggering, so the helpers force the operator to commit to one before writing.
+
 ## Lint and inspect
 
 Three CLI subcommands ship with `mcp-server` (and are available to downstream binaries via `mcp_methods::server::cli`):

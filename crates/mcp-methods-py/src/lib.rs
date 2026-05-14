@@ -21,7 +21,9 @@ use mcp_methods::grep::{
 use mcp_methods::json_grep::ripgrep_json_fields as core_ripgrep_json_fields;
 use mcp_methods::list_dir::{list_dir as core_list_dir, ListDirOpts};
 use mcp_methods::server::skills::{
-    Registry as SkillsRegistry, ResolvedRegistry as CoreResolvedRegistry, Skill as CoreSkill,
+    render_skill_template as core_render_skill_template,
+    write_skill_template as core_write_skill_template, Registry as SkillsRegistry,
+    ResolvedRegistry as CoreResolvedRegistry, Skill as CoreSkill,
 };
 use mcp_methods::server::{find_sibling_manifest, load_manifest};
 use mcp_methods::{compact, git_refs, github, html};
@@ -488,6 +490,48 @@ fn list_dir(
 }
 
 // ---------------------------------------------------------------------------
+// Skill template — pyfunctions wrapping `render_skill_template` /
+// `write_skill_template`. Operators reach these via the Python module-level
+// `mcp_methods.render_skill_template(...)` and
+// `mcp_methods.write_skill_template(...)` entry points.
+// ---------------------------------------------------------------------------
+
+/// Render a starter SKILL.md body as a string with the supplied
+/// `name` and `description` filled into the frontmatter. The rest
+/// of the optional extension fields are emitted as YAML comments.
+///
+/// Use `write_skill_template` for the on-disk version.
+#[pyfunction]
+fn render_skill_template(name: &str, description: &str) -> String {
+    core_render_skill_template(name, description)
+}
+
+/// Scaffold a starter SKILL.md at `dest` and return the resolved
+/// path written.
+///
+/// `dest` can be an existing directory (file lands at
+/// `dest/<name>.md`), an explicit `.md` path (used verbatim), or a
+/// not-yet-existing directory (created along with parents). Refuses
+/// to overwrite — pre-existing files raise `ValueError`.
+///
+/// Both `name` and `description` are required. Empty values raise
+/// `ValueError` — the description is the agent's only signal for
+/// triggering, and a blank one undertriggers the skill silently.
+#[pyfunction]
+fn write_skill_template(dest: PathBuf, name: &str, description: &str) -> PyResult<PathBuf> {
+    if name.trim().is_empty() {
+        return Err(PyValueError::new_err("skill name must not be empty"));
+    }
+    if description.trim().is_empty() {
+        return Err(PyValueError::new_err(
+            "description must not be empty — it's the agent's only signal for triggering",
+        ));
+    }
+    core_write_skill_template(&dest, name, description)
+        .map_err(|e| PyValueError::new_err(format!("template write failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Skills — `#[pyclass]` thin wrappers around `ResolvedRegistry` / `Skill`
 // ---------------------------------------------------------------------------
 
@@ -694,5 +738,7 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // skills
     m.add_class::<PySkill>()?;
     m.add_class::<PySkillRegistry>()?;
+    m.add_function(wrap_pyfunction!(render_skill_template, m)?)?;
+    m.add_function(wrap_pyfunction!(write_skill_template, m)?)?;
     Ok(())
 }
