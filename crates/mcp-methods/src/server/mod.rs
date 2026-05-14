@@ -38,6 +38,7 @@ pub mod runtime;
 // import; allow the inception.
 #[allow(clippy::module_inception)]
 pub mod server;
+pub mod skills;
 pub mod source;
 pub mod watch;
 pub mod workspace;
@@ -47,11 +48,15 @@ pub mod workspace;
 // without chasing the module hierarchy.
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
-    EmbedderConfig, Manifest, ManifestError, PythonTool, TempCleanup, ToolSpec, TrustConfig,
-    WorkspaceConfig, WorkspaceKind,
+    EmbedderConfig, Manifest, ManifestError, PythonTool, SkillSource, SkillsSource, TempCleanup,
+    ToolSpec, TrustConfig, WorkspaceConfig, WorkspaceKind,
 };
 pub use runtime::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots};
 pub use server::{McpServer, RepoProvider, ServerOptions};
+pub use skills::{
+    library_bundled_skills, BundledSkill, Registry as SkillRegistry, ResolvedRegistry, Skill,
+    SkillError, SkillFrontmatter, SkillProvenance,
+};
 pub use source::SourceRootsProvider;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};
 pub use workspace::{PostActivateHook, Workspace};
