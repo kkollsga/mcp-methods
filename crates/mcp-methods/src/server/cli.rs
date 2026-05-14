@@ -196,13 +196,28 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
     if registry.is_empty() {
         return "(no skills resolved)\n".to_string();
     }
+    // The CLI is the operator-facing surface — show predicate state
+    // even when it's "always active". The split-view design (boot log
+    // shows full state, agent prompts/list shows filtered) lets
+    // operators debug "why isn't my skill firing?" by reading this
+    // output. We pass empty tool / extension state since `skills-list`
+    // runs without a live server; predicates relying on runtime state
+    // show as Unsatisfied/Unknown and are explicitly labelled.
+    let empty_tools = std::collections::HashSet::new();
+    let empty_ext = serde_json::Map::new();
+
     let mut out = String::new();
-    let _ = writeln!(out, "{:<28}  {:<14}  description", "name", "provenance");
     let _ = writeln!(
         out,
-        "{:<28}  {:<14}  {}",
+        "{:<28}  {:<14}  {:<10}  description",
+        "name", "provenance", "status"
+    );
+    let _ = writeln!(
+        out,
+        "{:<28}  {:<14}  {:<10}  {}",
         "-".repeat(28),
         "-".repeat(14),
+        "-".repeat(10),
         "-".repeat(40)
     );
     for name in registry.skill_names() {
@@ -210,8 +225,32 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
             continue;
         };
         let prov = provenance_label(&skill.provenance);
+        let activation = registry.activation_for(skill, &empty_tools, &empty_ext);
+        let status = if activation.active {
+            "active"
+        } else {
+            "inactive"
+        };
         let desc: String = skill.description().chars().take(60).collect();
-        let _ = writeln!(out, "{:<28}  {:<14}  {desc}", skill.name(), prov);
+        let _ = writeln!(
+            out,
+            "{:<28}  {:<14}  {status:<10}  {desc}",
+            skill.name(),
+            prov
+        );
+        // For inactive skills, surface which predicate suppressed them
+        // so the operator can debug. Indented sub-lines keep the table
+        // readable while still giving full attribution.
+        if !activation.active {
+            for (clause, outcome) in &activation.clauses {
+                let mark = match outcome {
+                    crate::server::skills::PredicateOutcome::Satisfied => "ok",
+                    crate::server::skills::PredicateOutcome::Unsatisfied => "FAIL",
+                    crate::server::skills::PredicateOutcome::Unknown => "UNKNOWN",
+                };
+                let _ = writeln!(out, "    [{mark:>7}]  {clause}");
+            }
+        }
     }
     out
 }

@@ -56,9 +56,10 @@ pub use manifest::{
 pub use runtime::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots};
 pub use server::{serve_prompts, McpServer, RepoProvider, ServerOptions};
 pub use skills::{
-    library_bundled_skills, render_skill_template, write_skill_template, BundledSkill,
-    Registry as SkillRegistry, ResolvedRegistry, Skill, SkillError, SkillFrontmatter,
-    SkillProvenance,
+    library_bundled_skills, render_skill_template, write_skill_template, AppliesWhen, BundledSkill,
+    GraphPropertyCheck, PredicateClause, PredicateOutcome, Registry as SkillRegistry,
+    ResolvedRegistry, Skill, SkillActivation, SkillError, SkillFrontmatter,
+    SkillPredicateEvaluator, SkillProvenance,
 };
 pub use source::SourceRootsProvider;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};

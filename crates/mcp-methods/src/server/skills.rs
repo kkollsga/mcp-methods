@@ -62,6 +62,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -139,15 +140,147 @@ pub struct SkillFrontmatter {
     #[serde(default = "default_auto_inject_hint")]
     pub auto_inject_hint: bool,
 
-    /// `applies_when:` predicates — Phase 2 / 3 territory. Parsed
-    /// and stored verbatim for now; the predicate evaluator isn't
-    /// wired up in Phase 1.
+    /// `applies_when:` predicate set. Bounded — not a DSL. All
+    /// populated fields must evaluate true (AND semantics) for the
+    /// skill to surface in `prompts/list` and `prompts/get`. The
+    /// framework dispatches `tool_registered` and `extension_enabled`
+    /// itself; domain predicates (`graph_has_node_type`,
+    /// `graph_has_property`) are evaluated via the optional
+    /// [`SkillPredicateEvaluator`] registered on the
+    /// [`Registry`].
+    ///
+    /// `None` (the default) means "always active" — the skill applies
+    /// regardless of runtime state.
     #[serde(default)]
-    pub applies_when: Vec<serde_yaml::Value>,
+    pub applies_when: Option<AppliesWhen>,
 }
 
 fn default_auto_inject_hint() -> bool {
     true
+}
+
+/// The parsed shape of a SKILL.md's `applies_when:` block. Each field
+/// is one predicate; `None` means "this predicate is not applied".
+/// All populated fields are ANDed.
+///
+/// Adding a new predicate requires extending this struct and the
+/// matching arm in [`Registry::evaluate_clause`]. The bounded-set
+/// design is intentional — operators get type-checked semantics
+/// instead of an open-ended DSL.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AppliesWhen {
+    /// Active when the running graph has *any* of the listed node
+    /// types in its schema. Domain predicate — evaluated via the
+    /// consumer's [`SkillPredicateEvaluator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_has_node_type: Option<Vec<String>>,
+
+    /// Active when the running graph has the named property on the
+    /// named node type. Domain predicate — evaluated via the
+    /// consumer's [`SkillPredicateEvaluator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_has_property: Option<GraphPropertyCheck>,
+
+    /// Active when the named tool is in the registered catalogue
+    /// at boot. Framework-internal — dispatched against
+    /// `server.tool_router` without consulting any evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_registered: Option<String>,
+
+    /// Active when the manifest's `extensions:` block has the named
+    /// key set to a truthy value (not absent, not null, not `false`).
+    /// Framework-internal — dispatched against `manifest.extensions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_enabled: Option<String>,
+}
+
+/// Nested shape for the `graph_has_property:` predicate.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GraphPropertyCheck {
+    pub node_type: String,
+    pub prop_name: String,
+}
+
+/// A single predicate clause, passed to a
+/// [`SkillPredicateEvaluator`] one at a time. Borrowed slices so
+/// the evaluator doesn't have to allocate.
+#[derive(Debug)]
+pub enum PredicateClause<'a> {
+    /// `graph_has_node_type: [Function, Class]`
+    GraphHasNodeType(&'a [String]),
+    /// `graph_has_property: { node_type: Function, prop_name: module }`
+    GraphHasProperty {
+        node_type: &'a str,
+        prop_name: &'a str,
+    },
+    /// `tool_registered: cypher_query`
+    ToolRegistered(&'a str),
+    /// `extension_enabled: csv_http_server`
+    ExtensionEnabled(&'a str),
+}
+
+/// Per-clause result of evaluating an `applies_when:` block. Surfaced
+/// via [`SkillActivation`] so the operator-facing `skills-list` and
+/// boot log can show *which* predicate suppressed a skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredicateOutcome {
+    /// Predicate evaluated to true.
+    Satisfied,
+    /// Predicate evaluated to false. The skill is inactive.
+    Unsatisfied,
+    /// No evaluator recognized the predicate. Treated as
+    /// `Unsatisfied` for safety — a typo'd predicate must not
+    /// silently activate the skill against the wrong domain.
+    Unknown,
+}
+
+/// Activation state for a single skill, post-predicate-evaluation.
+/// Skills without an `applies_when:` block resolve to `Active` with
+/// an empty `clauses` vec.
+#[derive(Debug, Clone, Default)]
+pub struct SkillActivation {
+    /// Whether the skill should appear in `prompts/list` /
+    /// `prompts/get`.
+    pub active: bool,
+    /// Per-clause evaluation outcomes, in declaration order. Empty
+    /// for skills without an `applies_when:` block.
+    pub clauses: Vec<(String, PredicateOutcome)>,
+}
+
+/// Trait downstream binaries implement to evaluate domain-specific
+/// predicates. Framework-internal predicates (`tool_registered`,
+/// `extension_enabled`) are dispatched without consulting this trait;
+/// you only handle the domain ones (`graph_has_node_type`,
+/// `graph_has_property`).
+///
+/// Return `Some(true)` / `Some(false)` when you have an answer;
+/// return `None` when the predicate doesn't apply to your domain
+/// (the framework will mark it `Unknown` and the skill will be
+/// inactive — safer than silently activating the wrong skill).
+///
+/// # Example
+///
+/// ```ignore
+/// struct KgliteEvaluator {
+///     graph: Arc<Graph>,
+/// }
+///
+/// impl SkillPredicateEvaluator for KgliteEvaluator {
+///     fn evaluate(&self, clause: &PredicateClause<'_>) -> Option<bool> {
+///         match clause {
+///             PredicateClause::GraphHasNodeType(types) => {
+///                 Some(types.iter().any(|t| self.graph.has_node_type(t)))
+///             }
+///             PredicateClause::GraphHasProperty { node_type, prop_name } => {
+///                 Some(self.graph.has_property(node_type, prop_name))
+///             }
+///             _ => None,   // framework dispatches the rest
+///         }
+///     }
+/// }
+/// ```
+pub trait SkillPredicateEvaluator: Send + Sync {
+    fn evaluate(&self, clause: &PredicateClause<'_>) -> Option<bool>;
 }
 
 /// Where a [`Skill`] came from. Used for the boot-time collision-
@@ -628,7 +761,7 @@ fn resolve_template_dest(dest: &Path, name: &str) -> PathBuf {
 /// ready for MCP `prompts/list` + `prompts/get` wiring.
 ///
 /// See the module docs for the canonical usage pattern.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Registry {
     bundled: Vec<BundledSkill>,
     /// Sources from the manifest's `skills:` list, in declaration
@@ -639,14 +772,59 @@ pub struct Registry {
     /// Project layer — auto-detected `<basename>.skills/` adjacent
     /// to the manifest YAML. Set via `auto_detect_project_layer`.
     project_dir: Option<PathBuf>,
+    /// Optional consumer-supplied evaluator for domain predicates
+    /// (`graph_has_node_type`, `graph_has_property`). Wired in via
+    /// [`Registry::with_predicate_evaluator`]; framework-internal
+    /// predicates (`tool_registered`, `extension_enabled`) are
+    /// dispatched without consulting the evaluator.
+    evaluator: Option<Arc<dyn SkillPredicateEvaluator>>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("bundled", &self.bundled)
+            .field("root_dirs", &self.root_dirs)
+            .field("root_includes_bundled", &self.root_includes_bundled)
+            .field("project_dir", &self.project_dir)
+            .field(
+                "evaluator",
+                &self
+                    .evaluator
+                    .as_ref()
+                    .map(|_| "<dyn SkillPredicateEvaluator>"),
+            )
+            .finish()
+    }
 }
 
 impl Registry {
     /// Construct an empty registry. Chain in `add_bundled`,
-    /// `merge_framework_defaults`, `layer_dirs`, and
-    /// `auto_detect_project_layer` calls, then call `finalise()`.
+    /// `merge_framework_defaults`, `layer_dirs`,
+    /// `auto_detect_project_layer`, and optionally
+    /// `with_predicate_evaluator`, then call `finalise()`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a domain-specific predicate evaluator for the
+    /// `applies_when:` machinery. The evaluator only sees domain
+    /// predicates (`graph_has_node_type`, `graph_has_property`);
+    /// framework-internal ones (`tool_registered`,
+    /// `extension_enabled`) are dispatched against the
+    /// [`McpServer`](crate::server::McpServer)'s runtime state at
+    /// [`serve_prompts`](crate::server::serve_prompts) time.
+    ///
+    /// Without an evaluator, skills using domain predicates resolve
+    /// to inactive (predicate `Unknown` → skill suppressed). This
+    /// is the safe default: a typo'd predicate or a missing
+    /// evaluator must not silently activate the wrong-domain skill.
+    pub fn with_predicate_evaluator(
+        mut self,
+        evaluator: impl SkillPredicateEvaluator + 'static,
+    ) -> Self {
+        self.evaluator = Some(Arc::new(evaluator));
+        self
     }
 
     /// Add a compile-time bundled skill. Typically called by
@@ -768,6 +946,7 @@ impl Registry {
             root_dirs,
             root_includes_bundled,
             project_dir,
+            evaluator,
         } = self;
 
         // Parse bundled skills first. These are the lowest-priority
@@ -885,7 +1064,10 @@ impl Registry {
             );
         }
 
-        Ok(ResolvedRegistry { skills: resolved })
+        Ok(ResolvedRegistry {
+            skills: resolved,
+            evaluator,
+        })
     }
 }
 
@@ -902,9 +1084,30 @@ fn format_provenance(p: &SkillProvenance) -> String {
 /// The post-resolution skill set. Consumed by `serve_prompts`
 /// (Phase 1c) to wire `prompts/list` and `prompts/get` on the
 /// MCP server.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ResolvedRegistry {
     skills: HashMap<String, Skill>,
+    /// Optional domain-predicate evaluator carried from
+    /// [`Registry::with_predicate_evaluator`]. `serve_prompts`
+    /// consults this when evaluating `applies_when:` blocks; absent
+    /// means domain predicates resolve to `Unknown` → skill
+    /// inactive.
+    pub(crate) evaluator: Option<Arc<dyn SkillPredicateEvaluator>>,
+}
+
+impl std::fmt::Debug for ResolvedRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedRegistry")
+            .field("skills", &self.skills)
+            .field(
+                "evaluator",
+                &self
+                    .evaluator
+                    .as_ref()
+                    .map(|_| "<dyn SkillPredicateEvaluator>"),
+            )
+            .finish()
+    }
 }
 
 impl ResolvedRegistry {
@@ -936,6 +1139,119 @@ impl ResolvedRegistry {
     /// Whether the registry contains any skills.
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
+    }
+
+    /// Evaluate the `applies_when:` block on `skill` against this
+    /// registry's evaluator plus the supplied runtime state. Returns
+    /// the per-clause outcomes plus whether the skill should be
+    /// considered active.
+    ///
+    /// `registered_tools` and `extensions` carry the runtime state
+    /// the framework-internal predicates check against.
+    /// `serve_prompts` calls this for every skill at boot;
+    /// `skills-list` calls it (with placeholder empty state) for
+    /// the operator-facing summary.
+    ///
+    /// A skill without an `applies_when:` block is always active.
+    pub fn activation_for(
+        &self,
+        skill: &Skill,
+        registered_tools: &std::collections::HashSet<String>,
+        extensions: &serde_json::Map<String, serde_json::Value>,
+    ) -> SkillActivation {
+        let Some(applies_when) = skill.frontmatter.applies_when.as_ref() else {
+            return SkillActivation {
+                active: true,
+                clauses: Vec::new(),
+            };
+        };
+        let mut clauses = Vec::new();
+        let mut all_satisfied = true;
+
+        if let Some(types) = applies_when.graph_has_node_type.as_ref() {
+            let clause = PredicateClause::GraphHasNodeType(types);
+            let outcome = self.dispatch_clause(&clause, registered_tools, extensions);
+            if outcome != PredicateOutcome::Satisfied {
+                all_satisfied = false;
+            }
+            clauses.push((format!("graph_has_node_type: {types:?}"), outcome));
+        }
+        if let Some(prop) = applies_when.graph_has_property.as_ref() {
+            let clause = PredicateClause::GraphHasProperty {
+                node_type: &prop.node_type,
+                prop_name: &prop.prop_name,
+            };
+            let outcome = self.dispatch_clause(&clause, registered_tools, extensions);
+            if outcome != PredicateOutcome::Satisfied {
+                all_satisfied = false;
+            }
+            clauses.push((
+                format!("graph_has_property: {}.{}", prop.node_type, prop.prop_name),
+                outcome,
+            ));
+        }
+        if let Some(tool) = applies_when.tool_registered.as_ref() {
+            let clause = PredicateClause::ToolRegistered(tool);
+            let outcome = self.dispatch_clause(&clause, registered_tools, extensions);
+            if outcome != PredicateOutcome::Satisfied {
+                all_satisfied = false;
+            }
+            clauses.push((format!("tool_registered: {tool}"), outcome));
+        }
+        if let Some(key) = applies_when.extension_enabled.as_ref() {
+            let clause = PredicateClause::ExtensionEnabled(key);
+            let outcome = self.dispatch_clause(&clause, registered_tools, extensions);
+            if outcome != PredicateOutcome::Satisfied {
+                all_satisfied = false;
+            }
+            clauses.push((format!("extension_enabled: {key}"), outcome));
+        }
+
+        SkillActivation {
+            active: all_satisfied,
+            clauses,
+        }
+    }
+
+    fn dispatch_clause(
+        &self,
+        clause: &PredicateClause<'_>,
+        registered_tools: &std::collections::HashSet<String>,
+        extensions: &serde_json::Map<String, serde_json::Value>,
+    ) -> PredicateOutcome {
+        // Framework-internal predicates are dispatched in-framework
+        // regardless of the evaluator's preference. This keeps
+        // tool_registered + extension_enabled working even when no
+        // evaluator is registered.
+        match clause {
+            PredicateClause::ToolRegistered(name) => {
+                return if registered_tools.contains(*name) {
+                    PredicateOutcome::Satisfied
+                } else {
+                    PredicateOutcome::Unsatisfied
+                };
+            }
+            PredicateClause::ExtensionEnabled(key) => {
+                let truthy = extensions
+                    .get(*key)
+                    .map(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
+                    .unwrap_or(false);
+                return if truthy {
+                    PredicateOutcome::Satisfied
+                } else {
+                    PredicateOutcome::Unsatisfied
+                };
+            }
+            _ => {}
+        }
+
+        // Domain predicates: defer to the evaluator. Unknown when no
+        // evaluator is registered or the evaluator returns None.
+        match self.evaluator.as_ref().and_then(|e| e.evaluate(clause)) {
+            Some(true) => PredicateOutcome::Satisfied,
+            Some(false) => PredicateOutcome::Unsatisfied,
+            None => PredicateOutcome::Unknown,
+        }
     }
 }
 
@@ -1446,5 +1762,197 @@ Body.\n";
             .get("custom_method")
             .expect("template should resolve");
         assert_eq!(skill.description(), "Project-layer skill body.");
+    }
+
+    // ─── applies_when predicates (Phase 3) ────────────────────────
+
+    fn skill_with_applies_when(applies_when_yaml: &str) -> Skill {
+        let body = format!(
+            "---\nname: gated\ndescription: A gated skill.\n\
+             applies_when:\n{applies_when_yaml}\n---\n\nBody.\n"
+        );
+        let (frontmatter, body) = parse_skill(&body, &PathBuf::from("gated.md")).unwrap();
+        Skill {
+            frontmatter,
+            body,
+            provenance: SkillProvenance::Bundled,
+        }
+    }
+
+    #[test]
+    fn applies_when_parses_map_shape() {
+        let skill = skill_with_applies_when(
+            "  graph_has_node_type: [Function, Class]\n\
+             \x20 tool_registered: cypher_query\n\
+             \x20 extension_enabled: csv_http_server\n\
+             \x20 graph_has_property:\n\
+             \x20   node_type: Function\n\
+             \x20   prop_name: module",
+        );
+        let applies = skill.frontmatter.applies_when.unwrap();
+        assert_eq!(
+            applies.graph_has_node_type.as_deref(),
+            Some(["Function".to_string(), "Class".to_string()].as_slice())
+        );
+        assert_eq!(applies.tool_registered.as_deref(), Some("cypher_query"));
+        assert_eq!(
+            applies.extension_enabled.as_deref(),
+            Some("csv_http_server")
+        );
+        assert_eq!(
+            applies.graph_has_property,
+            Some(GraphPropertyCheck {
+                node_type: "Function".to_string(),
+                prop_name: "module".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn applies_when_absent_means_always_active() {
+        let body = "---\nname: ungated\ndescription: An ungated skill.\n---\n\nBody.\n";
+        let (frontmatter, body) = parse_skill(body, &PathBuf::from("ungated.md")).unwrap();
+        let skill = Skill {
+            frontmatter,
+            body,
+            provenance: SkillProvenance::Bundled,
+        };
+        let registry = ResolvedRegistry::default();
+        let activation = registry.activation_for(
+            &skill,
+            &std::collections::HashSet::new(),
+            &serde_json::Map::new(),
+        );
+        assert!(activation.active);
+        assert!(activation.clauses.is_empty());
+    }
+
+    #[test]
+    fn tool_registered_predicate_dispatches_in_framework() {
+        let skill = skill_with_applies_when("  tool_registered: cypher_query");
+        let registry = ResolvedRegistry::default();
+        let mut tools = std::collections::HashSet::new();
+
+        // Tool absent → unsatisfied.
+        let inactive = registry.activation_for(&skill, &tools, &serde_json::Map::new());
+        assert!(!inactive.active);
+        assert_eq!(inactive.clauses[0].1, PredicateOutcome::Unsatisfied);
+
+        // Tool present → satisfied.
+        tools.insert("cypher_query".to_string());
+        let active = registry.activation_for(&skill, &tools, &serde_json::Map::new());
+        assert!(active.active);
+        assert_eq!(active.clauses[0].1, PredicateOutcome::Satisfied);
+    }
+
+    #[test]
+    fn extension_enabled_predicate_dispatches_in_framework() {
+        let skill = skill_with_applies_when("  extension_enabled: csv_http_server");
+        let registry = ResolvedRegistry::default();
+        let tools = std::collections::HashSet::new();
+        let mut extensions = serde_json::Map::new();
+
+        // Key absent → unsatisfied.
+        assert!(!registry.activation_for(&skill, &tools, &extensions).active);
+
+        // Key with `false` → unsatisfied.
+        extensions.insert("csv_http_server".to_string(), serde_json::json!(false));
+        assert!(!registry.activation_for(&skill, &tools, &extensions).active);
+
+        // Key with `null` → unsatisfied.
+        extensions.insert("csv_http_server".to_string(), serde_json::Value::Null);
+        assert!(!registry.activation_for(&skill, &tools, &extensions).active);
+
+        // Key with truthy value → satisfied.
+        extensions.insert("csv_http_server".to_string(), serde_json::json!(true));
+        assert!(registry.activation_for(&skill, &tools, &extensions).active);
+
+        // Key with a map → satisfied (truthy).
+        extensions.insert(
+            "csv_http_server".to_string(),
+            serde_json::json!({"enabled": true}),
+        );
+        assert!(registry.activation_for(&skill, &tools, &extensions).active);
+    }
+
+    struct StubEvaluator {
+        has_function: bool,
+    }
+    impl SkillPredicateEvaluator for StubEvaluator {
+        fn evaluate(&self, clause: &PredicateClause<'_>) -> Option<bool> {
+            match clause {
+                PredicateClause::GraphHasNodeType(types) => {
+                    Some(types.iter().any(|t| t == "Function") && self.has_function)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn graph_predicate_dispatches_via_evaluator() {
+        let skill = skill_with_applies_when("  graph_has_node_type: [Function, Class]");
+
+        // With evaluator that says yes → active.
+        let registry = Registry::new()
+            .with_predicate_evaluator(StubEvaluator { has_function: true })
+            .finalise()
+            .unwrap();
+        let active = registry.activation_for(
+            &skill,
+            &std::collections::HashSet::new(),
+            &serde_json::Map::new(),
+        );
+        assert!(active.active);
+        assert_eq!(active.clauses[0].1, PredicateOutcome::Satisfied);
+
+        // With evaluator that says no → inactive.
+        let registry = Registry::new()
+            .with_predicate_evaluator(StubEvaluator {
+                has_function: false,
+            })
+            .finalise()
+            .unwrap();
+        let inactive = registry.activation_for(
+            &skill,
+            &std::collections::HashSet::new(),
+            &serde_json::Map::new(),
+        );
+        assert!(!inactive.active);
+        assert_eq!(inactive.clauses[0].1, PredicateOutcome::Unsatisfied);
+    }
+
+    #[test]
+    fn graph_predicate_unknown_without_evaluator_means_inactive() {
+        let skill = skill_with_applies_when("  graph_has_node_type: [Function]");
+        let registry = ResolvedRegistry::default();
+        let activation = registry.activation_for(
+            &skill,
+            &std::collections::HashSet::new(),
+            &serde_json::Map::new(),
+        );
+        assert!(!activation.active);
+        assert_eq!(activation.clauses[0].1, PredicateOutcome::Unknown);
+    }
+
+    #[test]
+    fn multiple_predicates_all_must_be_satisfied() {
+        let skill = skill_with_applies_when(
+            "  graph_has_node_type: [Function]\n\
+             \x20 tool_registered: cypher_query",
+        );
+        let registry = Registry::new()
+            .with_predicate_evaluator(StubEvaluator { has_function: true })
+            .finalise()
+            .unwrap();
+        let mut tools = std::collections::HashSet::new();
+        let extensions = serde_json::Map::new();
+
+        // Graph satisfied but tool absent → inactive.
+        assert!(!registry.activation_for(&skill, &tools, &extensions).active);
+
+        // Both satisfied → active.
+        tools.insert("cypher_query".to_string());
+        assert!(registry.activation_for(&skill, &tools, &extensions).active);
     }
 }

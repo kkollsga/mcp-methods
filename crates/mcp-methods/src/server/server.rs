@@ -71,6 +71,11 @@ pub struct ServerOptions {
     /// example) can read `temp_cleanup` / `save_graph` settings and
     /// implement the corresponding behaviour without re-parsing YAML.
     pub builtins: crate::server::manifest::BuiltinsConfig,
+    /// Manifest-declared `extensions:` block. The framework uses this
+    /// for the `extension_enabled:` skill predicate; downstream
+    /// consumers can also read it for their own per-extension config.
+    /// Empty map when no `extensions:` block is present.
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -101,6 +106,7 @@ impl ServerOptions {
             default_repo: None,
             workspace: None,
             builtins: manifest.map(|m| m.builtins.clone()).unwrap_or_default(),
+            extensions: manifest.map(|m| m.extensions.clone()).unwrap_or_default(),
         }
     }
 
@@ -799,6 +805,19 @@ fn resolve_repo_from(
 /// the zero-skills boot path.
 pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
     use std::borrow::Cow;
+    use std::collections::HashSet;
+
+    // Build the framework-internal predicate state once. The tool
+    // router has the full registered-tool list; extensions come from
+    // the manifest's builtins block (operators may have nothing
+    // here, in which case all `extension_enabled:` predicates fail).
+    let registered_tools: HashSet<String> = server
+        .tool_router
+        .list_all()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let extensions = server.options.extensions.clone();
 
     let mut auto_inject: Vec<(String, String)> = Vec::new();
 
@@ -806,6 +825,28 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         let Some(skill) = registry.get(&name) else {
             continue;
         };
+
+        // Evaluate `applies_when:` against the runtime state. Skills
+        // with all predicates satisfied register; others are
+        // suppressed from the agent-facing surface.
+        let activation = registry.activation_for(skill, &registered_tools, &extensions);
+        if !activation.active {
+            let failed_clauses: Vec<&str> = activation
+                .clauses
+                .iter()
+                .filter(|(_, outcome)| {
+                    *outcome != crate::server::skills::PredicateOutcome::Satisfied
+                })
+                .map(|(clause, _)| clause.as_str())
+                .collect();
+            tracing::info!(
+                skill = %name,
+                suppressed_by = ?failed_clauses,
+                "skill suppressed by applies_when predicates"
+            );
+            continue;
+        }
+
         let prompt = Prompt::new(
             skill.name().to_string(),
             Some(skill.description().to_string()),
@@ -1139,5 +1180,96 @@ mod tests {
             .map(|c| c.into_owned())
             .unwrap_or_default();
         assert!(!ping_desc.contains("no_such_tool"));
+    }
+
+    fn write_gated_project_skill(applies_when_yaml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("test_mcp.yaml");
+        std::fs::write(&yaml, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        std::fs::create_dir(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("gated_skill.md"),
+            format!(
+                "---\n\
+                 name: gated_skill\n\
+                 description: A predicate-gated skill for testing.\n\
+                 applies_when:\n\
+                 {applies_when_yaml}\n\
+                 ---\n\n\
+                 Body.\n",
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn serve_prompts_suppresses_skill_with_unsatisfied_predicate() {
+        // `tool_registered: nonexistent_tool` — that tool isn't in
+        // the registered catalogue, so the predicate fails and the
+        // skill is omitted from `prompts/list`.
+        use crate::server::skills::Registry as SkillsBuilder;
+        let dir = write_gated_project_skill("  tool_registered: nonexistent_tool");
+        let yaml = dir.path().join("test_mcp.yaml");
+        let registry = SkillsBuilder::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        assert!(
+            !server.prompt_router.map.contains_key("gated_skill"),
+            "skill with unsatisfied predicate must be suppressed"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_keeps_skill_with_satisfied_predicate() {
+        // `tool_registered: ping` — ping is always registered, so
+        // the predicate satisfies and the skill registers.
+        use crate::server::skills::Registry as SkillsBuilder;
+        let dir = write_gated_project_skill("  tool_registered: ping");
+        let yaml = dir.path().join("test_mcp.yaml");
+        let registry = SkillsBuilder::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        assert!(
+            server.prompt_router.map.contains_key("gated_skill"),
+            "skill with satisfied predicate must register"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_evaluates_extension_enabled_from_manifest() {
+        // The `extension_enabled:` predicate reads from
+        // `ServerOptions.extensions`. Verify it integrates end-to-end
+        // when the manifest declares the extension.
+        use crate::server::skills::Registry as SkillsBuilder;
+        let dir = write_gated_project_skill("  extension_enabled: csv_http_server");
+        let yaml = dir.path().join("test_mcp.yaml");
+        let registry = SkillsBuilder::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+
+        // Without the extension declared — suppressed.
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        assert!(!server.prompt_router.map.contains_key("gated_skill"));
+
+        // With the extension declared — registers.
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("csv_http_server".to_string(), serde_json::json!(true));
+        let opts = ServerOptions {
+            extensions,
+            ..ServerOptions::default()
+        };
+        let mut server = McpServer::new(opts);
+        super::serve_prompts(&registry, &mut server);
+        assert!(server.prompt_router.map.contains_key("gated_skill"));
     }
 }
