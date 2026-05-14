@@ -10,6 +10,11 @@ homepage = "https://github.com/kkollsga/mcp-methods"
 readme = "../../README.md"
 keywords = ["mcp", "cli", "ai", "rmcp", "agent"]
 categories = ["command-line-utilities", "development-tools"]
+# The `mcp-server` name on crates.io is owned by a different team
+# (Anthropic squatted it at 0.1.0). Our binary ships via the Python
+# wheel and via `cargo install --git`; the README documents both
+# paths under "Not on crates.io — unpublished on purpose."
+publish = false
 
 [[bin]]
 name = "mcp-server"
