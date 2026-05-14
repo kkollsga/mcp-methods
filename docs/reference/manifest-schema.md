@@ -98,6 +98,37 @@ A no-`skills:` deployment is a verbatim-current deploy: no `prompts/*` capabilit
 
 See [Authoring Skills](../guides/authoring-skills.md) for the walkthrough and [Three-Layer Composition](../explanation/three-layer-composition.md) for the design rationale.
 
+### `applies_when:` predicate gating (per-skill, 0.3.36+)
+
+Individual SKILL.md files can declare an `applies_when:` block that gates whether the skill appears in `prompts/list`. Bounded set of predicates — not a DSL:
+
+```yaml
+---
+name: read_code_source
+description: Resolve qualified_name → source slice. TRIGGER when ...
+applies_when:
+  graph_has_node_type: [Function, Class]
+  graph_has_property:
+    node_type: Function
+    prop_name: module
+  tool_registered: cypher_query
+  extension_enabled: csv_http_server
+---
+```
+
+All populated predicates are ANDed. A skill with `applies_when:` absent is always active.
+
+| Predicate | Dispatched by | Semantics |
+|---|---|---|
+| `graph_has_node_type: [...]` | Consumer's `SkillPredicateEvaluator` | True when any listed node type exists in the active graph |
+| `graph_has_property: {node_type, prop_name}` | Consumer's `SkillPredicateEvaluator` | True when the property exists on the named node type |
+| `tool_registered: <name>` | Framework | True when the tool is in the registered catalogue at boot |
+| `extension_enabled: <key>` | Framework | True when `manifest.extensions.<key>` is set to a truthy value (not absent / null / `false`) |
+
+Domain predicates (`graph_has_*`) require a consumer-supplied evaluator; without one they resolve to `Unknown` → inactive. This is the safe default — a typo'd predicate or missing evaluator must not silently activate the wrong-domain skill.
+
+Operator-facing `mcp-server skills-list` shows every skill with an `active` / `inactive` column and per-clause outcomes for inactive ones. Agent-facing `prompts/list` filters inactive skills out silently (with a `tracing::info!` line per skipped skill for boot logs).
+
 ## `extensions:` object
 
 Opaque passthrough. Only the top-level `extensions:` key is validated; everything below is stored verbatim as a `serde_json::Map`. Downstream binaries define their own sub-schemas:

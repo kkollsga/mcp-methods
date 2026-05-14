@@ -254,3 +254,64 @@ def test_write_skill_template_refuses_to_overwrite(tmp_path: Path) -> None:
         write_skill_template(tmp_path, "custom", "Description.")
     # Original content preserved.
     assert (tmp_path / "custom.md").read_text() == "existing content"
+
+
+# ─── applies_when surfacing (Phase 3) ──────────────────────────────
+
+
+def test_applies_when_absent_returns_none(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    skill = reg.get("custom_method")
+    # _write_manifest's fixture skill doesn't set applies_when.
+    assert skill.applies_when is None
+
+
+def test_applies_when_surfaces_as_dict(tmp_path: Path) -> None:
+    manifest = tmp_path / "test_mcp.yaml"
+    manifest.write_text("name: t\nskills: true\n")
+    skills_dir = tmp_path / "test_mcp.skills"
+    skills_dir.mkdir()
+    (skills_dir / "gated.md").write_text(
+        "---\n"
+        "name: gated\n"
+        "description: A gated skill.\n"
+        "applies_when:\n"
+        "  graph_has_node_type: [Function, Class]\n"
+        "  graph_has_property:\n"
+        "    node_type: Function\n"
+        "    prop_name: module\n"
+        "  tool_registered: cypher_query\n"
+        "  extension_enabled: csv_http_server\n"
+        "---\n\nBody.\n"
+    )
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    skill = reg.get("gated")
+    aw = skill.applies_when
+
+    assert aw == {
+        "graph_has_node_type": ["Function", "Class"],
+        "graph_has_property": {"node_type": "Function", "prop_name": "module"},
+        "tool_registered": "cypher_query",
+        "extension_enabled": "csv_http_server",
+    }
+
+
+def test_applies_when_partial_block_omits_absent_keys(tmp_path: Path) -> None:
+    # Operators rarely use all four predicates. Confirm the dict
+    # only contains keys that were actually populated in YAML.
+    manifest = tmp_path / "test_mcp.yaml"
+    manifest.write_text("name: t\nskills: true\n")
+    skills_dir = tmp_path / "test_mcp.skills"
+    skills_dir.mkdir()
+    (skills_dir / "gated.md").write_text(
+        "---\n"
+        "name: gated\n"
+        "description: A gated skill.\n"
+        "applies_when:\n"
+        "  tool_registered: cypher_query\n"
+        "---\n\nBody.\n"
+    )
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    skill = reg.get("gated")
+    assert skill.applies_when == {"tool_registered": "cypher_query"}

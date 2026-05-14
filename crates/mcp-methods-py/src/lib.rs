@@ -547,6 +547,19 @@ struct PySkill {
     provenance: String,
     auto_inject_hint: bool,
     references_tools: Vec<String>,
+    /// Snapshot of the `applies_when:` block as a plain `dict`-able
+    /// shape so Python callers can pre-filter their registries before
+    /// calling `register_skills_as_prompts`. `None` when the skill has
+    /// no `applies_when:` block (always active).
+    applies_when: Option<PyAppliesWhen>,
+}
+
+#[derive(Clone)]
+struct PyAppliesWhen {
+    graph_has_node_type: Option<Vec<String>>,
+    graph_has_property: Option<(String, String)>,
+    tool_registered: Option<String>,
+    extension_enabled: Option<String>,
 }
 
 impl PySkill {
@@ -559,6 +572,19 @@ impl PySkill {
             }
             SkillProvenance::Bundled => "bundled".to_string(),
         };
+        let applies_when = skill
+            .frontmatter
+            .applies_when
+            .as_ref()
+            .map(|aw| PyAppliesWhen {
+                graph_has_node_type: aw.graph_has_node_type.clone(),
+                graph_has_property: aw
+                    .graph_has_property
+                    .as_ref()
+                    .map(|p| (p.node_type.clone(), p.prop_name.clone())),
+                tool_registered: aw.tool_registered.clone(),
+                extension_enabled: aw.extension_enabled.clone(),
+            });
         Self {
             name: skill.name().to_string(),
             description: skill.description().to_string(),
@@ -566,6 +592,7 @@ impl PySkill {
             provenance,
             auto_inject_hint: skill.frontmatter.auto_inject_hint,
             references_tools: skill.frontmatter.references_tools.clone(),
+            applies_when,
         }
     }
 }
@@ -604,6 +631,43 @@ impl PySkill {
     #[getter]
     fn references_tools(&self) -> Vec<String> {
         self.references_tools.clone()
+    }
+
+    /// The `applies_when:` predicate block as a dict, or `None` when
+    /// the skill has no predicates (always active). Keys present
+    /// match the populated frontmatter fields:
+    ///
+    /// - `graph_has_node_type`: list[str]
+    /// - `graph_has_property`: dict with `node_type` and `prop_name`
+    /// - `tool_registered`: str
+    /// - `extension_enabled`: str
+    ///
+    /// Predicate semantics are AND across populated keys. Python
+    /// callers wanting to pre-filter a registry before
+    /// `register_skills_as_prompts` can inspect this dict and skip
+    /// skills whose predicates don't match their runtime state.
+    #[getter]
+    fn applies_when<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(aw) = self.applies_when.as_ref() else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        if let Some(types) = aw.graph_has_node_type.as_ref() {
+            dict.set_item("graph_has_node_type", types.clone())?;
+        }
+        if let Some((node_type, prop_name)) = aw.graph_has_property.as_ref() {
+            let prop = PyDict::new(py);
+            prop.set_item("node_type", node_type)?;
+            prop.set_item("prop_name", prop_name)?;
+            dict.set_item("graph_has_property", prop)?;
+        }
+        if let Some(tool) = aw.tool_registered.as_ref() {
+            dict.set_item("tool_registered", tool)?;
+        }
+        if let Some(key) = aw.extension_enabled.as_ref() {
+            dict.set_item("extension_enabled", key)?;
+        }
+        Ok(Some(dict))
     }
 
     fn __repr__(&self) -> String {

@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.3.36 — 2026-05-14
+
+### Added — `applies_when:` predicate gating on individual skills
+
+Skills can now declare predicate conditions for activation. Skills with `applies_when:` predicates that don't evaluate to true are silently omitted from `prompts/list` and `prompts/get`. Inspired by kglite's three-deployment scenario (legal / o&g / code) where the same skill catalogue ships to every deployment but only some skills should fire per-graph.
+
+```yaml
+---
+name: read_code_source
+description: Resolve qualified_name → source slice. TRIGGER when ...
+applies_when:
+  graph_has_node_type: [Function, Class]
+  graph_has_property: { node_type: Function, prop_name: module }
+  tool_registered: cypher_query
+  extension_enabled: csv_http_server
+---
+```
+
+Bounded predicate set — not a DSL. All populated predicates are ANDed. Predicate categories:
+
+- **Framework-internal** — `tool_registered`, `extension_enabled`. Dispatched against `ServerOptions.{tool_router, extensions}` without consulting any evaluator.
+- **Domain** — `graph_has_node_type`, `graph_has_property`. Dispatched via the new `SkillPredicateEvaluator` trait. Downstream binaries register one with `Registry::with_predicate_evaluator(...)` before `finalise()`.
+
+Evaluators that don't recognise a clause return `None`; the framework records `Unknown` and treats it as inactive — safer than silently activating the wrong-domain skill.
+
+### Behaviour split: operator-facing vs agent-facing
+
+- **Agent-facing `prompts/list` / `prompts/get`** — inactive skills are silently omitted. `tracing::info!` logs the failed clauses so the boot log carries full attribution.
+- **Operator-facing `mcp-server skills-list`** — shows every resolved skill with an `active`/`inactive` column and indented per-clause outcomes for inactive ones. Mirrors the existing loud-collision pattern.
+
+Mirrors the existing split for workspace activation: operator sees full provenance, agent sees only the resolved choice.
+
+### `ServerOptions.extensions` field
+
+`ServerOptions` gains an `extensions: serde_json::Map<String, Value>` field, populated from the manifest's `extensions:` block by `from_manifest`. Empty map when no `extensions:` block is present.
+
+Downstream binaries that previously read `Manifest.extensions` directly can now read the same data off `ServerOptions` without re-loading the manifest. The framework uses this internally for the `extension_enabled:` predicate.
+
+### Python surface — `Skill.applies_when`
+
+`mcp_methods.Skill` gains an `applies_when` getter returning a `dict | None`. Python operators can pre-filter their registries before calling `register_skills_as_prompts`:
+
+```python
+for skill in registry.skills():
+    if skill.applies_when and "graph_has_node_type" in skill.applies_when:
+        # filter against our domain state, skip if predicate fails
+        ...
+```
+
+The Python `SkillPredicateEvaluator` trait is not surfaced in this release — operators who need domain predicate dispatch from Python should pre-filter manually using `applies_when` introspection. Native Python evaluator support requires a Python-callable → Rust-trait bridge that's deferred to a future release.
+
+### Backwards compatibility
+
+A SKILL.md without `applies_when:` is always active — every existing skill keeps working unchanged. The `tool_registered` and `extension_enabled` framework-internal predicates work without any evaluator wired in, so single-domain consumers get most of the predicate engine for free.
+
 ## 0.3.35 — 2026-05-14
 
 ### Added — skills-aware MCP via the `prompts/` namespace

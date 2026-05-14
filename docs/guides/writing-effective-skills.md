@@ -151,6 +151,41 @@ In practice:
 
 Anthropic's hard guidance: **keep SKILL.md under 500 lines for optimal performance**. If you're approaching that, split into a top-level SKILL.md that points at `reference/<subtopic>.md` files. We don't currently support the reference-file pattern in our `.skills/` layout (single SKILL.md only), so 500 lines is a hard ceiling, not a soft one — for now, target 300 or below.
 
+## Predicate gating (0.3.36+)
+
+Some skills are correct guidance for *one* deployment of your binary and actively wrong for others — `read_code_source` is the canonical case: it makes sense against a code graph, and the agent loading it against a legal-corpus graph would reach for a tool with no useful behaviour. The `applies_when:` block lets you gate skills on runtime state:
+
+```yaml
+---
+name: read_code_source
+description: Resolve qualified_name → source slice. TRIGGER when ...
+applies_when:
+  graph_has_node_type: [Function, Class]
+---
+```
+
+Available predicates (bounded set):
+
+- **`graph_has_node_type: [Type, Type]`** — true when any listed type exists in the active graph schema. Needs a consumer-supplied `SkillPredicateEvaluator`.
+- **`graph_has_property: {node_type, prop_name}`** — true when the property exists on the named node type. Needs an evaluator.
+- **`tool_registered: tool_name`** — true when the tool is registered. Framework-internal; no evaluator needed.
+- **`extension_enabled: key`** — true when `manifest.extensions.key` is truthy. Framework-internal.
+
+All populated predicates are ANDed. No OR, no NOT, no nesting — by design. If you need OR, split into two skills.
+
+When to use:
+
+- You ship the same skill catalogue with multiple deployments (legal / o&g / code).
+- You have an optional tool that only registers under specific manifest config.
+- You want a skill to depend on an extension being enabled.
+
+When *not* to use:
+
+- The skill applies in every reasonable deployment (don't add predicates "just in case").
+- The "predicate" is really a domain decision the agent should make from the description (e.g. "this is for SQL queries" — that goes in TRIGGER, not `applies_when:`).
+
+See [Manifest Schema → `applies_when:`](../reference/manifest-schema.md#applies_when-predicate-gating-per-skill-0336) for the dispatch rules.
+
 ## What our framework adds
 
 Anthropic's frontmatter has two required fields (`name`, `description`) and an optional `license`. Ours adds framework-specific extensions:
