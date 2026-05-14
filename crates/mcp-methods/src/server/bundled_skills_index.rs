@@ -32,7 +32,7 @@ pub fn library_bundled_skills() -> Vec<BundledSkill> {
         },
         BundledSkill {
             name: "github_issues",
-            body: include_str!("bundled_skills/github_discussions.md"),
+            body: include_str!("bundled_skills/github_issues.md"),
         },
         BundledSkill {
             name: "repo_management",

@@ -1,6 +1,6 @@
 ---
 name: list_source
-description: Methodology for the `list_source` directory-listing tool — depth control, when to use it, how to interpret the tree output.
+description: "List directory contents under the configured source roots in tree format, with optional depth control. TRIGGER when the user wants to see how a repository is organized (\"what's in this repo?\", \"show me the layout\", \"first contact\" exploration), confirm a path exists before passing it to `read_source` or `grep`, drill into a subdirectory to see its modules, or spot conventions (monorepo `crates/`/`packages/`, test layout `tests/`/`test/`, migrations dir). ALSO TRIGGER when an agent has been wandering in `read_source` for a while without finding what it wants — a quick `list_source` of the parent dir often reveals what they missed. SKIP for finding files by content (use grep with a glob), reading file contents (use read_source), or symbol-graph navigation (use cypher_query / equivalent when available)."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:

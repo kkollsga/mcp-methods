@@ -1,6 +1,6 @@
 ---
 name: grep
-description: Methodology for the `grep` source-search tool — regex syntax, where to scope, how to interpret results.
+description: "Search code using regex patterns across the configured source roots, with file-glob scoping and result caps. TRIGGER when the user wants to find a symbol or string across files (function/class/variable name, error message, log line), locate call sites textually, hunt for patterns by file type, or sweep a codebase for occurrences of a name. ALSO TRIGGER when grep would be the natural shell tool — surfacing it here keeps the agent inside the framework's source sandbox. SKIP when the codebase has a knowledge graph and the question is structural (\"where is X defined?\", \"what calls Y?\") — graph queries are exact, grep is fuzzy. SKIP for single-file reads (use read_source) and directory layout questions (use list_source)."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:

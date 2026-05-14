@@ -1,6 +1,6 @@
 ---
 name: read_source
-description: Methodology for the `read_source` file-reading tool — slicing, filtering, the path-traversal guard, and when to drill vs. broaden.
+description: "Read source files from the configured source roots, with optional line slicing and in-file regex filtering. TRIGGER when the user wants the actual contents of a file at a known path, to slice into a specific line window after `grep` has pointed somewhere, to extract a function or section, or to filter to lines matching a pattern within a file. The framework enforces path-traversal protection — `..`, absolute paths, and symlinks that escape the configured roots all reject. ALSO TRIGGER when the user names a file (\"show me src/lib.rs\", \"open the manifest YAML\", \"what's in that test file\") rather than asking the agent to discover it. SKIP for locating which file holds something (use grep), seeing directory layout (use list_source), or reading binary artefacts and large logs (the tool is for source code, not raw artefacts)."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:

@@ -1,6 +1,6 @@
 ---
 name: github_issues
-description: Methodology for the `github_issues` tool — when to FETCH vs. SEARCH vs. LIST, the compact-response model, and ElementCache drill-down via `element_id`.
+description: "Search, list, or fetch GitHub issues, pull requests, and Discussions, with smart compaction and drill-down via element_id. TRIGGER when the user names a specific issue/PR/discussion number (FETCH mode with `number=N`), wants to search across topics by keyword (SEARCH mode with `query=\"...\"`), wants to see recent open items in a repo (LIST mode, no args), or wants to drill into a collapsed element (code block `cb_N`, patch `patch_N`, long comment `comment_N`, or `overflow`) inside a previously-fetched issue using `element_id=`. ALSO TRIGGER for questions like \"what's been broken lately?\", \"how was this handled before?\", \"read PR 1234\" — these map cleanly to LIST / SEARCH / FETCH respectively. The tool only registers when `GITHUB_TOKEN` is reachable at boot; if it doesn't appear in `tools/list`, the server has no token. SKIP for commits, branches, releases, or repo metadata (use github_api), reading the actual code a PR touches (use read_source against the local checkout — the conversation tells you *why*, the code tells you *what*), or authoring/commenting on issues (out of scope, read-only)."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:

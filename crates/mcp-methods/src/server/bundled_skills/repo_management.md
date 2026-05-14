@@ -1,6 +1,6 @@
 ---
 name: repo_management
-description: Methodology for the `repo_management` workspace tool — when to clone, update, delete, force-rebuild, and how workspace state interacts with `set_root_dir`.
+description: "Clone GitHub repos into the workspace, swap which repo is currently active, update clones to latest, force a rebuild, or delete a tracked repo. TRIGGER when the user wants to start work on a new repo (`set` with `name=\"org/repo\"`), pull latest on the active checkout (`update`), see the workspace inventory (`list`), drop a clone to reclaim disk (`delete`), or bypass the last-built-SHA gate (`force_rebuild`). ALSO TRIGGER for phrasings like \"switch to numpy\", \"what repos do I have?\", \"rebuild the graph\" — these map to set / list / force_rebuild. The tool only registers in workspace mode (`--workspace DIR` with `kind: github`); local-workspace deployments use `set_root_dir` instead. SKIP for reading code (use read_source/grep — repo_management only chooses *which* checkout the source tools see), one-off GitHub API queries without cloning (use github_api or github_issues), or pointing at a directory that's not on GitHub (use a local-mode workspace with `set_root_dir`)."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:
