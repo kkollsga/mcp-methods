@@ -22,17 +22,21 @@ jobs:
           echo "Package version: $VERSION"
       - name: Check if version exists on crates.io
         id: check_crates_io
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
         run: |
-          # crates.io API returns 404 for missing versions, 200 for present ones.
-          # We hit the version-specific endpoint so a partial-publish (crate exists
-          # but this version doesn't yet) still gets a 404 and triggers a publish.
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/mcp-methods/${{ steps.get_version.outputs.version }}")
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "Version ${{ steps.get_version.outputs.version }} already on crates.io"
+          # crates.io rate-limits / blocks default GitHub-runner User-Agents
+          # on the per-version endpoint (returns 403 instead of 200/404). Use
+          # the per-crate endpoint with an explicit UA and pull the version
+          # list — this is the same source the cargo client reads.
+          VERSIONS=$(curl -fsSL -A "mcp-methods-ci (kkollsga/mcp-methods)" \
+            "https://crates.io/api/v1/crates/mcp-methods" \
+            | jq -r '.versions[].num')
+          if echo "$VERSIONS" | grep -qx "$VERSION"; then
+            echo "Version $VERSION already on crates.io"
             echo "should_publish=false" >> $GITHUB_OUTPUT
           else
-            echo "Version ${{ steps.get_version.outputs.version }} not on crates.io (HTTP $HTTP_STATUS)"
+            echo "Version $VERSION not on crates.io"
             echo "should_publish=true" >> $GITHUB_OUTPUT
           fi
 
@@ -63,5 +67,24 @@ jobs:
       # paths are the only distribution channels for the binary.
       # mcp-methods-py has `publish = false` (cdylib, consumed only
       # by maturin). So this workflow only publishes one crate.
+      #
+      # The `already exists` branch is the idempotency belt — the
+      # version-check job is the suspenders. If a race or a stale
+      # cache lets a re-run reach this step after a successful
+      # publish, we treat it as a no-op rather than a failure.
       - name: cargo publish -p mcp-methods
-        run: cargo publish -p mcp-methods --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set +e
+          OUTPUT=$(cargo publish -p mcp-methods 2>&1)
+          STATUS=$?
+          echo "$OUTPUT"
+          if [ $STATUS -eq 0 ]; then
+            exit 0
+          fi
+          if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
+            echo "::notice::Version already on crates.io; treating as no-op."
+            exit 0
+          fi
+          exit $STATUS
