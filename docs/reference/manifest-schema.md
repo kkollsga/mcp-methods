@@ -18,6 +18,7 @@ The YAML manifest accepted by `mcp-server` and all downstream binaries. Strict u
 | `env_file` | string | no | walk-up `.env` | Path to `.env` file (relative to YAML or absolute) |
 | `workspace` | object | no | unset | Workspace mode declaration — see below |
 | `extensions` | object | no | `{}` | Opaque passthrough for downstream-binary-specific config |
+| `skills` | bool / string / list | no | `false` | Operator-authored methodology exposed via MCP `prompts/*` — see below |
 
 \* `source_root` and `source_roots` are mutually exclusive — specifying both is a validation error.
 
@@ -72,6 +73,30 @@ The framework parses but doesn't instantiate. Downstream binaries load when `tru
 | `watch` | bool | Optional, `local` mode only |
 
 The manifest `workspace:` block wins over CLI `--workspace` flag.
+
+## `skills:` polymorphic value
+
+Opts a deployment into shipping operator-authored methodology as MCP prompts. Three-layer composition: **project layer** (auto-detected `<basename>.skills/` directory adjacent to the manifest) → **domain pack(s)** (operator-declared paths) → **bundled defaults** (framework + downstream binary's compile-time skills). Higher layers fully replace same-named entries in lower layers (no merging).
+
+Accepted shapes:
+
+```yaml
+skills: false           # default — feature disabled, no prompts surface
+skills: true            # bundled framework defaults only
+skills: ./my-skills/    # one operator-declared directory
+skills:                 # mixed: bundled + domain pack(s)
+  - true
+  - ./my-skills/
+  - ~/shared-mcp-skills/
+```
+
+Paths resolve relative to the manifest YAML (or against `$HOME` when prefixed with `~/`). The auto-detected project layer is *always* probed when `skills:` is any non-`false` value — operators don't list it explicitly.
+
+Each SKILL.md file under a declared directory ships YAML frontmatter (`name`, `description`, optional `applies_to`/`references_tools`/`auto_inject_hint`) plus a markdown body. The framework enforces 4 KB soft / 16 KB hard size caps per skill and 64 KB total per resolved set.
+
+A no-`skills:` deployment is a verbatim-current deploy: no `prompts/*` capability advertised in MCP `initialize`, no behavioural diff against pre-0.3.35.
+
+See [Authoring Skills](../guides/authoring-skills.md) for the walkthrough and [Three-Layer Composition](../explanation/three-layer-composition.md) for the design rationale.
 
 ## `extensions:` object
 

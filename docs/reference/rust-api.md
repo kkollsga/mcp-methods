@@ -34,6 +34,14 @@ The most-imported types and functions, grouped:
 - [`Workspace::open`](https://docs.rs/mcp-methods/latest/mcp_methods/server/workspace/struct.Workspace.html#method.open) (GitHub mode) / [`Workspace::open_local`](https://docs.rs/mcp-methods/latest/mcp_methods/server/workspace/struct.Workspace.html#method.open_local) (local mode)
 - [`PostActivateHook`](https://docs.rs/mcp-methods/latest/mcp_methods/server/workspace/type.PostActivateHook.html) — callback signature
 
+### Skills
+
+- [`mcp_methods::server::SkillRegistry`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.Registry.html) — builder for the three-layer resolved set
+- [`mcp_methods::server::ResolvedRegistry`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.ResolvedRegistry.html) — post-resolution skill set
+- [`mcp_methods::server::serve_prompts`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.serve_prompts.html) — wire a resolved registry into `prompts/list` / `prompts/get`
+- [`mcp_methods::server::library_bundled_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.library_bundled_skills.html) — framework defaults Vec
+- [`mcp_methods::server::cli::skills_lint`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_lint.html) / [`skills_list`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_list.html) / [`skills_show`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_show.html) — composable CLI helpers
+
 ### Watch + env
 
 - [`mcp_methods::server::maybe_watch`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.maybe_watch.html) — spawn the filesystem watcher

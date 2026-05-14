@@ -113,6 +113,18 @@ In workspace, watch, and local-workspace modes, the framework looks for `<worksp
 
 In source-root and bare modes, no auto-detection happens — you must pass `--mcp-config PATH` explicitly if you want a manifest loaded.
 
+## Skills subcommands
+
+When a `skills-*` subcommand is given on the command line, `mcp-server` runs that command and exits without booting the MCP server:
+
+```bash
+mcp-server skills-lint ./mcp-servers/my_mcp.skills/
+mcp-server skills-list --mcp-config ./mcp-servers/my_mcp.yaml
+mcp-server skills-show --mcp-config ./mcp-servers/my_mcp.yaml cypher_query
+```
+
+These are operator tools — they don't interact with the server boot path. The same helpers are reachable from Rust as `mcp_methods::server::cli::{skills_lint, skills_list, skills_show}` so downstream binaries can offer the same surface in their own CLIs. See [Skills-Aware Manifests](skills-aware-manifests.md) for examples.
+
 ## See also
 
 - [Writing a Manifest](writing-a-manifest.md) — the schema

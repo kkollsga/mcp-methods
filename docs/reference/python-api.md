@@ -110,9 +110,58 @@ text = cache.fetch_issue("owner/repo", 123)
 code = cache.retrieve("owner/repo", 123, "cb_1")
 ```
 
+## Skills
+
+### `SkillRegistry`
+
+Resolved skill set built from a YAML manifest, applying the three-layer composition (project → domain pack → bundled defaults).
+
+```python
+from mcp_methods import SkillRegistry
+
+reg = SkillRegistry.from_manifest("./my_mcp.yaml")            # include_bundled=True by default
+reg = SkillRegistry.from_manifest("./my_mcp.yaml", include_bundled=False)
+reg = SkillRegistry.find_sibling("./data/legal.kdb")          # returns the path to legal_mcp.yaml
+
+reg.skill_names()       # → ['cypher_query', 'grep', 'read_source', ...]
+reg.get("grep")         # → Skill | None
+reg.skills()            # → list[Skill], sorted
+len(reg)                # → int
+"grep" in reg           # → bool
+```
+
+### `Skill`
+
+Single resolved skill. Read-only attributes:
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `name` | str | Lookup key used by `prompts/get`. |
+| `description` | str | One-line summary for `prompts/list`. |
+| `body` | str | Markdown body (frontmatter stripped). |
+| `provenance` | str | One of `"project"`, `"domain_pack:<path>"`, or `"bundled"`. |
+| `auto_inject_hint` | bool | Whether tool descriptions should get the `prompts/get` pointer. |
+| `references_tools` | list[str] | Tools the skill mentions in prose (per frontmatter). |
+
 ## FastMCP helpers
 
 See [Using FastMCP Helpers](../guides/using-fastmcp-helpers.md) for `mcp_methods.fastmcp` (separate sub-module).
+
+### `register_skills_as_prompts(app, registry) -> int`
+
+Walks `registry`, registers each skill as a `@app.prompt(name, description)` on the FastMCP `app`, and returns the count of registered prompts. Empty registries are a safe no-op.
+
+```python
+from mcp.server.fastmcp import FastMCP
+from mcp_methods import SkillRegistry
+from mcp_methods.fastmcp import register_skills_as_prompts
+
+app = FastMCP("My Server")
+registry = SkillRegistry.from_manifest("./my_mcp.yaml")
+n = register_skills_as_prompts(app, registry)
+print(f"registered {n} skills")
+app.run(transport="stdio")
+```
 
 ## See also
 

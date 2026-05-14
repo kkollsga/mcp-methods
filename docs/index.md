@@ -31,6 +31,8 @@ guides/downstream-binary
 guides/python-bindings
 guides/using-fastmcp-helpers
 guides/watch-and-workspace
+guides/skills-aware-manifests
+guides/authoring-skills
 ```
 
 ```{toctree}
@@ -40,6 +42,7 @@ guides/watch-and-workspace
 explanation/architecture
 explanation/trust-pattern
 explanation/distribution-shape
+explanation/three-layer-composition
 ```
 
 ```{toctree}
