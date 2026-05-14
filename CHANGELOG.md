@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.3.35 — unreleased
+
+### Added — skills-aware MCP via the `prompts/` namespace
+
+A new top-level manifest field, `skills:`, opts a deployment into
+shipping operator-authored methodology as MCP prompts. The three-layer
+composition is **project → domain pack → bundled defaults**, with
+later-layer (i.e. project) entries fully replacing same-named entries
+in the lower layers:
+
+```yaml
+name: kglite-mcp-server
+skills:
+  - true                    # framework defaults (5 bundled skills)
+  - ./my-skills/            # domain skill-pack (operator-declared dir)
+```
+
+Polymorphic shape: `skills: false` (default), `skills: true` (bundled
+only), `skills: ./path/` (one domain pack), or a list mixing booleans
+and paths. The auto-detected project layer is `<basename>.skills/`
+adjacent to the manifest YAML — if present, it wins over both
+domain-pack and bundled.
+
+Bundled framework defaults ship five SKILL.md files (`grep`,
+`read_source`, `list_source`, `github_issues`, `repo_management`) that
+operators inherit when `skills: true`. Downstream binaries can add
+their own bundled layer via `Registry::add_bundled_many(...)` before
+finalising.
+
+### Wiring helpers for downstream binaries
+
+Downstream binaries reach the wiring with roughly ten lines of glue:
+
+```rust
+let manifest = mcp_methods::server::load_manifest(&path)?;
+let registry = mcp_methods::server::SkillRegistry::new()
+    .merge_framework_defaults()
+    .auto_detect_project_layer(&path)
+    .layer_dirs(&manifest.skills, &path)?
+    .finalise()?;
+let mut server = mcp_methods::server::McpServer::new(opts);
+mcp_methods::server::serve_prompts(&registry, &mut server);
+```
+
+`serve_prompts(registry, server)` populates the `prompts/list` /
+`prompts/get` surface and applies an auto-injection pass on tool
+descriptions: skills with `auto_inject_hint: true` whose name matches
+a registered tool get a "see `prompts/get` `<name>` for full
+methodology" pointer appended to that tool's description, so agents
+who only read `tools/list` can still find the methodology.
+
+### Zero impact on existing deployments
+
+A manifest with no `skills:` declaration is a verbatim-current deploy:
+no `prompts/` capability advertised in `get_info`, no behavioural
+diff. The constraint is enforced at the type level via
+`SkillsSource::Disabled` (the default) and at the runtime level via
+the empty `prompt_router` — the rmcp default `list_prompts` /
+`get_prompt` impls return empty / not-found when no skills are
+registered.
+
+### Python bindings
+
+`mcp_methods.SkillRegistry` and `mcp_methods.Skill` ship as thin
+pyo3 wrappers (newtype + delegate). `SkillRegistry.from_manifest(path,
+include_bundled=True)` builds the registry; `register_skills_as_prompts(app,
+registry)` in `mcp_methods.fastmcp` wires it into a FastMCP server in
+one call. The framework crate (`mcp-methods`) remains pyo3-free; the
+CI gate (`cargo tree -p mcp-methods -e all | grep pyo3` returns empty)
+is unchanged.
+
+### Frontmatter schema
+
+Each SKILL.md file ships YAML frontmatter for metadata:
+
+```yaml
+---
+name: cypher_query
+description: One-line summary for `prompts/list`.
+applies_to:
+  mcp_methods: ">=0.3.35"
+references_tools:
+  - cypher_query
+references_arguments:
+  - cypher_query.format
+auto_inject_hint: true     # default
+applies_when: []           # phase-3 predicate hooks; parsed but inert
+---
+
+# Methodology body in markdown...
+```
+
+`name` and `description` are required; everything else is optional.
+The `applies_when:` predicate evaluator is deferred to a later release
+— predicates parse but don't gate yet.
+
+### Size limits
+
+The registry enforces three soft/hard caps to keep the prompt surface
+healthy: 4 KB lint-warns, 16 KB hard-fails a single skill, 64 KB caps
+the resolved-set total. The framework's bundled skills round-trip
+through CI tests that pin the limits.
+
 ## 0.3.34 — 2026-05-14
 
 ### Added — `tools[].bundled: rename:` per-deployment tool aliasing

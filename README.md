@@ -77,8 +77,9 @@ Rust API rustdoc: **[docs.rs/mcp-methods](https://docs.rs/mcp-methods)**.
 | `html_to_text`, `compact_text`, `collapse_code_blocks` | Text utilities |
 | `extract_github_refs`, `detect_git_repo`, `validate_repo` | Git/GitHub helpers |
 | `mcp_methods.fastmcp` | Composable tool registrations for FastMCP servers |
+| `SkillRegistry`, `Skill`, `register_skills_as_prompts` | Operator-authored methodology as MCP prompts (three-layer: project → domain pack → bundled defaults). See `crates/mcp-methods/dev-documentation/skills-aware-mcp.md` for the design doc. |
 
-Plus the **server framework** in `mcp_methods::server::*`: `McpServer`, `ServerOptions`, `Manifest`, `Workspace`, `watch_dir`, `load_env_walk`. See the [Rust API reference](https://mcp-methods.readthedocs.io/en/latest/reference/rust-api.html).
+Plus the **server framework** in `mcp_methods::server::*`: `McpServer`, `ServerOptions`, `Manifest`, `Workspace`, `watch_dir`, `load_env_walk`, `serve_prompts`. See the [Rust API reference](https://mcp-methods.readthedocs.io/en/latest/reference/rust-api.html).
 
 ## License
 
