@@ -33,6 +33,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use rmcp::handler::server::router::prompt::{PromptRoute, PromptRouter};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -40,6 +41,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use serde::{Deserialize, Serialize};
 
 use crate::server::manifest::Manifest;
+use crate::server::skills::ResolvedRegistry;
 use crate::server::source::{
     self, resolve_dir_under_roots, GrepOpts, ListOpts, ReadOpts, SourceRootsProvider,
 };
@@ -341,6 +343,11 @@ fn default_depth() -> usize {
 pub struct McpServer {
     options: ServerOptions,
     tool_router: ToolRouter<McpServer>,
+    /// Skill-backed prompt routes. Empty until [`serve_prompts`] is
+    /// called with a resolved skill registry; remains empty for the
+    /// existing zero-skills boot path so `prompts/list` returns the
+    /// rmcp default (empty result, no capability advertised).
+    prompt_router: PromptRouter<McpServer>,
 }
 
 #[tool_router]
@@ -349,6 +356,7 @@ impl McpServer {
         let mut server = Self {
             options,
             tool_router: Self::tool_router(),
+            prompt_router: PromptRouter::new(),
         };
         server.register_github_tools_if_authorized();
         server.register_local_workspace_tools();
@@ -510,6 +518,14 @@ impl McpServer {
     /// mutation would race.
     pub fn tool_router_mut(&mut self) -> &mut ToolRouter<McpServer> {
         &mut self.tool_router
+    }
+
+    /// Mutable access to the prompt router for dynamic skill / prompt
+    /// registration. Same lifecycle contract as [`tool_router_mut`]:
+    /// boot-time only. Most operators reach prompts via
+    /// [`serve_prompts`] rather than touching the router directly.
+    pub fn prompt_router_mut(&mut self) -> &mut PromptRouter<McpServer> {
+        &mut self.prompt_router
     }
 
     /// Register a typed dynamic tool. Compresses the boilerplate of:
@@ -768,6 +784,69 @@ fn resolve_repo_from(
     )
 }
 
+/// Wire a resolved skill registry into a server's `prompts/list` and
+/// `prompts/get` surface, and apply auto-injection hints to tool
+/// descriptions for skills whose name matches a registered tool.
+///
+/// Call at boot time after all tools have been registered (so the
+/// auto-inject pass sees the final tool catalogue) and before
+/// `serve(...)`. Idempotent in spirit but not by construction:
+/// calling twice with the same registry would re-append the hint to
+/// already-injected descriptions, so don't.
+///
+/// The function is additive and a no-op when the registry is empty
+/// — downstream callers can wire it unconditionally without breaking
+/// the zero-skills boot path.
+pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
+    use std::borrow::Cow;
+
+    let mut auto_inject: Vec<(String, String)> = Vec::new();
+
+    for name in registry.skill_names() {
+        let Some(skill) = registry.get(&name) else {
+            continue;
+        };
+        let prompt = Prompt::new(
+            skill.name().to_string(),
+            Some(skill.description().to_string()),
+            None,
+        );
+        let body = skill.body.clone();
+        let route = PromptRoute::new_dyn(prompt, move |_ctx| {
+            let body = body.clone();
+            Box::pin(async move {
+                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                    PromptMessageRole::Assistant,
+                    body,
+                )]))
+            })
+        });
+        server.prompt_router.add_route(route);
+
+        if skill.frontmatter.auto_inject_hint {
+            auto_inject.push((skill.name().to_string(), skill.description().to_string()));
+        }
+    }
+
+    // Auto-inject discoverability hints: for each skill where
+    // `auto_inject_hint: true` AND a registered tool shares the
+    // skill's name, append a pointer line to the tool description
+    // so agents who only see `tools/list` can still find the
+    // methodology. Skips unmatched skills silently — operators see
+    // those skills via `prompts/list` regardless.
+    for (skill_name, _desc) in &auto_inject {
+        let key = Cow::<'static, str>::Owned(skill_name.clone());
+        if let Some(route) = server.tool_router.map.get_mut(&key) {
+            let hint = format!("\n\nSee `prompts/get` `{skill_name}` for the full methodology.");
+            let new_desc = match route.attr.description.take() {
+                Some(existing) => format!("{existing}{hint}"),
+                None => hint.trim_start().to_string(),
+            };
+            route.attr.description = Some(Cow::Owned(new_desc));
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -776,13 +855,49 @@ impl ServerHandler for McpServer {
             .name
             .clone()
             .unwrap_or_else(|| "MCP Server".to_string());
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        // Only advertise the prompts capability when at least one skill
+        // is registered. The zero-skills boot path is the existing
+        // contract and must keep producing capability output that's
+        // byte-identical to today. ServerCapabilities is `#[non_exhaustive]`
+        // but its fields are pub, so we mutate after `build()` rather
+        // than fighting the type-state builder.
+        let mut caps = ServerCapabilities::builder().enable_tools().build();
+        if !self.prompt_router.map.is_empty() {
+            caps.prompts = Some(PromptsCapability::default());
+        }
+        let mut info = ServerInfo::new(caps)
             .with_server_info(Implementation::new(name, env!("CARGO_PKG_VERSION")))
             .with_protocol_version(ProtocolVersion::V_2024_11_05);
         if let Some(text) = &self.options.instructions {
             info = info.with_instructions(text.clone());
         }
         info
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult {
+            meta: None,
+            next_cursor: None,
+            prompts: self.prompt_router.list_all(),
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
+            self,
+            request.name,
+            request.arguments,
+            context,
+        );
+        self.prompt_router.get_prompt(prompt_context).await
     }
 }
 
@@ -799,10 +914,12 @@ mod tests {
     #[test]
     fn builtins_exposed_via_server() {
         use crate::server::manifest::{BuiltinsConfig, TempCleanup};
-        let mut opts = ServerOptions::default();
-        opts.builtins = BuiltinsConfig {
-            save_graph: true,
-            temp_cleanup: TempCleanup::OnOverview,
+        let opts = ServerOptions {
+            builtins: BuiltinsConfig {
+                save_graph: true,
+                temp_cleanup: TempCleanup::OnOverview,
+            },
+            ..ServerOptions::default()
         };
         let server = McpServer::new(opts);
         assert!(server.builtins().save_graph);
@@ -872,5 +989,155 @@ mod tests {
         assert_eq!(server.current_source_roots(), vec!["/initial".to_string()]);
         *state.lock().unwrap() = vec!["/swapped".to_string()];
         assert_eq!(server.current_source_roots(), vec!["/swapped".to_string()]);
+    }
+
+    // ─── Prompt / skill wiring ────────────────────────────────────
+
+    fn build_test_registry(
+        skills: &[(&str, &str, &str, bool)],
+    ) -> crate::server::skills::ResolvedRegistry {
+        use crate::server::skills::Registry;
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("manifest.yaml");
+        let skills_dir = dir.path().join("manifest.skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        for (name, description, body, auto_inject) in skills {
+            let auto = if *auto_inject { "true" } else { "false" };
+            let content = format!(
+                "---\nname: {name}\ndescription: {description}\nauto_inject_hint: {auto}\n---\n\n{body}\n"
+            );
+            std::fs::write(skills_dir.join(format!("{name}.md")), content).unwrap();
+        }
+        Registry::new()
+            .auto_detect_project_layer(&yaml_path)
+            .finalise()
+            .unwrap()
+    }
+
+    #[test]
+    fn prompt_router_empty_by_default() {
+        let server = McpServer::new(ServerOptions::default());
+        assert!(server.prompt_router.map.is_empty());
+    }
+
+    #[test]
+    fn get_info_no_prompts_capability_when_empty() {
+        // Zero-impact invariant: a server with no skills must not
+        // advertise the prompts capability. kglite's existing
+        // deployment depends on this byte-for-byte.
+        let server = McpServer::new(ServerOptions::default());
+        let info = server.get_info();
+        assert!(
+            info.capabilities.prompts.is_none(),
+            "prompts capability must be absent when no skills are registered"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_registers_routes_with_metadata() {
+        let registry = build_test_registry(&[
+            ("alpha", "First skill.", "Alpha body.", true),
+            ("beta", "Second skill.", "Beta body.", true),
+        ]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+
+        let prompts = server.prompt_router.list_all();
+        let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+
+        let alpha = prompts.iter().find(|p| p.name == "alpha").unwrap();
+        assert_eq!(alpha.description.as_deref(), Some("First skill."));
+        assert!(alpha.arguments.is_none());
+    }
+
+    #[test]
+    fn serve_prompts_empty_registry_is_noop() {
+        let registry = crate::server::skills::ResolvedRegistry::default();
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        assert!(server.prompt_router.map.is_empty());
+        assert!(server.get_info().capabilities.prompts.is_none());
+    }
+
+    #[test]
+    fn get_info_advertises_prompts_when_present() {
+        let registry = build_test_registry(&[("alpha", "First skill.", "Alpha body.", true)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        let info = server.get_info();
+        assert!(
+            info.capabilities.prompts.is_some(),
+            "prompts capability must be advertised once a skill is registered"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_auto_injects_hint_into_matching_tool() {
+        // `ping` is registered by every server. A skill named `ping`
+        // with `auto_inject_hint: true` should mutate the ping tool's
+        // description to point at the prompt.
+        let registry = build_test_registry(&[("ping", "Ping methodology.", "Ping body.", true)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        let before = server
+            .tool_router
+            .get("ping")
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        super::serve_prompts(&registry, &mut server);
+        let after = server
+            .tool_router
+            .get("ping")
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        assert!(after.starts_with(&before), "original description preserved");
+        assert!(
+            after.contains("`prompts/get`") && after.contains("`ping`"),
+            "hint should reference prompts/get and the skill name; got: {after}"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_skips_injection_when_disabled() {
+        let registry = build_test_registry(&[("ping", "Ping methodology.", "Ping body.", false)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        let before = server
+            .tool_router
+            .get("ping")
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        super::serve_prompts(&registry, &mut server);
+        let after = server
+            .tool_router
+            .get("ping")
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            before, after,
+            "auto_inject_hint=false must leave tool description untouched"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_skips_injection_when_no_matching_tool() {
+        // Skill name doesn't match any registered tool; nothing to
+        // inject into, but the prompt route is still added.
+        let registry = build_test_registry(&[("no_such_tool", "Methodology.", "Body.", true)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        assert!(server.prompt_router.map.contains_key("no_such_tool"));
+        // No panic, no mutation of unrelated tools — the ping tool's
+        // description is unchanged.
+        let ping_desc = server
+            .tool_router
+            .get("ping")
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        assert!(!ping_desc.contains("no_such_tool"));
     }
 }

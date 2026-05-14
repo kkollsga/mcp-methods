@@ -1079,10 +1079,7 @@ Body.\n";
         // Bundled `foo`:
         let bundled = BundledSkill {
             name: "foo",
-            body: Box::leak(
-                format!("---\nname: foo\ndescription: from bundled.\n---\nbundled body\n")
-                    .into_boxed_str(),
-            ),
+            body: "---\nname: foo\ndescription: from bundled.\n---\nbundled body\n",
         };
 
         // Project layer `foo`:
