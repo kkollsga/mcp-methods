@@ -33,6 +33,7 @@ guides/using-fastmcp-helpers
 guides/watch-and-workspace
 guides/skills-aware-manifests
 guides/authoring-skills
+guides/writing-effective-skills
 ```
 
 ```{toctree}

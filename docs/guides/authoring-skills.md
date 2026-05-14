@@ -109,6 +109,7 @@ Skills whose name doesn't match any registered tool are still surfaced via `prom
 
 ## See also
 
+- [Writing Effective Skills](writing-effective-skills.md) — the *craft* side: description patterns, body anatomy, tone, what we learned from reading Anthropic's published skills
 - [Manifest Schema Reference](../reference/manifest-schema.md#skills-polymorphic-value) — the `skills:` field shape
 - [Three-Layer Composition](../explanation/three-layer-composition.md) — why three layers, when each is the right home
 - [Python bindings](python-bindings.md#skills) — `SkillRegistry` and `register_skills_as_prompts` for FastMCP authors
