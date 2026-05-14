@@ -2,6 +2,22 @@
 
 A companion to [Authoring Skills](authoring-skills.md). That page covers the mechanics (frontmatter fields, where files live, lint output). This page covers the *craft*: what makes a skill that agents actually trigger and use well. The patterns here are distilled from reading Anthropic's published skills at [github.com/anthropics/skills](https://github.com/anthropics/skills) plus our own five bundled defaults.
 
+## How skill bodies reach the agent
+
+Worth stating up front, because pre-0.3.37 the answer was different and operators authoring against the old assumption hit a real wall:
+
+**The primary delivery channel for a skill body is the matching tool's description.** When a skill has `auto_inject_hint: true` (the default) AND its name matches a registered tool, the framework embeds the full skill body under a `## Methodology` header inside that tool's description. The 4 KB soft / 16 KB hard size caps the framework enforces per skill bound how big this embed gets.
+
+Why this matters: real MCP clients (Claude Code, Claude Desktop, Cursor, Continue) expose only `tools/*` to the agent. The MCP protocol's `prompts/*` plane was designed for human-invoked slash commands in chat UIs — agentic clients don't surface it to the model. An agent reading `tools/list` sees the embedded methodology; an agent looking for `prompts/get` finds nothing it can call.
+
+Implications for authoring:
+
+- **Skill name should match a registered tool name** for the inject to fire. The five bundled framework skills (`grep`, `read_source`, `list_source`, `github_issues`, `repo_management`) all do this.
+- **Cross-cutting skills with no matching tool** (workflow guidance, methodology spanning several tools) still show up in `prompts/list` and `prompts/get` — they just don't get auto-injected anywhere. For these, consider whether the content actually belongs in the manifest's top-level `instructions:` field, which always reaches the agent.
+- **`auto_inject_hint: false`** is the per-skill escape hatch when an operator wants the smaller `tools/list` payload and is fine with the methodology being unreachable in standard clients.
+
+`prompts/list` and `prompts/get` still work for any MCP client that does surface prompts to the agent (rare today), plus CLI introspection (`mcp-server skills-show`) and operator/programmatic readers. The two channels coexist; the auto-inject is just the primary one for agentic clients.
+
 ## The description is your discovery mechanism
 
 Agents see two things about a skill before they decide to fetch its body:

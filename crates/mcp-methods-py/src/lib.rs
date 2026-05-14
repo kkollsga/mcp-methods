@@ -755,6 +755,27 @@ impl PySkillRegistry {
             .collect()
     }
 
+    /// Non-fatal per-file load failures from the most recent
+    /// `from_manifest` call. Returns a list of `{"path": str,
+    /// "error": str}` dicts. Empty in the happy path. Files that
+    /// fail to parse (YAML errors, missing required frontmatter,
+    /// size-limit violations) are silently skipped at load time
+    /// rather than failing the whole registry — this getter is the
+    /// durable channel for operators to render those warnings in
+    /// their boot summary instead of having to enable tracing.
+    fn parse_warnings<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.inner
+            .parse_warnings()
+            .iter()
+            .map(|w| {
+                let d = PyDict::new(py);
+                d.set_item("path", w.path.display().to_string())?;
+                d.set_item("error", &w.error)?;
+                Ok(d)
+            })
+            .collect()
+    }
+
     fn __len__(&self) -> usize {
         self.inner.len()
     }

@@ -297,6 +297,39 @@ def test_applies_when_surfaces_as_dict(tmp_path: Path) -> None:
     }
 
 
+def test_parse_warnings_empty_in_happy_path(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    assert reg.parse_warnings() == []
+
+
+def test_parse_warnings_surface_dropped_file(tmp_path: Path) -> None:
+    # The exact failure mode an mcp-servers operator hit deploying
+    # kglite 0.9.31 — unquoted colon in description breaks YAML
+    # parsing, the file is silently dropped at load time. Pre-0.3.37
+    # this was invisible without tracing; the parse_warnings list is
+    # the durable structured channel.
+    manifest = tmp_path / "test_mcp.yaml"
+    manifest.write_text("name: t\nskills: true\n")
+    skills_dir = tmp_path / "test_mcp.skills"
+    skills_dir.mkdir()
+    (skills_dir / "good.md").write_text(
+        "---\nname: good\ndescription: A working skill.\n---\nBody.\n"
+    )
+    (skills_dir / "broken.md").write_text(
+        "---\nname: broken\ndescription: First clause: second clause\n---\nBody.\n"
+    )
+
+    reg = SkillRegistry.from_manifest(str(manifest), include_bundled=False)
+    # Good skill still resolves; broken file produces a warning.
+    assert reg.get("good") is not None
+    assert reg.get("broken") is None
+    warnings = reg.parse_warnings()
+    assert len(warnings) == 1
+    assert warnings[0]["path"].endswith("broken.md")
+    assert warnings[0]["error"]
+
+
 def test_applies_when_partial_block_omits_absent_keys(tmp_path: Path) -> None:
     # Operators rarely use all four predicates. Confirm the dict
     # only contains keys that were actually populated in YAML.

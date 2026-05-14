@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.3.37 — 2026-05-14
+
+### Fixed — agent retrieval gap (the load-bearing one)
+
+The auto-inject pass for `auto_inject_hint: true` skills previously appended a `[See prompts/get <name> for full methodology.]` pointer to the matched tool's description. **Agents in real MCP clients can't reach `prompts/get`** — Claude Code, Claude Desktop, Cursor, and Continue all expose only `tools/*` to the model; the `prompts/*` plane was designed for human-invoked slash commands. The pointer was a dangling reference; operator-authored methodology was unreachable by the agent.
+
+This release replaces the pointer with **full-body embedding** under a `## Methodology` header in the matched tool's description. Bounded by the existing 4 KB soft / 16 KB hard size caps the framework enforces per skill. Operators who want the older pointer-shaped behaviour (or no inject at all) set `auto_inject_hint: false` per skill.
+
+`prompts/list` and `prompts/get` continue to work — they're still useful for MCP clients that do surface prompts to the agent, plus CLI introspection (`mcp-server skills-show`). The auto-inject path just becomes the primary delivery channel for the agentic clients in use today.
+
+Found by an mcp-servers operator deploying kglite 0.9.31 + mcp-methods 0.3.36 against a live Claude Code session. Their three eval queries passed only because `graph_overview` happened to inline schema + methodology in one tool response; skills with non-parallel property prefixes, multi-hop temporal idioms, or out-of-schema content would have failed silently.
+
+### Fixed — silent file-drop on YAML parse error
+
+`SkillRegistry.from_manifest` previously silently skipped any SKILL.md whose frontmatter failed to parse. The intent was "one broken skill in a domain pack shouldn't take down the rest" — but the surface was *too* silent: operators hitting an unquoted colon in a description (`First clause: second clause`, which PyYAML reads as a mapping value separator) spent 25-minute debug sessions wondering why their override "took" but didn't show up in `prompts/list`.
+
+Two-channel fix:
+
+1. **`tracing::warn!`** continues to fire per dropped file. Operators with structured tracing get the warning immediately.
+2. **New `ResolvedRegistry.parse_warnings()`** Rust getter and **`SkillRegistry.parse_warnings` Python getter** — durable structured surface that downstream binaries can render in their boot summary. Returns `Vec<ParseWarning>` (Rust) or `list[dict]` (Python) with per-file path + error.
+
+```rust
+let registry = SkillRegistry::new()
+    .auto_detect_project_layer(&yaml_path)
+    .finalise()?;
+for warning in registry.parse_warnings() {
+    eprintln!("skill drop: {} — {}", warning.path.display(), warning.error);
+}
+```
+
+```python
+reg = SkillRegistry.from_manifest("./my_mcp.yaml")
+for w in reg.parse_warnings():
+    print(f"skill drop: {w['path']} — {w['error']}")
+```
+
+Same pattern as the existing `(no .env found)` boot lines downstream binaries already render — operators internalised that channel.
+
+### Tests + docs
+
+- `load_skills_from_dir_surfaces_yaml_parse_failure_as_warning` — reproduces the operator's colon-in-description scenario; good skill still loads, broken file surfaces as a structured warning.
+- `resolved_registry_parse_warnings_propagated_from_project_layer` — end-to-end through `Registry::finalise`.
+- `serve_prompts_auto_injects_full_body_into_matching_tool` — replaces the pre-0.3.37 pointer-assertion test; now asserts `## Methodology` header + body sentinel are present, and that `prompts/get` is **not** referenced (anti-regression).
+- `docs/guides/writing-effective-skills.md` gains a "How skill bodies reach the agent" section explaining the retrieval-gap rationale and authoring implications.
+
+### Backwards compatibility
+
+- A skill without `auto_inject_hint` (or with `auto_inject_hint: true`, the default) now produces a larger tool description than in 0.3.36. The size is bounded by the per-skill caps; operators who want the old behaviour set `auto_inject_hint: false`.
+- `parse_warnings` is a new field on `ResolvedRegistry` — additive, doesn't break any existing usage.
+- The `load_skills_from_dir` function's return type changed from `Result<Vec<Skill>, _>` to `Result<(Vec<Skill>, Vec<ParseWarning>), _>`. This is technically a breaking change for anyone calling that function directly, but kglite's audit and our own grep confirmed no downstream consumers reach for it — they go through `Registry::finalise` instead.
+
 ## 0.3.36 — 2026-05-14
 
 ### Added — `applies_when:` predicate gating on individual skills

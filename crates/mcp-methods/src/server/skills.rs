@@ -528,17 +528,43 @@ pub fn load_skill_from_file(path: &Path, provenance: SkillProvenance) -> Result<
     })
 }
 
+/// A non-fatal warning emitted while loading skills — a single file
+/// failed to parse, but the rest of the directory was loaded
+/// successfully.
+///
+/// Surfaced on [`ResolvedRegistry::parse_warnings`] so downstream
+/// binaries can render warnings in their boot summary. Operators
+/// previously had to set up tracing-subscriber filters to see these;
+/// the structured surface makes them visible without log plumbing.
+///
+/// Lands in 0.3.37 in response to an operator hitting an unquoted
+/// colon in a description (`First clause: second clause`) — PyYAML
+/// raised `mapping values are not allowed here` and the loader
+/// silently skipped the file. 25-minute debug session later, the
+/// operator switched to a folded scalar. The lesson: silent skip is
+/// the worst failure mode for a new authoring surface.
+#[derive(Debug, Clone)]
+pub struct ParseWarning {
+    /// The file that failed to load.
+    pub path: PathBuf,
+    /// Human-readable description of why it failed.
+    pub error: String,
+}
+
 /// Walk a directory for `*.md` files, loading each as a skill.
 ///
-/// Files that fail to parse log warnings via `tracing::warn!` and
-/// are skipped — one malformed skill in a domain pack shouldn't take
-/// down the rest. The lint pass surfaces these for fix-it-later.
+/// Files that fail to parse are skipped (one malformed skill in a
+/// domain pack shouldn't take down the rest) but their errors are
+/// **both** logged via `tracing::warn!` AND collected for the caller
+/// to surface via [`ResolvedRegistry::parse_warnings`]. Operators
+/// using stdio transport — where tracing output may not be visible —
+/// can still see the warnings through the structured channel.
 pub fn load_skills_from_dir(
     dir: &Path,
     provenance: SkillProvenance,
-) -> Result<Vec<Skill>, SkillError> {
+) -> Result<(Vec<Skill>, Vec<ParseWarning>), SkillError> {
     if !dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let entries = fs::read_dir(dir).map_err(|e| SkillError::Io {
@@ -547,6 +573,7 @@ pub fn load_skills_from_dir(
     })?;
 
     let mut skills = Vec::new();
+    let mut warnings = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -556,6 +583,10 @@ pub fn load_skills_from_dir(
                     error = %e,
                     "failed to read directory entry; skipping"
                 );
+                warnings.push(ParseWarning {
+                    path: dir.to_path_buf(),
+                    error: format!("failed to read directory entry: {e}"),
+                });
                 continue;
             }
         };
@@ -571,11 +602,15 @@ pub fn load_skills_from_dir(
                         error = %e,
                         "failed to load skill; skipping"
                     );
+                    warnings.push(ParseWarning {
+                        path: path.clone(),
+                        error: e.to_string(),
+                    });
                 }
             }
         }
     }
-    Ok(skills)
+    Ok((skills, warnings))
 }
 
 // ─── Path resolution ──────────────────────────────────────────────
@@ -978,16 +1013,24 @@ impl Registry {
         }
 
         // Root layer: walk each declared path; first wins per name.
+        // Accumulate parse warnings across all layers so the resolved
+        // registry can surface them to downstream binaries.
+        let mut parse_warnings: Vec<ParseWarning> = Vec::new();
         let mut root_skills_per_dir: Vec<Vec<Skill>> = Vec::with_capacity(root_dirs.len());
         for (resolved, _raw) in &root_dirs {
             let provenance = SkillProvenance::DomainPack(resolved.clone());
-            let skills = load_skills_from_dir(resolved, provenance)?;
+            let (skills, warnings) = load_skills_from_dir(resolved, provenance)?;
+            parse_warnings.extend(warnings);
             root_skills_per_dir.push(skills);
         }
 
         // Project layer: auto-detected adjacent dir.
         let project_skills: Vec<Skill> = match &project_dir {
-            Some(dir) => load_skills_from_dir(dir, SkillProvenance::Project)?,
+            Some(dir) => {
+                let (skills, warnings) = load_skills_from_dir(dir, SkillProvenance::Project)?;
+                parse_warnings.extend(warnings);
+                skills
+            }
             None => Vec::new(),
         };
 
@@ -1067,6 +1110,7 @@ impl Registry {
         Ok(ResolvedRegistry {
             skills: resolved,
             evaluator,
+            parse_warnings,
         })
     }
 }
@@ -1093,6 +1137,12 @@ pub struct ResolvedRegistry {
     /// means domain predicates resolve to `Unknown` → skill
     /// inactive.
     pub(crate) evaluator: Option<Arc<dyn SkillPredicateEvaluator>>,
+    /// Non-fatal per-file load failures (silent skips). Empty in the
+    /// happy path; populated when a SKILL.md fails to parse and the
+    /// rest of the directory is loaded around it. Downstream binaries
+    /// render these in their boot summary so operators see what was
+    /// silently dropped without having to enable tracing.
+    parse_warnings: Vec<ParseWarning>,
 }
 
 impl std::fmt::Debug for ResolvedRegistry {
@@ -1139,6 +1189,16 @@ impl ResolvedRegistry {
     /// Whether the registry contains any skills.
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
+    }
+
+    /// Per-file load failures that were silently skipped. Empty in
+    /// the happy path. Each entry names the path and the error so
+    /// downstream binaries can render them in their boot summary —
+    /// the durable channel for visibility into "this file was
+    /// silently dropped" failures that previously cost a 25-minute
+    /// debug session per operator.
+    pub fn parse_warnings(&self) -> &[ParseWarning] {
+        &self.parse_warnings
     }
 
     /// Evaluate the `applies_when:` block on `skill` against this
@@ -1387,8 +1447,10 @@ Body.\n";
         fs::create_dir(&sub).unwrap();
         write_skill(&sub, "c", &minimal_skill("c"));
 
-        let skills = load_skills_from_dir(dir.path(), SkillProvenance::Project).unwrap();
+        let (skills, warnings) =
+            load_skills_from_dir(dir.path(), SkillProvenance::Project).unwrap();
         assert_eq!(skills.len(), 2);
+        assert!(warnings.is_empty());
         let mut names: Vec<&str> = skills.iter().map(|s| s.name()).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
@@ -1398,8 +1460,72 @@ Body.\n";
     fn load_skills_from_dir_missing_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does-not-exist");
-        let skills = load_skills_from_dir(&nonexistent, SkillProvenance::Project).unwrap();
+        let (skills, warnings) =
+            load_skills_from_dir(&nonexistent, SkillProvenance::Project).unwrap();
         assert!(skills.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn load_skills_from_dir_surfaces_yaml_parse_failure_as_warning() {
+        // The exact scenario the operator hit: unquoted colon in
+        // description value triggers PyYAML's "mapping values are
+        // not allowed here" — except ours uses serde_yaml so the
+        // failure mode is `InvalidFrontmatter`. Either way, the
+        // file is skipped, the rest of the dir loads, and the
+        // warning surfaces structurally rather than just via
+        // tracing::warn!.
+        let dir = tempfile::tempdir().unwrap();
+        // Valid skill.
+        write_skill(dir.path(), "good", &minimal_skill("good"));
+        // Broken skill: unquoted colon inside description.
+        write_skill(
+            dir.path(),
+            "broken",
+            "---\nname: broken\ndescription: First clause: second clause\n---\n# body\n",
+        );
+
+        let (skills, warnings) =
+            load_skills_from_dir(dir.path(), SkillProvenance::Project).unwrap();
+        assert_eq!(skills.len(), 1, "the good skill should still load");
+        assert_eq!(skills[0].name(), "good");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the broken file should surface as a warning"
+        );
+        assert!(warnings[0].path.ends_with("broken.md"));
+        assert!(!warnings[0].error.is_empty());
+    }
+
+    #[test]
+    fn resolved_registry_parse_warnings_propagated_from_project_layer() {
+        // End-to-end through `Registry::finalise`: a broken file in
+        // the project layer shows up on `ResolvedRegistry::parse_warnings`.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("test_mcp.yaml");
+        fs::write(&yaml, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        // Valid skill.
+        write_skill(&skills_dir, "good", &minimal_skill("good"));
+        // Broken skill: missing closing `---`.
+        write_skill(
+            &skills_dir,
+            "broken",
+            "---\nname: broken\ndescription: bad\nstill in frontmatter\n",
+        );
+
+        let registry = Registry::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1, "good skill resolved");
+        assert!(registry.get("good").is_some());
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].path.ends_with("broken.md"));
     }
 
     // ─── Path resolution ──────────────────────────────────────────

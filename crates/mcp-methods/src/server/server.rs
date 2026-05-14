@@ -819,6 +819,10 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         .collect();
     let extensions = server.options.extensions.clone();
 
+    // For the auto-inject pass: skills whose name matches a registered
+    // tool get their full body embedded into that tool's description.
+    // Tracking (name, body) — see the comment at the bottom of the
+    // function for why this is the body, not a pointer.
     let mut auto_inject: Vec<(String, String)> = Vec::new();
 
     for name in registry.skill_names() {
@@ -865,23 +869,40 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         server.prompt_router.add_route(route);
 
         if skill.frontmatter.auto_inject_hint {
-            auto_inject.push((skill.name().to_string(), skill.description().to_string()));
+            auto_inject.push((skill.name().to_string(), skill.body.clone()));
         }
     }
 
-    // Auto-inject discoverability hints: for each skill where
-    // `auto_inject_hint: true` AND a registered tool shares the
-    // skill's name, append a pointer line to the tool description
-    // so agents who only see `tools/list` can still find the
-    // methodology. Skips unmatched skills silently — operators see
-    // those skills via `prompts/list` regardless.
-    for (skill_name, _desc) in &auto_inject {
+    // Auto-inject the full skill body into matching tool descriptions.
+    //
+    // Background: pre-0.3.37 this loop appended a short pointer line
+    // (`See `prompts/get` <name> for the full methodology.`) to the
+    // tool description, assuming agents could call `prompts/get` to
+    // fetch the body. **They can't** in real MCP clients — Claude Code,
+    // Claude Desktop, Cursor, and Continue all expose only `tools/*`
+    // to the model; the `prompts/` plane was designed for human-
+    // invoked slash commands. Operators authoring against the pointer
+    // pattern shipped methodology the agent literally could not read.
+    //
+    // The fix: when `auto_inject_hint: true` AND a registered tool
+    // shares the skill's name, embed the full body under a
+    // `## Methodology` header. Bounded by the 4 KB soft / 16 KB hard
+    // size caps the framework already enforces per skill. Operators
+    // who want the smaller pointer-only behaviour set
+    // `auto_inject_hint: false` per skill.
+    //
+    // `prompts/list` / `prompts/get` continue to work for any client
+    // that does surface them to the agent, plus CLI introspection.
+    // This pass just makes the *primary* delivery channel a place
+    // agents actually look.
+    for (skill_name, body) in &auto_inject {
         let key = Cow::<'static, str>::Owned(skill_name.clone());
         if let Some(route) = server.tool_router.map.get_mut(&key) {
-            let hint = format!("\n\nSee `prompts/get` `{skill_name}` for the full methodology.");
+            let trimmed_body = body.trim();
+            let inject = format!("\n\n## Methodology\n\n{trimmed_body}");
             let new_desc = match route.attr.description.take() {
-                Some(existing) => format!("{existing}{hint}"),
-                None => hint.trim_start().to_string(),
+                Some(existing) => format!("{existing}{inject}"),
+                None => inject.trim_start().to_string(),
             };
             route.attr.description = Some(Cow::Owned(new_desc));
         }
@@ -1114,11 +1135,16 @@ mod tests {
     }
 
     #[test]
-    fn serve_prompts_auto_injects_hint_into_matching_tool() {
+    fn serve_prompts_auto_injects_full_body_into_matching_tool() {
         // `ping` is registered by every server. A skill named `ping`
-        // with `auto_inject_hint: true` should mutate the ping tool's
-        // description to point at the prompt.
-        let registry = build_test_registry(&[("ping", "Ping methodology.", "Ping body.", true)]);
+        // with `auto_inject_hint: true` should embed its full body
+        // under a `## Methodology` header in the ping tool's
+        // description. Pre-0.3.37 this appended a short pointer at
+        // `prompts/get`, but agents in real MCP clients can't reach
+        // that surface — see the comment on the auto-inject loop in
+        // `serve_prompts`.
+        let registry =
+            build_test_registry(&[("ping", "Ping methodology.", "PING-BODY-SENTINEL", true)]);
         let mut server = McpServer::new(ServerOptions::default());
         let before = server
             .tool_router
@@ -1135,8 +1161,16 @@ mod tests {
             .unwrap_or_default();
         assert!(after.starts_with(&before), "original description preserved");
         assert!(
-            after.contains("`prompts/get`") && after.contains("`ping`"),
-            "hint should reference prompts/get and the skill name; got: {after}"
+            after.contains("## Methodology"),
+            "inject should include a Methodology header; got: {after}"
+        );
+        assert!(
+            after.contains("PING-BODY-SENTINEL"),
+            "inject should embed the full skill body; got: {after}"
+        );
+        assert!(
+            !after.contains("prompts/get"),
+            "post-0.3.37 inject should NOT reference the prompts/get surface (agents can't reach it); got: {after}"
         );
     }
 
