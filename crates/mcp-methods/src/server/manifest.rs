@@ -228,15 +228,46 @@ pub struct WorkspaceConfig {
     /// Optional opt-in for the [`find_workspace_manifest`] parent-walk
     /// fallback. When set, this manifest is auto-discovered by
     /// ``mcp-server --workspace DIR`` (and similar callers) only when
-    /// ``DIR`` canonicalises to ``applies_to`` resolved against the
-    /// manifest's parent directory. When unset, the parent-walk
-    /// fallback NEVER fires for this manifest — operators must pass
-    /// ``--mcp-config`` explicitly.
+    /// the operator's ``DIR`` matches the declaration here. When
+    /// unset, the parent-walk fallback NEVER fires for this manifest
+    /// — operators must pass ``--mcp-config`` explicitly.
+    ///
+    /// Values are glob patterns matching the workspace dir's basename
+    /// (single-segment match — parent-walk is always single-level).
+    /// Three forms:
+    ///
+    /// - **Single pattern** (`./repos`, `repos`, `*`, `a*`, `prod-?`):
+    ///   match against the workspace dir's basename. Literal strings
+    ///   like `repos` match only `repos`; glob patterns like `*` or
+    ///   `prod-*` match any name fitting the pattern.
+    /// - **List of patterns** (`[./repos, ./clones]`, `[prod-*, test-*]`):
+    ///   match if any pattern matches. Useful for curated subsets or
+    ///   multiple naming conventions in one manifest.
+    ///
+    /// Leading `./` is optional and stripped at parse time. Patterns
+    /// must be single-segment — `./a/b` is rejected. Invalid glob
+    /// syntax is rejected at parse time.
     ///
     /// Eliminates the accidental-discovery footgun where a workspace
     /// manifest is auto-picked-up by an unrelated sibling dir. The
     /// manifest's own declaration is the opt-in.
-    pub applies_to: Option<String>,
+    pub applies_to: Option<AppliesTo>,
+}
+
+/// Declaration of which workspace dirs the manifest applies to for
+/// the [`find_workspace_manifest`] parent-walk fallback. See
+/// [`WorkspaceConfig::applies_to`] for the full semantics. Each
+/// entry is a glob pattern (literal or with `*` / `?` / `[abc]`)
+/// matched against the workspace dir's basename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliesTo {
+    /// Single glob pattern. Matches if the workspace dir's basename
+    /// satisfies the pattern. Literal names (`repos`) match only
+    /// that name; `*` matches anything; `prod-*` matches anything
+    /// starting with `prod-`.
+    Pattern(String),
+    /// Multiple patterns. Matches if any pattern in the list matches.
+    Patterns(Vec<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +360,12 @@ impl Manifest {
                 "kind": w.kind.as_str(),
                 "root": w.root,
                 "watch": w.watch,
-                "applies_to": w.applies_to,
+                "applies_to": w.applies_to.as_ref().map(|a| match a {
+                    AppliesTo::Pattern(p) => serde_json::Value::String(p.clone()),
+                    AppliesTo::Patterns(ps) => serde_json::Value::Array(
+                        ps.iter().map(|p| serde_json::Value::String(p.clone())).collect()
+                    ),
+                }),
             })),
             "extensions": self.extensions,
         })
@@ -433,28 +469,35 @@ pub fn find_workspace_manifest(workspace_dir: &Path) -> Option<PathBuf> {
         .workspace
         .as_ref()
         .and_then(|w| w.applies_to.as_ref());
-    let Some(declared_path) = declared else {
+    let Some(declared_applies_to) = declared else {
         tracing::info!(
             manifest = %fallback.display(),
             "parent-walk manifest does not declare workspace.applies_to; \
-             ignoring (set workspace.applies_to: <relative path> to opt in)"
+             ignoring (set workspace.applies_to: <pattern> to opt in)"
         );
         return None;
     };
-    let manifest_dir = fallback.parent()?;
-    let declared_abs = match manifest_dir.join(declared_path).canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                manifest = %fallback.display(),
-                applies_to = %declared_path,
-                error = %e,
-                "parent-walk manifest's workspace.applies_to cannot be resolved; ignoring"
-            );
-            return None;
-        }
+    // Match the workspace dir's basename against the declared pattern(s).
+    // The parent-walk guarantee (workspace_dir.parent() == manifest_dir)
+    // is already established above — only the basename match is left.
+    let Some(basename) = workspace_resolved.file_name().and_then(|n| n.to_str()) else {
+        return None; // path with no usable basename, defensive
     };
-    if declared_abs == workspace_resolved {
+    let patterns: Vec<&str> = match declared_applies_to {
+        AppliesTo::Pattern(p) => vec![p.as_str()],
+        AppliesTo::Patterns(ps) => ps.iter().map(String::as_str).collect(),
+    };
+    let matched = patterns.iter().any(|pat| {
+        match globset::Glob::new(pat) {
+            Ok(g) => g.compile_matcher().is_match(basename),
+            Err(_) => {
+                // Should not happen — patterns were validated at parse
+                // time. Defensive: treat as non-match.
+                false
+            }
+        }
+    });
+    if matched {
         tracing::info!(
             workspace_dir = %workspace_dir.display(),
             manifest = %fallback.display(),
@@ -465,9 +508,10 @@ pub fn find_workspace_manifest(workspace_dir: &Path) -> Option<PathBuf> {
         tracing::info!(
             workspace_dir = %workspace_resolved.display(),
             manifest = %fallback.display(),
-            declared = %declared_abs.display(),
+            basename = %basename,
+            patterns = ?patterns,
             "parent-walk manifest's workspace.applies_to does not match \
-             this workspace_dir; ignoring"
+             this workspace_dir's basename; ignoring"
         );
         None
     }
@@ -627,16 +671,42 @@ fn build_workspace(
             ))
         }
     };
-    let applies_to = match map.get("applies_to") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => {
-            return Err(ManifestError::at(
+    let applies_to =
+        match map.get("applies_to") {
+            None | Some(serde_yaml::Value::Null) => None,
+            Some(serde_yaml::Value::String(s)) => {
+                Some(AppliesTo::Pattern(parse_applies_to_pattern(s, yaml_path)?))
+            }
+            Some(serde_yaml::Value::Sequence(seq)) => {
+                if seq.is_empty() {
+                    return Err(ManifestError::at(
+                        yaml_path,
+                        "workspace.applies_to: list must contain at least one pattern",
+                    ));
+                }
+                let mut patterns = Vec::with_capacity(seq.len());
+                for (i, item) in seq.iter().enumerate() {
+                    let s = item.as_str().ok_or_else(|| {
+                        ManifestError::at(
+                            yaml_path,
+                            format!("workspace.applies_to[{i}] must be a string"),
+                        )
+                    })?;
+                    let cleaned = parse_applies_to_pattern(s, yaml_path).map_err(|e| {
+                        ManifestError::at(
+                            yaml_path,
+                            format!("workspace.applies_to[{i}]: {}", e.message),
+                        )
+                    })?;
+                    patterns.push(cleaned);
+                }
+                Some(AppliesTo::Patterns(patterns))
+            }
+            _ => return Err(ManifestError::at(
                 yaml_path,
-                "workspace.applies_to must be a non-empty string (a relative path)",
-            ))
-        }
-    };
+                "workspace.applies_to must be a non-empty string (a pattern) or a list of patterns",
+            )),
+        };
     if kind == WorkspaceKind::Local && root.is_none() {
         return Err(ManifestError::at(
             yaml_path,
@@ -655,6 +725,65 @@ fn build_workspace(
         watch,
         applies_to,
     }))
+}
+
+/// Parse + validate a single ``workspace.applies_to`` entry. Accepts
+/// any glob pattern matching a single path segment (no embedded
+/// slashes, no `..`). The leading ``./`` is optional and stripped.
+/// Validates glob syntax via `globset::Glob::new` so invalid patterns
+/// surface clear errors at boot.
+///
+/// Returns the cleaned pattern string (without `./` prefix) on
+/// success.
+fn parse_applies_to_pattern(raw: &str, yaml_path: &Path) -> Result<String, ManifestError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.applies_to: pattern must not be empty",
+        ));
+    }
+    // Strip a single leading `./` for ergonomic equivalence between
+    // `./repos` and `repos`. Both forms commonly appear in operator
+    // muscle memory; normalise so storage + glob matching is uniform.
+    let stripped = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    if stripped.is_empty() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.applies_to: pattern must not be empty after stripping `./` prefix",
+        ));
+    }
+    if stripped.contains('/') {
+        return Err(ManifestError::at(
+            yaml_path,
+            format!(
+                "workspace.applies_to: pattern {raw:?} must be a single path segment \
+                 (no embedded `/`) — parent-walk discovery is bounded to one level"
+            ),
+        ));
+    }
+    if stripped == ".." || stripped.starts_with("../") {
+        return Err(ManifestError::at(
+            yaml_path,
+            format!("workspace.applies_to: pattern {raw:?} must not contain `..`"),
+        ));
+    }
+    if Path::new(stripped).is_absolute() {
+        return Err(ManifestError::at(
+            yaml_path,
+            format!("workspace.applies_to: pattern {raw:?} must be relative, not absolute"),
+        ));
+    }
+    // Validate glob syntax. Construct a Glob to surface any syntax
+    // errors immediately — we don't keep the compiled form (cheap to
+    // re-compile at match time, keeps `WorkspaceConfig` Clone-cheap).
+    globset::Glob::new(stripped).map_err(|e| {
+        ManifestError::at(
+            yaml_path,
+            format!("workspace.applies_to: invalid glob pattern {raw:?}: {e}"),
+        )
+    })?;
+    Ok(stripped.to_string())
 }
 
 fn check_keys(
@@ -1597,6 +1726,130 @@ mod tests {
             None,
             "applies_to: ./repos must NOT match --workspace ./other_dir"
         );
+    }
+
+    #[test]
+    fn find_workspace_applies_to_wildcard_matches_any_child() {
+        // applies_to: '*' (or './*') means "any direct child of the
+        // manifest's parent dir." Three different child names should
+        // all auto-detect the manifest.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(&manifest, "workspace:\n  kind: github\n  applies_to: '*'\n").unwrap();
+        for child_name in ["repos", "clones", "totally-different-name"] {
+            let child = parent.join(child_name);
+            std::fs::create_dir(&child).unwrap();
+            let found =
+                find_workspace_manifest(&child).expect("wildcard should match any direct child");
+            assert_eq!(
+                found.canonicalize().unwrap(),
+                manifest.canonicalize().unwrap(),
+                "wildcard should match child {child_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_workspace_applies_to_glob_matches_prefix() {
+        // applies_to: './prod-*' should match any direct child whose
+        // basename starts with "prod-".
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(
+            &manifest,
+            "workspace:\n  kind: github\n  applies_to: ./prod-*\n",
+        )
+        .unwrap();
+        // Match cases.
+        for child_name in ["prod-api", "prod-web", "prod-"] {
+            let child = parent.join(child_name);
+            std::fs::create_dir(&child).unwrap();
+            assert!(
+                find_workspace_manifest(&child).is_some(),
+                "prod-* should match {child_name:?}"
+            );
+        }
+        // Non-match cases.
+        for child_name in ["test-api", "stage-web", "random"] {
+            let child = parent.join(child_name);
+            std::fs::create_dir(&child).unwrap();
+            assert_eq!(
+                find_workspace_manifest(&child),
+                None,
+                "prod-* should NOT match {child_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_workspace_applies_to_list_matches_any_entry() {
+        // applies_to: [./repos, ./clones] should match either name
+        // but reject anything else.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let manifest = parent.join("workspace_mcp.yaml");
+        std::fs::write(
+            &manifest,
+            "workspace:\n  kind: github\n  applies_to:\n    - ./repos\n    - ./clones\n",
+        )
+        .unwrap();
+        for matching in ["repos", "clones"] {
+            let child = parent.join(matching);
+            std::fs::create_dir(&child).unwrap();
+            assert!(
+                find_workspace_manifest(&child).is_some(),
+                "list should match {matching:?}"
+            );
+        }
+        let other = parent.join("scratch");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(
+            find_workspace_manifest(&other),
+            None,
+            "list with [repos, clones] must NOT match scratch"
+        );
+    }
+
+    #[test]
+    fn applies_to_rejects_deep_path_at_parse_time() {
+        let f = write_tmp("workspace:\n  kind: github\n  applies_to: ./too/deep/path\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("must be a single path segment"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn applies_to_rejects_invalid_glob_at_parse_time() {
+        // globset rejects unterminated character class.
+        let f = write_tmp("workspace:\n  kind: github\n  applies_to: './[unterminated'\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("invalid glob pattern"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn applies_to_rejects_parent_relative() {
+        // Bare `..` is caught by the `..` rejection branch. The
+        // multi-segment form `../foo` is caught earlier by the
+        // single-segment check; either is rejected.
+        let f = write_tmp("workspace:\n  kind: github\n  applies_to: '..'\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("must not contain `..`"));
+
+        let f2 = write_tmp("workspace:\n  kind: github\n  applies_to: '../up'\n");
+        let err2 = load(f2.path()).unwrap_err();
+        assert!(err2.message.contains("must be a single path segment"));
     }
 
     #[test]

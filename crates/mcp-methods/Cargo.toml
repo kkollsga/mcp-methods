@@ -1,6 +1,6 @@
 [package]
 name = "mcp-methods"
-version = "0.3.32"
+version = "0.3.33"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -54,6 +54,10 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+# Glob-pattern matching for `workspace.applies_to`. Already a
+# transitive dep via `ignore`; making it direct so the manifest
+# parser can validate patterns at boot.
+globset = "0.4"
 
 # --- server feature ---
 rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "schemars"], optional = true }

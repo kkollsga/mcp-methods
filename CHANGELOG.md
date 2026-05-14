@@ -1,5 +1,128 @@
 # Changelog
 
+## 0.3.33 — 2026-05-14
+
+### Changed — `workspace.applies_to` now accepts glob patterns + lists
+
+The opt-in declaration introduced in 0.3.32 was a single literal
+path string. 0.3.33 widens it to three shapes:
+
+```yaml
+workspace:
+  # 1. Literal pattern (existing in 0.3.32) — match this exact name
+  applies_to: ./repos
+
+  # 2. Glob pattern (NEW) — match a subset by naming convention
+  applies_to: ./prod-*      # any child whose name starts with "prod-"
+  applies_to: ./*           # any direct child (wildcard)
+  applies_to: ./test-?      # one-char suffix variant
+
+  # 3. List of patterns (NEW) — match if any pattern matches
+  applies_to: [./repos, ./clones]
+  applies_to: [./prod-*, ./test-*]   # multiple naming conventions
+```
+
+Glob syntax follows [globset](https://docs.rs/globset) (the
+ripgrep/cargo crate): `*` (any chars), `?` (one char), `[abc]`
+(character class), `**` (any depth — irrelevant here since the
+parent-walk is single-level).
+
+The opt-in semantics are unchanged: when the parent-walk fallback
+finds a manifest, the framework compares the actual `workspace_dir`'s
+basename against the declared pattern(s). Match → use the manifest.
+No match or no declaration → operator must pass `--mcp-config`
+explicitly. The accidental-discovery footgun stays closed; this
+release just widens what an author can opt into.
+
+### Use case
+
+Operators with a `repos/` sandbox containing many projects no
+longer need to enumerate each child:
+
+```text
+repos/
+├── workspace_mcp.yaml      # applies_to: ./*
+├── project-alpha/          # --workspace repos/project-alpha/  ✓
+├── project-beta/           # --workspace repos/project-beta/   ✓
+└── client-acme/            # --workspace repos/client-acme/    ✓
+```
+
+Or filter by naming convention:
+
+```text
+deployments/
+├── workspace_mcp.yaml      # applies_to: ./prod-*
+├── prod-api/               # ✓
+├── prod-web/               # ✓
+├── stage-api/              # ✗  (parent-walk discovery refuses)
+└── test-runner/            # ✗
+```
+
+### Parse-time validation
+
+Patterns are validated at boot via `globset::Glob::new`:
+
+- Empty patterns rejected (`applies_to: ""`)
+- Multi-segment paths rejected (`applies_to: ./a/b/c` —
+  parent-walk is single-level, so deeper paths could never match)
+- Parent-relative rejected (`applies_to: ..`)
+- Absolute paths rejected (`applies_to: /abs/foo`)
+- Invalid glob syntax rejected (e.g. unterminated `[`)
+
+Operators get a clear error at boot rather than silent non-matching.
+
+### Internal shape change
+
+`WorkspaceConfig::applies_to` changed from `Option<String>` to
+`Option<AppliesTo>` where:
+
+```rust
+pub enum AppliesTo {
+    Pattern(String),         // single pattern
+    Patterns(Vec<String>),   // multiple patterns
+}
+```
+
+Leading `./` is stripped at parse time (storage is normalised).
+This is a Rust-API surface change since 0.3.32; consumers that read
+`manifest.workspace.applies_to` need to handle the enum.
+
+### JSON shape change
+
+`Manifest::to_json()` now emits `workspace.applies_to` polymorphically:
+
+- `Pattern("repos")` → `"repos"` (string)
+- `Patterns(["repos", "clones"])` → `["repos", "clones"]` (array)
+- `None` → `null`
+
+Mirrors the YAML shape. Consumers should accept both types.
+
+### New dependency
+
+Direct dependency on `globset = "0.4"` added to `mcp-methods`. The
+crate was already a transitive dep via `ignore`; making it direct
+just lets the manifest parser validate glob patterns at boot.
+
+### Tests
+
+Six new tests in `manifest.rs::tests`:
+
+- `find_workspace_applies_to_wildcard_matches_any_child` — `*` matches three different child names
+- `find_workspace_applies_to_glob_matches_prefix` — `./prod-*` matches `prod-api`/`prod-web` but not `test-*`
+- `find_workspace_applies_to_list_matches_any_entry` — `[./repos, ./clones]` matches either, rejects others
+- `applies_to_rejects_deep_path_at_parse_time` — `./a/b/c` errors at boot
+- `applies_to_rejects_invalid_glob_at_parse_time` — `./[unterminated` errors at boot
+- `applies_to_rejects_parent_relative` — `..` and `../up` both error
+
+117 mcp-methods unit tests pass (was 111 at 0.3.32; +6 net). 7
+deployed_manifests + 7 mcp-server tests unchanged.
+
+### Origin
+
+Operator scenario raised by Kristian: a `repos/` directory holding
+many child repos, with one manifest covering them all. Single-path
+match didn't cover this; glob + list shapes do.
+
 ## 0.3.32 — 2026-05-14
 
 ### Changed — `find_workspace_manifest` parent-walk fallback (opt-in)
