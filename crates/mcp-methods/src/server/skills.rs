@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::manifest::{SkillSource, SkillsSource};
+use super::manifest::{load as load_manifest, SkillSource, SkillsSource};
 
 // ─── Public types ─────────────────────────────────────────────────
 
@@ -353,6 +353,9 @@ pub enum SkillError {
     /// bug — the bundled skill files should round-trip through their
     /// own CI tests before shipping.
     BundledSkillInvalid { name: &'static str, message: String },
+    /// Manifest YAML at `path` failed to load while resolving skills
+    /// from a manifest (e.g. via [`Registry::from_manifest`]).
+    Manifest { path: PathBuf, message: String },
 }
 
 impl std::fmt::Display for SkillError {
@@ -395,6 +398,11 @@ impl std::fmt::Display for SkillError {
             SkillError::BundledSkillInvalid { name, message } => write!(
                 f,
                 "bundled skill `{name}` is malformed: {message}"
+            ),
+            SkillError::Manifest { path, message } => write!(
+                f,
+                "manifest load failed at {}: {message}",
+                path.display()
             ),
         }
     }
@@ -840,6 +848,44 @@ impl Registry {
     /// `with_predicate_evaluator`, then call `finalise()`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// One-shot resolution of a [`ResolvedRegistry`] from a manifest
+    /// YAML — loads the manifest, merges framework defaults (when
+    /// `include_bundled` is true), auto-detects the project layer at
+    /// `<basename>.skills/`, layers in operator-declared `skills:`
+    /// paths, and finalises in a single call.
+    ///
+    /// This is the canonical shape consumed by pyo3 wrappers
+    /// (`mcp-methods-py::SkillRegistry.from_manifest` and downstream
+    /// equivalents like kglite's). Owning it here keeps the
+    /// orchestration single-sourced so layering tweaks don't need to
+    /// be replicated in every wrapper.
+    ///
+    /// For bespoke layering — e.g. supplying a custom predicate
+    /// evaluator via [`Registry::with_predicate_evaluator`], or
+    /// `include_str!`'d downstream bundled skills via
+    /// [`Registry::add_bundled`] — drive the builder directly
+    /// instead of calling this.
+    ///
+    /// Pass `include_bundled=false` to skip framework defaults; useful
+    /// for tests or downstream binaries supplying their own bundled
+    /// layer.
+    pub fn from_manifest(
+        manifest_path: &Path,
+        include_bundled: bool,
+    ) -> Result<ResolvedRegistry, SkillError> {
+        let manifest = load_manifest(manifest_path).map_err(|e| SkillError::Manifest {
+            path: manifest_path.to_path_buf(),
+            message: e.message,
+        })?;
+        let mut builder = Registry::new();
+        if include_bundled {
+            builder = builder.merge_framework_defaults();
+        }
+        builder = builder.auto_detect_project_layer(manifest_path);
+        builder = builder.layer_dirs(&manifest.skills, manifest_path)?;
+        builder.finalise()
     }
 
     /// Register a domain-specific predicate evaluator for the
@@ -1722,6 +1768,40 @@ Body.\n";
             )
             .unwrap_err();
         assert!(matches!(err, SkillError::PathNotFound { .. }));
+    }
+
+    #[test]
+    fn from_manifest_resolves_full_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("test_mcp.yaml");
+        fs::write(&yaml, "name: x\nskills:\n  - true\n  - ./domain-pack\n").unwrap();
+
+        let project_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(project_dir.join("a.md"), minimal_skill("a")).unwrap();
+
+        let pack_dir = dir.path().join("domain-pack");
+        fs::create_dir(&pack_dir).unwrap();
+        fs::write(pack_dir.join("b.md"), minimal_skill("b")).unwrap();
+
+        let registry = Registry::from_manifest(&yaml, false).unwrap();
+        let names = registry.skill_names();
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
+        assert_eq!(
+            registry.get("a").unwrap().provenance,
+            SkillProvenance::Project
+        );
+    }
+
+    #[test]
+    fn from_manifest_surfaces_manifest_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("broken_mcp.yaml");
+        fs::write(&yaml, "this: is: not: valid yaml\n").unwrap();
+
+        let err = Registry::from_manifest(&yaml, false).unwrap_err();
+        assert!(matches!(err, SkillError::Manifest { .. }));
     }
 
     #[test]

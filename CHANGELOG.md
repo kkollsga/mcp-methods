@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.38 — 2026-05-18
+
+### Added — `Registry::from_manifest` on the Rust crate
+
+The one-shot manifest → resolved-skills-registry orchestration that previously lived only in `mcp-methods-py`'s `SkillRegistry.from_manifest` is now a public method on the Rust `Registry` builder:
+
+```rust
+let registry = mcp_methods::server::Registry::from_manifest(&manifest_path, true)?;
+```
+
+Loads the manifest, optionally merges framework bundled defaults, auto-detects the project layer at `<basename>.skills/`, layers in operator-declared `skills:` paths, and finalises in a single call. Use the builder directly for bespoke layering (e.g. supplying a `SkillPredicateEvaluator` via `with_predicate_evaluator`, or `include_str!`'d downstream bundled skills via `add_bundled`).
+
+The pyo3 wheel's `SkillRegistry.from_manifest` now delegates to this method — no public Python API change. Downstream pyo3 wrappers that consume `mcp-methods` from crates.io (kglite's incoming `kglite._mcp_internal` wrapper crate, others) can now call the same library function instead of replicating the six-line orchestration, eliminating drift risk on future layering tweaks.
+
+### Added — `SkillError::Manifest` variant
+
+Carries the manifest path + message when `from_manifest` fails at the manifest-load step (before any skill loading happens). Lets callers distinguish "your YAML is broken" from "your skills/ tree is broken" without parsing error messages.
+
+Motivated by kglite as part of the "consume the Cargo crate, not the wheel" framing — by widening the library's public surface, downstream wheels (kglite, others) can stay thin pyo3 wrappers instead of carrying business logic.
+
+### Tests
+
+- `from_manifest_resolves_full_stack` — happy path: bundled + project + operator-declared paths compose through the one-shot call.
+- `from_manifest_surfaces_manifest_load_error` — broken manifest YAML surfaces as `SkillError::Manifest`, not a downstream parsing error.
+
 ## 0.3.37 — 2026-05-14
 
 ### Fixed — agent retrieval gap (the load-bearing one)

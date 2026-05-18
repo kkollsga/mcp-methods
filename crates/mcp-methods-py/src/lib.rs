@@ -20,12 +20,12 @@ use mcp_methods::grep::{
 };
 use mcp_methods::json_grep::ripgrep_json_fields as core_ripgrep_json_fields;
 use mcp_methods::list_dir::{list_dir as core_list_dir, ListDirOpts};
+use mcp_methods::server::find_sibling_manifest;
 use mcp_methods::server::skills::{
     render_skill_template as core_render_skill_template,
     write_skill_template as core_write_skill_template, Registry as SkillsRegistry,
     ResolvedRegistry as CoreResolvedRegistry, Skill as CoreSkill,
 };
-use mcp_methods::server::{find_sibling_manifest, load_manifest};
 use mcp_methods::{compact, git_refs, github, html};
 
 use pyo3::exceptions::PyValueError;
@@ -703,19 +703,8 @@ impl PySkillRegistry {
     #[staticmethod]
     #[pyo3(signature = (manifest_path, *, include_bundled=true))]
     fn from_manifest(manifest_path: PathBuf, include_bundled: bool) -> PyResult<Self> {
-        let manifest = load_manifest(&manifest_path)
-            .map_err(|e| PyValueError::new_err(format!("manifest load failed: {e}")))?;
-        let mut builder = SkillsRegistry::new();
-        if include_bundled {
-            builder = builder.merge_framework_defaults();
-        }
-        builder = builder.auto_detect_project_layer(&manifest_path);
-        builder = builder
-            .layer_dirs(&manifest.skills, &manifest_path)
-            .map_err(|e| PyValueError::new_err(format!("skill layer load failed: {e}")))?;
-        let resolved = builder
-            .finalise()
-            .map_err(|e| PyValueError::new_err(format!("skill registry finalise failed: {e}")))?;
+        let resolved = SkillsRegistry::from_manifest(&manifest_path, include_bundled)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: resolved })
     }
 
