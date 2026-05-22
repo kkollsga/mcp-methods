@@ -306,9 +306,12 @@ impl Default for GithubIssuesArgs {
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GithubApiArgs {
-    /// API path. Relative paths (e.g. "pulls?state=open", "commits/abc",
-    /// "branches", "compare/main...x") are prefixed with /repos/<repo_name>/.
-    /// Absolute resources ("search/issues?q=...", "users/octocat") pass through.
+    /// API path, with or without a leading slash. Repo-relative paths
+    /// (e.g. "pulls?state=open", "commits/abc", "branches",
+    /// "compare/main...x") are prefixed with /repos/<repo_name>/. Top-level
+    /// resources ("search/issues?q=...", "users/octocat", "repos/o/r") pass
+    /// through. A leading slash is accepted on either form — "/repos/o/r"
+    /// and "repos/o/r" resolve identically.
     pub path: String,
     /// org/repo override; defaults to the active server repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -491,9 +494,10 @@ impl McpServer {
             "Read-only GET against the GitHub REST API. `path` may be a \
              repo-relative endpoint (\"pulls?state=open\", \"commits/abc123\", \
              \"branches\", \"compare/main...feature\") which is auto-prefixed \
-             with /repos/<repo_name>/, or an absolute resource (\"search/issues?q=...\", \
-             \"users/octocat\") which passes through. Returns JSON, truncated at \
-             80 KB by default.",
+             with /repos/<repo_name>/, or a top-level resource (\"search/issues?q=...\", \
+             \"users/octocat\", \"repos/owner/name\") which passes through. A \
+             leading slash is optional and accepted on either form. Returns \
+             JSON, truncated at 80 KB by default.",
             move |args: GithubApiArgs| match resolve_repo_from(
                 repo_provider.as_ref(),
                 args.repo_name.clone(),

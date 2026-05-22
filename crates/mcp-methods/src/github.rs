@@ -1095,10 +1095,17 @@ pub fn fetch_issue_internal(repo: &str, number: u64) -> Result<(String, Option<S
 // git_api — generic GitHub REST API access (no GIL needed)
 // ---------------------------------------------------------------------------
 
-pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
-    if let Some(err) = git_refs::validate_repo(repo) {
-        return err;
-    }
+/// Build the GitHub REST API URL for a `git_api` call.
+///
+/// Paths naming a top-level resource (`repos/...`, `search/...`, …) pass
+/// through unchanged; anything else is treated as relative to `repo` and
+/// wrapped in `/repos/<repo>/`. A single leading slash is stripped first,
+/// so `/repos/...` and `repos/...` are equivalent — an agent writing the
+/// idiomatic absolute form from the GitHub REST docs gets the same URL as
+/// the relative form rather than a doubled `/repos/` prefix.
+fn build_git_api_url(repo: &str, path: &str) -> String {
+    // `/repos/...` == `repos/...` — normalise before the prefix check.
+    let path = path.strip_prefix('/').unwrap_or(path);
 
     let top_level = [
         "search/",
@@ -1108,11 +1115,19 @@ pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
         "rate_limit",
         "repos/",
     ];
-    let url = if top_level.iter().any(|p| path.starts_with(p)) {
+    if top_level.iter().any(|p| path.starts_with(p)) {
         format!("{}/{}", GITHUB_API, path)
     } else {
         format!("{}/repos/{}/{}", GITHUB_API, repo, path)
-    };
+    }
+}
+
+pub fn git_api_internal(repo: &str, path: &str, truncate_at: usize) -> String {
+    if let Some(err) = git_refs::validate_repo(repo) {
+        return err;
+    }
+
+    let url = build_git_api_url(repo, path);
 
     match gh_get(&url) {
         Ok(data) => {
@@ -1902,5 +1917,33 @@ mod tests {
                 None => std::env::remove_var("GH_TOKEN"),
             }
         }
+    }
+
+    #[test]
+    fn leading_slash_paths_normalise() {
+        // A leading slash is how the GitHub REST docs render endpoints; it
+        // must not change the resulting URL.
+        assert_eq!(
+            build_git_api_url("someorg/somerepo", "/repos/kkollsga/kglite"),
+            "https://api.github.com/repos/kkollsga/kglite",
+        );
+        assert_eq!(
+            build_git_api_url("someorg/somerepo", "repos/kkollsga/kglite"),
+            "https://api.github.com/repos/kkollsga/kglite",
+        );
+        // Relative paths still get wrapped in /repos/<repo>/, slash or not.
+        assert_eq!(
+            build_git_api_url("o/r", "/pulls?state=open"),
+            "https://api.github.com/repos/o/r/pulls?state=open",
+        );
+        assert_eq!(
+            build_git_api_url("o/r", "pulls?state=open"),
+            "https://api.github.com/repos/o/r/pulls?state=open",
+        );
+        // search/ is a top-level resource in both forms.
+        assert_eq!(
+            build_git_api_url("o/r", "/search/issues?q=foo"),
+            "https://api.github.com/search/issues?q=foo",
+        );
     }
 }

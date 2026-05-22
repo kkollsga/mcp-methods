@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.39 — 2026-05-22
+
+### Fixed — `git_api` doubled `/repos/` for leading-slash paths
+
+`git_api_internal` decided pass-through-vs-prefix by testing the path
+against a `top_level` list (`repos/`, `search/`, …) whose entries have no
+leading slash. A path written in the idiomatic absolute form the GitHub
+REST docs render — `/repos/owner/name`, `/search/issues?q=…` — matched
+none of them, fell into the relative branch, and got wrapped in
+`/repos/<repo>/`, producing a doubled prefix and a 404:
+
+```text
+git_api("someorg/somerepo", "/repos/kkollsga/kglite")
+  actual: https://api.github.com/repos/someorg/somerepo//repos/kkollsga/kglite → 404
+  want:   https://api.github.com/repos/kkollsga/kglite
+```
+
+The same call without the leading slash worked, which made the failure
+surprising and slow to diagnose. URL construction now strips a single
+leading slash before the `top_level` check, so `/repos/…` and `repos/…`
+(and `/search/…` vs `search/…`) are equivalent.
+
+Reported by kglite (their issue #19), surfaced through kglite's
+`github_api` MCP tool against non-active repos.
+
+### Changed — URL construction lifted into `build_git_api_url`
+
+The pure URL-building logic is now a `build_git_api_url(repo, path)`
+helper that `git_api_internal` calls, so a regression test can assert on
+the constructed URL without a network round-trip — a URL-building bug
+with no unit coverage is the kind that silently comes back.
+
+### Tests
+
+- `leading_slash_paths_normalise` — leading and non-leading slash forms
+  build the same URL for both top-level and relative paths.
+
 ## 0.3.38 — 2026-05-18
 
 ### Added — `Registry::from_manifest` on the Rust crate
