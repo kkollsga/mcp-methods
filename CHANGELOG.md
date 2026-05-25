@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.3.40 — 2026-05-25 (proposed)
+
+### Added — `server::watch` default skip-patterns
+
+The watch primitive now drops events under conventional noise paths
+(`.git/`, `target/`, `node_modules/`, `__pycache__/`, `.venv/`,
+`build/`, `dist/`, `.DS_Store`) and noise extensions (`.pyc`, `.pyo`,
+`.swp`, `.swo`, `.tmp`) **before** the debounced callback runs. A
+wide-sandbox watcher under active development can generate hundreds
+of FSEvents per second from `cargo build` / `npm install` / `git`
+operations alone; without the filter every consumer either rebuilt
+wastefully or implemented the same skip list. With it, consumers see
+only events that could plausibly matter.
+
+New API:
+
+```rust
+pub const DEFAULT_SKIP_SUBSTRINGS: &[&str] = &[
+    "/.git/", "/target/", "/node_modules/", "/__pycache__/",
+    "/.venv/", "/build/", "/dist/", "/.DS_Store",
+];
+pub const DEFAULT_SKIP_EXTENSIONS: &[&str] = &[
+    "pyc", "pyo", "swp", "swo", "tmp",
+];
+
+pub struct WatchConfig {
+    pub skip_substrings: Vec<String>,
+    pub skip_extensions: Vec<String>,
+}
+impl WatchConfig {
+    pub fn default() -> Self;     // recommended; uses the DEFAULT_* sets above
+    pub fn unfiltered() -> Self;  // empty skip set; every event reaches the callback
+    pub fn is_skipped(&self, path: &Path) -> bool;
+}
+
+pub fn watch_with_config(
+    dir: &Path,
+    on_change: Option<ChangeHandler>,
+    debounce: Option<Duration>,
+    config: WatchConfig,
+) -> Result<WatchHandle>;
+```
+
+The existing `pub fn watch(dir, on_change, debounce)` is unchanged at
+the signature level; internally it now delegates to
+`watch_with_config(..., WatchConfig::default())`. Consumers that want
+every event opt out via
+`watch_with_config(..., WatchConfig::unfiltered())`.
+
+Skip-substring matching is anchored with `/` on both sides where
+appropriate so a file literally named `target` at the repo root
+doesn't false-match (but `/repo/target/foo` does). Matching is
+allocation-free per event. Empty post-filter batches (a pure-noise
+storm) skip the callback invocation entirely.
+
+#### Why now
+
+Originally surfaced by an MCP-servers operator deploying
+kglite-mcp-server with a wide `workspace.root`
+(`/Volumes/EksternalHome/Koding`, ~360k files). The `cargo build`
+storm under that root generated ~120 FSEvents/sec; the downstream
+kglite watch callback rebuilt the active code-tree on every event.
+kglite shipped its own fix on 2026-05-25 (active-root scoping +
+`language_for_path` filter + deferred rebuild — kglite main commits
+`6596da6` + `0306655`), but the upstream `server::watch` is still
+walking those events through the FFI / debouncer cycle before the
+kglite filter drops them.
+
+This change moves the skip to the source. Every `server::watch`
+consumer benefits — kglite's filter becomes defense-in-depth, any
+future code-indexer-shaped consumer gets correct defaults, and the
+mcp-methods binary's own log-changes mode emits fewer noise lines.
+
+#### Compatibility
+
+Existing callers see strictly fewer callback invocations for paths
+under the skip set. Any consumer relying on `.git/objects/` writes
+hitting their callback has a bug already. No changes to
+`watch(dir, on_change, debounce)`'s signature; downstream kglite
+needs no source change to adopt — just bumps its `mcp-methods` pin
+when 0.3.40 ships.
+
+11 new unit tests cover the default skip set, the unfiltered escape
+hatch, custom skip configs, anchoring (`target` file vs `target/`
+dir), and an end-to-end "callback does not fire for noise-only
+batch" behavior test.
+
 ## 0.3.39 — 2026-05-22
 
 ### Fixed — `git_api` doubled `/repos/` for leading-slash paths
