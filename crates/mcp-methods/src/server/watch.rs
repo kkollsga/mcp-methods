@@ -347,9 +347,18 @@ mod tests {
     fn skip_filter_silences_callback_for_noise_only_batch() {
         use std::thread::sleep;
         let dir = tempfile::tempdir().unwrap();
-        // Create a `target/` dir so writes inside it produce events.
-        let target_dir = dir.path().join("target");
-        std::fs::create_dir(&target_dir).unwrap();
+        // Pre-create a *nested* dir under `target/` before the watch starts.
+        // Writing into the leaf keeps every event path unambiguously under
+        // `/target/` (the file writes and the leaf-dir mtime bump alike).
+        // We deliberately do NOT touch the bare `target` entry during the
+        // watch window: on Linux/inotify a write directly inside `target/`
+        // also emits a modify event for the `target` directory itself, whose
+        // path (`.../target`, no trailing slash) escapes the `/target/`
+        // substring filter and would fire the callback. macOS/FSEvents does
+        // not surface that event, which is why the shallow version passed
+        // locally but failed in CI.
+        let noise_dir = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&noise_dir).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_for_cb = counter.clone();
         let cb: ChangeHandler = Arc::new(move |_paths: &[PathBuf]| {
@@ -357,9 +366,9 @@ mod tests {
         });
         let _handle = watch(dir.path(), Some(cb), Some(Duration::from_millis(100))).unwrap();
         sleep(Duration::from_millis(50));
-        // Write only into `target/` — should be filtered.
-        std::fs::write(target_dir.join("a.rlib"), "noise").unwrap();
-        std::fs::write(target_dir.join("b.rlib"), "noise").unwrap();
+        // Write only into the nested `target/.../deps/` — should be filtered.
+        std::fs::write(noise_dir.join("a.rlib"), "noise").unwrap();
+        std::fs::write(noise_dir.join("b.rlib"), "noise").unwrap();
         sleep(Duration::from_millis(400));
         assert_eq!(
             counter.load(Ordering::SeqCst),
