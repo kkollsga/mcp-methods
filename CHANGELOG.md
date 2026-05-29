@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.40 — 2026-05-25 (proposed)
+## 0.3.40 — 2026-05-29
 
 ### Added — `server::watch` default skip-patterns
 
@@ -86,6 +86,32 @@ when 0.3.40 ships.
 hatch, custom skip configs, anchoring (`target` file vs `target/`
 dir), and an end-to-end "callback does not fire for noise-only
 batch" behavior test.
+
+### Fixed — `graph_overview` against kglite 0.10
+
+`fastmcp.register_overview` forwarded a `limit=` kwarg to
+`graph.describe()`, which kglite dropped from `KnowledgeGraph.describe()`
+in the 0.10 line. Every `graph_overview()` call against a kglite ≥ 0.10
+graph raised `TypeError: describe() got an unexpected keyword argument
+'limit'` — a broken first-reach escape-hatch tool for any consumer on
+the current kglite. The `limit` parameter is removed; `describe()`
+already adapts its output to graph scale, so no replacement knob is
+needed. The test/example graph stubs now mirror the post-0.10
+`describe(types, connections)` signature, so a regression that
+re-introduces `limit` forwarding fails the suite instead of passing
+against an over-permissive mock. Reported by kglite-docs (kglite 0.10.5,
+mcp-methods 0.3.39).
+
+### Fixed — `cypher_query` text mode returns a non-string
+
+`fastmcp.register_cypher_query` returned `graph.cypher(query)` raw in
+text mode. kglite's `cypher()` returns a lazy `ResultView` (Polars-backed,
+not a `str`), so the `-> str` tool handed a non-string to FastMCP's
+output validation and the call failed. The text path now coerces with
+`str()` — `ResultView.__str__` renders the result table — matching the
+defensive coercion the CSV path already did. Graph impls that already
+return a `str` pass through unchanged. Flagged by kglite-docs alongside
+the `graph_overview` report.
 
 ## 0.3.39 — 2026-05-22
 

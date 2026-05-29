@@ -1,10 +1,12 @@
 """`cypher_query` tool registration with CSV-to-file transport.
 
-The graph object must expose `cypher(query, format="text"|"csv") -> str|bytes`.
-When `format="csv"` is requested the bytes are written to a uuid-named
-file under `csv_dir` and the tool returns the file path; the agent can
-then `read_source` it or fetch over HTTP if `serve_csv_via_http` is also
-mounted.
+The graph object must expose `cypher(query, format="text"|"csv")`. In text
+mode the return value is coerced with `str()`, so any object with a
+useful `__str__` works (kglite's `cypher()` returns a lazy `ResultView`
+whose `__str__` renders the result table). When `format="csv"` is
+requested the result is written to a uuid-named file under `csv_dir` and
+the tool returns the file path; the agent can then `read_source` it or
+fetch over HTTP if `serve_csv_via_http` is also mounted.
 """
 
 from __future__ import annotations
@@ -42,4 +44,9 @@ def register_cypher_query(app, graph, *, csv_dir: str | os.PathLike[str] = "temp
             else:
                 path.write_text(str(payload))
             return f"CSV written: {path}"
-        return graph.cypher(query)
+        # Text mode: coerce to str. kglite's `cypher()` returns a lazy
+        # `ResultView` (not a str); its `__str__` renders the result
+        # table. Without this, the `-> str` tool hands a non-string to
+        # FastMCP's output validation and the call fails. Graph impls
+        # that already return a str pass through unchanged.
+        return str(graph.cypher(query))
