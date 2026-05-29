@@ -107,8 +107,10 @@ def test_list_source_lists_entries():
 
 def test_register_overview_uses_prefix():
     class FakeGraph:
-        def describe(self, *, types=None, connections=False, limit=20):
-            return f"schema(types={types}, connections={connections}, limit={limit})"
+        # Mirrors kglite 0.10's describe() signature — no `limit` kwarg.
+        # If the framework regresses to forwarding `limit`, this raises.
+        def describe(self, *, types=None, connections=False):
+            return f"schema(types={types}, connections={connections})"
 
     app = _FakeApp()
     register_overview(app, FakeGraph(), overview_prefix="HELLO")
@@ -121,7 +123,7 @@ def test_register_overview_uses_prefix():
 
 def test_register_overview_no_prefix():
     class FakeGraph:
-        def describe(self, *, types=None, connections=False, limit=20):
+        def describe(self, *, types=None, connections=False):
             return "schema-body"
 
     app = _FakeApp()
@@ -139,6 +141,26 @@ def test_register_cypher_query_text_mode():
         register_cypher_query(app, FakeGraph(), csv_dir=tmpdir)
         body = app.tools["cypher_query"]("MATCH (n) RETURN n")
         assert "format=text" in body
+
+
+def test_register_cypher_query_text_mode_coerces_non_str():
+    # kglite's cypher() returns a lazy ResultView (not a str) whose
+    # __str__ renders the table. The tool is typed `-> str`, so it must
+    # coerce; without it, FastMCP output validation rejects the object.
+    class ResultViewLike:
+        def __str__(self):
+            return "rendered-table"
+
+    class FakeGraph:
+        def cypher(self, query, format="text"):
+            return ResultViewLike()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        app = _FakeApp()
+        register_cypher_query(app, FakeGraph(), csv_dir=tmpdir)
+        body = app.tools["cypher_query"]("MATCH (n) RETURN n")
+        assert isinstance(body, str)
+        assert body == "rendered-table"
 
 
 def test_register_cypher_query_csv_mode_writes_file():

@@ -34,8 +34,8 @@ from mcp_methods.fastmcp import (
 class StubGraph:
     """Minimal graph stub. Replace with kglite.KnowledgeGraph in real use."""
 
-    def describe(self, *, types=None, connections=False, limit=20):
-        return f"stub-graph: types={types} connections={connections} limit={limit}"
+    def describe(self, *, types=None, connections=False):
+        return f"stub-graph: types={types} connections={connections}"
 
     def cypher(self, query, format="text"):
         if format == "csv":
