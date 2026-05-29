@@ -82,10 +82,14 @@ hitting their callback has a bug already. No changes to
 needs no source change to adopt — just bumps its `mcp-methods` pin
 when 0.3.40 ships.
 
-11 new unit tests cover the default skip set, the unfiltered escape
-hatch, custom skip configs, anchoring (`target` file vs `target/`
-dir), and an end-to-end "callback does not fire for noise-only
-batch" behavior test.
+Unit tests cover the default skip set, the unfiltered escape hatch,
+custom skip configs, anchoring (`target` file vs `target/` dir), a
+positive end-to-end "callback fires on a real file change" test, and
+the debouncer's batch-retention decision (`retain_unskipped`) — a
+noise-only batch retains nothing (so no callback fires), a mixed batch
+keeps only non-noise paths. The retention decision is tested as a pure
+function rather than against a live watcher, since inotify (Linux) and
+FSEvents (macOS) report different event paths for the same writes.
 
 ### Fixed — `graph_overview` against kglite 0.10
 
