@@ -145,7 +145,7 @@ impl ServerOptions {
                 .map(|p| vec![p.to_string_lossy().into_owned()])
                 .unwrap_or_default()
         }));
-        self.default_repo = Some(Arc::new(move || ws_for_repo.active_repo_name()));
+        self.default_repo = Some(Arc::new(move || ws_for_repo.default_github_repo()));
         self
     }
 }

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.41 — 2026-06-06
+
+### Fixed — local-mode GitHub default repo
+
+In local-workspace mode the GitHub tools (`github_issues` /
+`github_api`) defaulted their repo to the `local/<dir>` *inventory key*
+whenever the caller omitted `repo_name`, producing 404s against
+`repos/local/<dir>/…` — even when the active root was a real GitHub
+checkout. The inventory key is filesystem-derived (a local root needn't
+even be a git repo) and was never a valid `org/repo`; it was simply the
+wrong source for the GitHub default.
+
+`Workspace::active_repo_name()` was doing two jobs with one field:
+inventory key *and* GitHub default repo. Split them. The new
+`Workspace::default_github_repo()` resolves the default per mode —
+github mode keeps using the active repo (there the inventory key *is*
+the `org/repo`), while local mode now derives it from the active root's
+`origin` remote (`git remote get-url origin`, both SSH and HTTPS forms,
+`.git` stripped), returning `None` for a non-git / no-remote /
+non-GitHub root so the existing "ask the caller for repo_name" path is
+preserved verbatim. The builder (`with_workspace`) points the
+default-repo provider at the new resolver. No inventory migration — the
+`local/<dir>` keys on disk stay valid.
+
+Reported by kglite (code-review MCP server, local-workspace mode).
+
+New API:
+
+```rust
+impl Workspace {
+    /// Default `org/repo` for the GitHub tools when the caller passes
+    /// none. Github mode: the active repo. Local mode: the active
+    /// root's `origin` remote, or None — never the `local/<dir>` key.
+    pub fn default_github_repo(&self) -> Option<String>;
+}
+```
+
 ## 0.3.40 — 2026-05-29
 
 ### Added — `server::watch` default skip-patterns

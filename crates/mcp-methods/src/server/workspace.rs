@@ -208,6 +208,21 @@ impl Workspace {
         self.inner.state.read().unwrap().active_repo_path.clone()
     }
 
+    /// Default `org/repo` for the GitHub tools when the caller passes none.
+    ///
+    /// Github mode: the active repo — there the inventory key *is* the
+    /// `org/repo`. Local mode: the active root's `origin` remote parsed
+    /// to `org/repo`, or `None` when there's no GitHub remote. Crucially
+    /// it is *never* the `local/<dir>` inventory key (see
+    /// [`active_repo_name`](Self::active_repo_name)), which is a
+    /// filesystem-derived key, not a valid repo slug.
+    pub fn default_github_repo(&self) -> Option<String> {
+        match self.inner.kind {
+            WorkspaceKind::Github => self.active_repo_name(),
+            WorkspaceKind::Local => self.active_repo_path().and_then(|p| parse_origin_repo(&p)),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Inventory management
     // ------------------------------------------------------------------
@@ -735,6 +750,53 @@ fn synthesize_local_name(root: &Path) -> String {
     format!("local/{name}")
 }
 
+/// Parse the `org/repo` slug from a local checkout's `origin` remote.
+///
+/// Shells out to `git -C <root> remote get-url origin` and parses both
+/// canonical GitHub remote forms, stripping the trailing `.git`:
+///   - `git@github.com:kkollsga/kglite.git`     → `kkollsga/kglite`
+///   - `https://github.com/kkollsga/kglite.git` → `kkollsga/kglite`
+///
+/// Returns `None` for a non-git directory, a missing `origin` remote, or
+/// a non-GitHub remote — so the GitHub tools fall back to their existing
+/// empty-default path (ask the caller for `repo_name`).
+fn parse_origin_repo(root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(out.stdout).ok()?;
+    parse_github_remote(url.trim())
+}
+
+/// Pure-string half of [`parse_origin_repo`]: turn a GitHub remote URL
+/// into `org/repo`, or `None` if it isn't a recognisable GitHub remote.
+fn parse_github_remote(url: &str) -> Option<String> {
+    // Accept both SSH (`git@github.com:org/repo`) and HTTPS
+    // (`https://github.com/org/repo`) forms; everything after the host
+    // separator is the path.
+    let path = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    // Must be exactly `org/repo` — both segments non-empty, one slash.
+    let mut parts = path.split('/');
+    let org = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{org}/{repo}"))
+}
+
 /// Cheap recursive content fingerprint of a directory tree. Walks files
 /// (respecting common ignore patterns) and folds `(path, mtime, len)`
 /// into a 64-bit hash, then hex-formats it. Good enough to detect
@@ -1040,6 +1102,80 @@ mod tests {
             "auto-rebuild gate must skip"
         );
         assert!(out.contains("build skipped"));
+    }
+
+    #[test]
+    fn parses_github_remote_forms() {
+        assert_eq!(
+            parse_github_remote("git@github.com:kkollsga/kglite.git").as_deref(),
+            Some("kkollsga/kglite")
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/kkollsga/kglite.git").as_deref(),
+            Some("kkollsga/kglite")
+        );
+        // No .git suffix, trailing slash.
+        assert_eq!(
+            parse_github_remote("https://github.com/acme/widget/").as_deref(),
+            Some("acme/widget")
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/acme/widget.git").as_deref(),
+            Some("acme/widget")
+        );
+        // Non-github / malformed → None.
+        assert_eq!(
+            parse_github_remote("https://gitlab.com/acme/widget.git"),
+            None
+        );
+        assert_eq!(parse_github_remote("git@github.com:acme.git"), None);
+        assert_eq!(parse_github_remote("not a url"), None);
+    }
+
+    #[test]
+    fn local_default_github_repo_uses_origin_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Stand up a real git repo with a faked origin so default_github_repo
+        // exercises the actual `git remote get-url` path.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        if !git(&["init"]).status.success() {
+            // git unavailable in this environment — skip rather than fail.
+            return;
+        }
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ]);
+        let ws = Workspace::open_local(root.to_path_buf(), None).unwrap();
+        assert_eq!(
+            ws.default_github_repo().as_deref(),
+            Some("acme/widget"),
+            "local default repo must come from the origin remote, not the inventory key"
+        );
+        // The inventory key remains the synthetic local name.
+        assert!(ws.active_repo_name().unwrap().starts_with("local/"));
+    }
+
+    #[test]
+    fn local_default_github_repo_none_without_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
+        // No git remote → None, and crucially NOT Some("local/<dir>").
+        let def = ws.default_github_repo();
+        assert!(
+            def.is_none(),
+            "expected None for a non-git local root, got {def:?}"
+        );
     }
 
     #[test]
