@@ -114,9 +114,11 @@ pub struct SkillFrontmatter {
     #[serde(default)]
     pub applies_to: Option<HashMap<String, String>>,
 
-    /// Tools this skill teaches or references in prose. Used for
-    /// auto-inject discoverability hints (Phase 1c) and staleness
-    /// detection (Phase 1f).
+    /// Tools this skill teaches or references in prose. When
+    /// `auto_inject_hint` is set, the skill's routing + methodology is
+    /// injected into the description of every tool listed here, in
+    /// addition to its name-match tool — the only way to express a
+    /// cross-tool skill. Also used for staleness detection (Phase 1f).
     #[serde(default)]
     pub references_tools: Vec<String>,
 
@@ -133,10 +135,12 @@ pub struct SkillFrontmatter {
     #[serde(default)]
     pub references_properties: Vec<String>,
 
-    /// When `true` (the default) AND the skill's name matches a
-    /// registered MCP tool, the framework injects a "see `prompts/get`
-    /// `<name>` for full methodology" pointer into the tool's
-    /// description. Phase 1c wires this up.
+    /// When `true` (the default), the framework injects the skill's
+    /// `description` (under `## When to use`) and `body` (under
+    /// `## Methodology`) into the live tool-description channel — for
+    /// the tool whose name matches the skill plus every tool in
+    /// `references_tools`. Set `false` to keep the skill on the
+    /// `prompts/*` plane only (no tool-description injection).
     #[serde(default = "default_auto_inject_hint")]
     pub auto_inject_hint: bool,
 

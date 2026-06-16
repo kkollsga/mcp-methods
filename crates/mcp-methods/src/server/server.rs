@@ -823,11 +823,18 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         .collect();
     let extensions = server.options.extensions.clone();
 
-    // For the auto-inject pass: skills whose name matches a registered
-    // tool get their full body embedded into that tool's description.
-    // Tracking (name, body) — see the comment at the bottom of the
-    // function for why this is the body, not a pointer.
-    let mut auto_inject: Vec<(String, String)> = Vec::new();
+    // For the auto-inject pass: skills with `auto_inject_hint` get
+    // their `description` (routing) and `body` (methodology) embedded
+    // into the descriptions of their name-match tool AND every tool
+    // they list in `references_tools`. See the comment at the bottom
+    // of the function for why this is the content, not a pointer.
+    struct InjectSkill {
+        name: String,
+        description: String,
+        body: String,
+        references_tools: Vec<String>,
+    }
+    let mut auto_inject: Vec<InjectSkill> = Vec::new();
 
     for name in registry.skill_names() {
         let Some(skill) = registry.get(&name) else {
@@ -873,11 +880,17 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         server.prompt_router.add_route(route);
 
         if skill.frontmatter.auto_inject_hint {
-            auto_inject.push((skill.name().to_string(), skill.body.clone()));
+            auto_inject.push(InjectSkill {
+                name: skill.name().to_string(),
+                description: skill.description().to_string(),
+                body: skill.body.clone(),
+                references_tools: skill.frontmatter.references_tools.clone(),
+            });
         }
     }
 
-    // Auto-inject the full skill body into matching tool descriptions.
+    // Auto-inject the skill's routing + methodology into tool
+    // descriptions.
     //
     // Background: pre-0.3.37 this loop appended a short pointer line
     // (`See `prompts/get` <name> for the full methodology.`) to the
@@ -888,25 +901,72 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
     // invoked slash commands. Operators authoring against the pointer
     // pattern shipped methodology the agent literally could not read.
     //
-    // The fix: when `auto_inject_hint: true` AND a registered tool
-    // shares the skill's name, embed the full body under a
-    // `## Methodology` header. Bounded by the 4 KB soft / 16 KB hard
-    // size caps the framework already enforces per skill. Operators
-    // who want the smaller pointer-only behaviour set
-    // `auto_inject_hint: false` per skill.
+    // The fix, in two parts:
+    //   * Embed the skill's `description` under a `## When to use`
+    //     header and its `body` under `## Methodology`. The
+    //     description carries the TRIGGER/SKIP routing — small by
+    //     design, so it leads and isn't subject to the body's size
+    //     caps (4 KB soft / 16 KB hard, enforced at load). An empty
+    //     description omits the `## When to use` block.
+    //   * Inject into the skill's name-match tool AND every tool it
+    //     lists in `references_tools`. This is the only way to express
+    //     a *cross-tool* skill — one not named after any single tool.
     //
-    // `prompts/list` / `prompts/get` continue to work for any client
-    // that does surface them to the agent, plus CLI introspection.
-    // This pass just makes the *primary* delivery channel a place
-    // agents actually look.
-    for (skill_name, body) in &auto_inject {
-        let key = Cow::<'static, str>::Owned(skill_name.clone());
-        if let Some(route) = server.tool_router.map.get_mut(&key) {
-            let trimmed_body = body.trim();
-            let inject = format!("\n\n## Methodology\n\n{trimmed_body}");
+    // A tool may now carry several skills (its own plus any that
+    // reference it). Each injection is fenced by a per-skill marker
+    // (`<!-- mcp-skill:<name> -->`) so the pass stays idempotent per
+    // (skill, tool) pair: a tool that is both the name-match and a
+    // `references_tools` entry of the same skill gets one injection,
+    // and re-running the pass never double-appends.
+    //
+    // Operators who want the smaller pointer-only behaviour set
+    // `auto_inject_hint: false` per skill. `prompts/list` /
+    // `prompts/get` continue to work for any client that does surface
+    // them to the agent, plus CLI introspection. This pass just makes
+    // the *primary* delivery channel a place agents actually look.
+    for inj in &auto_inject {
+        // The skill's name-match tool plus every tool it references,
+        // deduped so a self-reference doesn't queue the same tool twice.
+        let mut targets: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for tool in std::iter::once(inj.name.as_str())
+            .chain(inj.references_tools.iter().map(String::as_str))
+        {
+            if seen.insert(tool) {
+                targets.push(tool);
+            }
+        }
+
+        // Build the injected block once. Marker first (idempotency
+        // fence), then the routing, then the methodology body.
+        let marker = format!("<!-- mcp-skill:{} -->", inj.name);
+        let mut block = format!("\n\n{marker}");
+        let description = inj.description.trim();
+        if !description.is_empty() {
+            block.push_str("\n\n## When to use\n\n");
+            block.push_str(description);
+        }
+        block.push_str("\n\n## Methodology\n\n");
+        block.push_str(inj.body.trim());
+
+        for tool in targets {
+            let key = Cow::<'static, str>::Owned(tool.to_string());
+            let Some(route) = server.tool_router.map.get_mut(&key) else {
+                continue;
+            };
+            // Per-skill idempotency: never inject the same skill twice
+            // into one tool's description.
+            if route
+                .attr
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains(&marker))
+            {
+                continue;
+            }
             let new_desc = match route.attr.description.take() {
-                Some(existing) => format!("{existing}{inject}"),
-                None => inject.trim_start().to_string(),
+                Some(existing) => format!("{existing}{block}"),
+                None => block.trim_start().to_string(),
             };
             route.attr.description = Some(Cow::Owned(new_desc));
         }
@@ -1080,6 +1140,40 @@ mod tests {
             .unwrap()
     }
 
+    /// Like [`build_test_registry`] but lets each skill declare a
+    /// `references_tools` list (a YAML inline array, e.g. `[ping]`) so
+    /// the cross-tool injection path can be exercised. Every skill is
+    /// `auto_inject_hint: true`.
+    fn build_registry_with_refs(
+        skills: &[(&str, &str, &str, &str)],
+    ) -> crate::server::skills::ResolvedRegistry {
+        use crate::server::skills::Registry;
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("manifest.yaml");
+        let skills_dir = dir.path().join("manifest.skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        for (name, description, body, references_tools) in skills {
+            let content = format!(
+                "---\nname: {name}\ndescription: {description}\n\
+                 auto_inject_hint: true\nreferences_tools: {references_tools}\n---\n\n{body}\n"
+            );
+            std::fs::write(skills_dir.join(format!("{name}.md")), content).unwrap();
+        }
+        Registry::new()
+            .auto_detect_project_layer(&yaml_path)
+            .finalise()
+            .unwrap()
+    }
+
+    fn tool_desc(server: &McpServer, tool: &str) -> String {
+        server
+            .tool_router
+            .get(tool)
+            .and_then(|t| t.description.clone())
+            .map(|c| c.into_owned())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn prompt_router_empty_by_default() {
         let server = McpServer::new(ServerOptions::default());
@@ -1218,6 +1312,115 @@ mod tests {
             .map(|c| c.into_owned())
             .unwrap_or_default();
         assert!(!ping_desc.contains("no_such_tool"));
+    }
+
+    #[test]
+    fn serve_prompts_injects_description_under_when_to_use() {
+        // The skill's `description` carries the TRIGGER/SKIP routing —
+        // it must reach the live tool-description channel under a
+        // `## When to use` header, ahead of the methodology body.
+        let registry = build_test_registry(&[("ping", "ROUTING-SENTINEL", "BODY-SENTINEL", true)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        let desc = tool_desc(&server, "ping");
+        assert!(
+            desc.contains("## When to use\n\nROUTING-SENTINEL"),
+            "description should be injected under `## When to use`; got: {desc}"
+        );
+        assert!(
+            desc.contains("<!-- mcp-skill:ping -->"),
+            "injection should carry the per-skill idempotency marker; got: {desc}"
+        );
+        // Routing leads, methodology follows.
+        let when = desc.find("## When to use").unwrap();
+        let method = desc.find("## Methodology").unwrap();
+        assert!(when < method, "`When to use` must precede `Methodology`");
+    }
+
+    #[test]
+    fn serve_prompts_honors_references_tools() {
+        // A cross-tool skill named after no tool injects into every
+        // tool it lists in `references_tools`. `ping` is always
+        // registered; the skill name (`graph_strategy`) is not a tool.
+        let registry = build_registry_with_refs(&[(
+            "graph_strategy",
+            "Map structure first.",
+            "GRAPH-BODY-SENTINEL",
+            "[ping]",
+        )]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        // The prompt route still registers under the skill name.
+        assert!(server.prompt_router.map.contains_key("graph_strategy"));
+        // ...and the referenced tool carries the full injection.
+        let desc = tool_desc(&server, "ping");
+        assert!(
+            desc.contains("<!-- mcp-skill:graph_strategy -->"),
+            "referenced tool should carry the skill marker; got: {desc}"
+        );
+        assert!(
+            desc.contains("Map structure first."),
+            "referenced tool should carry the skill routing; got: {desc}"
+        );
+        assert!(
+            desc.contains("GRAPH-BODY-SENTINEL"),
+            "referenced tool should carry the skill body; got: {desc}"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_idempotent_when_skill_self_references() {
+        // A skill named after its own tool that also lists that tool in
+        // `references_tools` must inject exactly once — the dedup of
+        // the target set plus the per-skill marker keep the pass clean.
+        let registry = build_registry_with_refs(&[("ping", "Routing.", "Body.", "[ping]")]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        let desc = tool_desc(&server, "ping");
+        let marker_count = desc.matches("<!-- mcp-skill:ping -->").count();
+        assert_eq!(
+            marker_count, 1,
+            "self-referencing skill must inject exactly once; got {marker_count}: {desc}"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_idempotent_across_repeated_passes() {
+        // Re-running the pass over the same server must not double-
+        // append: the per-skill marker fences each (skill, tool) pair.
+        let registry = build_test_registry(&[("ping", "Routing.", "Body.", true)]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        let once = tool_desc(&server, "ping");
+        super::serve_prompts(&registry, &mut server);
+        let twice = tool_desc(&server, "ping");
+        assert_eq!(
+            once, twice,
+            "second pass must be a no-op for an already-injected tool"
+        );
+    }
+
+    #[test]
+    fn serve_prompts_multiple_skills_stack_on_one_tool() {
+        // A tool can carry its own name-match skill plus a referencing
+        // cross-tool skill — both injections coexist, each fenced by
+        // its own marker.
+        let registry = build_registry_with_refs(&[
+            ("ping", "Ping routing.", "PING-BODY", "[]"),
+            ("ping_strategy", "Strategy routing.", "STRAT-BODY", "[ping]"),
+        ]);
+        let mut server = McpServer::new(ServerOptions::default());
+        super::serve_prompts(&registry, &mut server);
+        let desc = tool_desc(&server, "ping");
+        assert!(desc.contains("<!-- mcp-skill:ping -->"), "got: {desc}");
+        assert!(
+            desc.contains("<!-- mcp-skill:ping_strategy -->"),
+            "got: {desc}"
+        );
+        assert!(
+            desc.contains("PING-BODY") && desc.contains("STRAT-BODY"),
+            "got: {desc}"
+        );
     }
 
     fn write_gated_project_skill(applies_when_yaml: &str) -> tempfile::TempDir {

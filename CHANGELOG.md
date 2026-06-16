@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.42 — 2026-06-16
+
+### Added — `serve_prompts` injects skill routing and honors `references_tools`
+
+The auto-inject pass that embeds skills into live tool descriptions did
+two things that left the most useful half of a skill unreachable by the
+agent. Both are now fixed; the change is additive and needs no
+frontmatter schema change (both fields already parsed).
+
+1. **The skill `description` now reaches the tool channel.** Previously
+   only the `body` was injected (under `## Methodology`); the
+   `description` — which carries the skill's TRIGGER/SKIP *routing* —
+   went only to `prompts/list`, a surface mainstream MCP clients
+   (Claude Code, Desktop, Cursor, Continue) never expose to the model.
+   The pass now injects the description under a `## When to use` header
+   ahead of the methodology. It's small by design, so it leads and is
+   never subject to the body's size caps (4 KB soft / 16 KB hard). An
+   empty description omits the block.
+
+2. **`references_tools` is honored for injection.** A skill is now
+   injected into its name-match tool *and* every tool it lists in
+   `references_tools`. This is the only way to express a **cross-tool**
+   skill — one not named after any single tool (e.g. a graph-analysis
+   strategy that spans `cypher_query`, `graph_overview`, `grep`, and
+   `read_source`). Previously such a skill injected nowhere.
+
+A tool may now carry several skills (its own plus any that reference
+it). Each injection is fenced by a per-skill marker
+(`<!-- mcp-skill:<name> -->`), keeping the pass idempotent per
+(skill, tool) pair: a self-referencing skill injects once, and
+re-running the pass never double-appends.
+
+Backward compatible: a skill with no `references_tools` and a
+tool-matching name behaves as before, additively gaining a `## When to
+use` block. `auto_inject_hint: false` still opts out entirely.
+
+Requested by kglite (consolidating onto a pure-Rust MCP server), which
+was holding two cross-tool, routing-first skills (`code_graph_analysis`,
+`code_graph_views`) that the old name-match + body-only pass could not
+surface.
+
 ## 0.3.41 — 2026-06-06
 
 ### Fixed — local-mode GitHub default repo
