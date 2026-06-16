@@ -139,9 +139,9 @@ let m = manifest::load(yaml_path)?;
 let options = ServerOptions::from_manifest(Some(&m), "My Server");
 
 // Enforce trust gates BEFORE constructing the server.
-if m.extensions.get("my_hook").is_some() && !m.trust.allow_query_preprocessor {
+if m.extensions.get("my_hook").is_some() && !m.trust.allow_embedder {
     anyhow::bail!(
-        "extensions.my_hook requires trust.allow_query_preprocessor: true"
+        "extensions.my_hook requires trust.allow_embedder: true"
     );
 }
 ```

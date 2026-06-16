@@ -66,7 +66,6 @@ source_roots:
 trust:
   allow_python_tools: false
   allow_embedder: false
-  allow_query_preprocessor: false
 builtins:
   save_graph: false
   temp_cleanup: never

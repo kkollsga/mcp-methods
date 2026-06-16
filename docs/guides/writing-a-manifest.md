@@ -40,7 +40,6 @@ source_roots:                    # list of paths; relative to the YAML's parent 
 trust:
   allow_python_tools: false           # tools[].python: factories
   allow_embedder: false               # extensions.embedder loaders
-  allow_query_preprocessor: false     # extensions.cypher_preprocessor hooks
 
 # Builtins — framework-level behaviour switches.
 builtins:

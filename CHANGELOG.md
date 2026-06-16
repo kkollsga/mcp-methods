@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.43 — 2026-06-16
+
+### Removed — `trust.allow_query_preprocessor`
+
+The third advisory trust gate, added in 0.3.29, is retired. It gated
+kglite's `extensions.cypher_preprocessor` hook — a raw-query-text
+rewriter. kglite removed that extension entirely in 0.10.27 (it could
+corrupt string literals and `RETURN` aliases by rewriting text before
+parsing) and replaced it with `extensions.value_codecs`: position-scoped
+literal codecs applied *after* parsing. kglite was the gate's only
+consumer, so it is now dead surface.
+
+A no-op trust gate is worse than no gate: an operator could set
+`allow_query_preprocessor: true` believing it gates something, when
+nothing reads it. So rather than leave it parsed-but-unused, we remove it
+outright — from `TrustConfig`, the parser, the allowed-trust-keys list,
+and `Manifest::to_json()`. Two gates remain: `allow_python_tools` and
+`allow_embedder`.
+
+**Breaking, but with no live impact.** The manifest validator is strict,
+so a manifest still carrying `allow_query_preprocessor:` now fails to load
+as an unknown trust key. None of the five production manifests in the
+`deployed_manifests` regression suite use it, and kglite drops it in
+0.10.27 — so no deployed manifest carries it once that ships. Operators
+who set the key (only kglite did) must remove the line.
+
+We deliberately did **not** add a replacement `allow_value_codecs` gate.
+The `trust:` block gates host-access / code-execution risk:
+`allow_python_tools` runs operator Python, `allow_embedder` loads a Python
+module, and the preprocessor this gate guarded could carry a `command:`
+subprocess hook — which is *why* it needed a gate. Tier-1 value codecs
+(prefix / map / regex) are pure declarative data transforms: no
+subprocess, no code execution, no host access. Their opt-in is the
+presence of an operator-authored `value_codecs:` block, the same posture
+as `tools:`. Gating them would dilute what `trust:` means without a
+corresponding risk to gate against.
+
+### Docs
+- The trust-gate pattern explainers (`docs/explanation/trust-pattern.md`,
+  `docs/guides/trust-gates.md`) and every copy-paste manifest example now
+  use `allow_embedder` as the canonical worked gate. Schema/reference
+  tables drop the retired row. The 0.3.29 entry in the architecture
+  version-log is left as historical record.
+
 ## 0.3.42 — 2026-06-16
 
 ### Added — `serve_prompts` injects skill routing and honors `references_tools`

@@ -12,7 +12,7 @@ A YAML file (`workspace_mcp.yaml` by convention, or `--mcp-config path/to/file.y
 
 - The **server's identity** (`name:`, `instructions:`, `overview_prefix:`)
 - The **operating mode** (`source_roots:`, `workspace: { kind, root, watch }`)
-- The **trust gates** (`trust: { allow_python_tools, allow_embedder, allow_query_preprocessor }`)
+- The **trust gates** (`trust: { allow_python_tools, allow_embedder }`)
 - The **builtin behaviour** (`builtins: { save_graph, temp_cleanup }`)
 - Optional **manifest-declared tools** (`tools: [{ kind: cypher | python, ... }]`)
 - An **opaque passthrough** (`extensions: { ... }`) for downstream-binary-specific config
@@ -35,13 +35,12 @@ The manifest's `workspace:` block wins over CLI flags (same precedence as `sourc
 
 ### 3. Trust gates (advisory metadata)
 
-Three boolean flags under `trust:` declare what dynamic-code hooks the manifest permits:
+Two boolean flags under `trust:` declare what dynamic-code hooks the manifest permits:
 
 | Flag | Gates |
 |---|---|
 | `allow_python_tools` | `tools[].python:` factories |
-| `allow_embedder` | `extensions.embedder` loaders in downstream binaries |
-| `allow_query_preprocessor` | `extensions.cypher_preprocessor` hooks |
+| `allow_embedder` | `embedder:` loaders in downstream binaries |
 
 **The framework records these flags but doesn't enforce them.** Enforcement lives in downstream binaries (the consumer pattern). The flag answers the question "the operator approved this hook," and the consumer is responsible for refusing to boot the hook when the answer is false. See [Trust Gates](guides/trust-gates.md) and the [Trust Pattern](explanation/trust-pattern.md) explanation for why it works this way.
 

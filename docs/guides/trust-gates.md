@@ -2,15 +2,14 @@
 
 The `trust:` block in a manifest is **advisory metadata**. The framework parses + surfaces it; downstream consumers (`kglite-mcp-server`, your own binary) enforce it. This page explains the model and how to use it correctly.
 
-## The three flags
+## The two flags
 
 | Flag | Gates (consumer enforces) |
 |---|---|
 | `allow_python_tools` | `tools[].python:` factories — Python code the operator declared as a tool |
-| `allow_embedder` | `extensions.embedder` loaders — typically a Python class that produces vector embeddings |
-| `allow_query_preprocessor` | `extensions.cypher_preprocessor` hooks — Python or other rewriters that fire before each query |
+| `allow_embedder` | `embedder:` loaders — typically a Python class that produces vector embeddings |
 
-All three default to `false`. The framework writes them to:
+Both default to `false`. The framework writes them to:
 
 - Rust: `manifest.trust.allow_python_tools` (etc.)
 - JSON: `manifest.to_json()["trust"]["allow_python_tools"]`
@@ -22,25 +21,24 @@ When you write:
 
 ```yaml
 trust:
-  allow_query_preprocessor: true
-extensions:
-  cypher_preprocessor:
-    module: ./preprocessor.py
-    class: WikidataPreprocessor
+  allow_embedder: true
+embedder:
+  module: ./embedder.py
+  class: SentenceTransformerEmbedder
 ```
 
 the framework:
 
-1. Parses the manifest, validating `allow_query_preprocessor` is a bool.
-2. Stores `extensions.cypher_preprocessor` as opaque JSON under `manifest.extensions`.
+1. Parses the manifest, validating `allow_embedder` is a bool.
+2. Parses the `embedder:` block (module/class/kwargs) into `manifest.embedder`.
 3. Boots, exposing the manifest via `Manifest::to_json()` and the Rust struct.
-4. **Does NOT instantiate the preprocessor.** The framework has no Python runtime.
+4. **Does NOT instantiate the embedder.** The framework has no Python runtime.
 
 The downstream consumer (kglite-mcp-server) then:
 
-1. Reads `manifest.trust.allow_query_preprocessor`.
-2. If false AND `extensions.cypher_preprocessor` is set, **refuses to boot** with an error like: `extensions.cypher_preprocessor requires trust.allow_query_preprocessor: true`.
-3. If true, instantiates the preprocessor via its pyo3 wrapper and wires it into the Cypher dispatch path.
+1. Reads `manifest.trust.allow_embedder`.
+2. If false AND `embedder:` is set, **refuses to boot** with an error like: `embedder requires trust.allow_embedder: true`.
+3. If true, instantiates the embedder via its pyo3 wrapper and wires it into the `text_score()` path.
 
 This separation is intentional — see [Trust Pattern](../explanation/trust-pattern.md) for the design rationale.
 
@@ -48,7 +46,7 @@ This separation is intentional — see [Trust Pattern](../explanation/trust-patt
 
 Three reasons:
 
-1. **Domain-agnostic framework.** The framework doesn't know what an embedder is, what a query preprocessor does, or what makes a `python:` tool "safe." Each consumer has different semantics for the same flag. Enforcement belongs where the semantics live.
+1. **Domain-agnostic framework.** The framework doesn't know what an embedder is or what makes a `python:` tool "safe." Each consumer has different semantics for the same flag. Enforcement belongs where the semantics live.
 
 2. **Audit-readable in one place.** An operator reviewing a manifest for security implications can scan `trust:` to see every dynamic-code hook the server allows, without hunting through `extensions:` for hidden gates. The block becomes the canonical "what does this server load?" surface.
 
@@ -56,25 +54,25 @@ Three reasons:
 
 ## What happens if you forget to enforce?
 
-The framework can't catch it. If a consumer reads `manifest.extensions.cypher_preprocessor` and instantiates the hook regardless of `trust.allow_query_preprocessor`, the operator's `false` is silently ignored.
+The framework can't catch it. If a consumer reads `manifest.embedder` and instantiates the hook regardless of `trust.allow_embedder`, the operator's `false` is silently ignored.
 
 This is why the contract is documented in CHANGELOG entries (every new gate ships with the enforcement responsibility spelled out) and in [Trust Pattern](../explanation/trust-pattern.md).
 
-**If you're writing a downstream binary**: write a single boot-time check that walks each extension hook + its corresponding trust flag and raises a clean error before any hook is instantiated. The kglite pattern is:
+**If you're writing a downstream binary**: write a single boot-time check that walks each dynamic-code hook + its corresponding trust flag and raises a clean error before any hook is instantiated. The kglite pattern is:
 
 ```python
 # In the consumer's manifest loader
 if (
-    manifest.extensions.get("cypher_preprocessor") is not None
-    and not manifest.trust.allow_query_preprocessor
+    manifest.embedder is not None
+    and not manifest.trust.allow_embedder
 ):
     raise ManifestError(
-        "extensions.cypher_preprocessor requires "
-        "trust.allow_query_preprocessor: true"
+        "embedder requires "
+        "trust.allow_embedder: true"
     )
 ```
 
-One check per extension hook, fail-loud, before `serve()`.
+One check per hook, fail-loud, before `serve()`.
 
 ## Adding a new trust gate
 
@@ -86,7 +84,7 @@ If your downstream binary needs a new extension category, propose a new trust fl
 4. The snapshot test (`to_json_shape_is_stable`) is updated to include it.
 5. CHANGELOG entry documents the consumer-enforcement contract.
 
-This is exactly the path `allow_query_preprocessor` followed in mcp-methods 0.3.29 — proposed by kglite for their 0.9.25 release, shipped same-day after a brief design review.
+This is exactly the path `allow_embedder` followed — proposed by kglite when they needed to load a Python embedder for semantic search, added upstream as a non-breaking patch, and enforced in their boot-time check.
 
 ## See also
 

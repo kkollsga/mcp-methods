@@ -28,7 +28,6 @@ The YAML manifest accepted by `mcp-server` and all downstream binaries. Strict u
 |---|---|---|
 | `allow_python_tools` | bool | `false` |
 | `allow_embedder` | bool | `false` |
-| `allow_query_preprocessor` | bool | `false` |
 
 Unknown keys under `trust:` are rejected.
 
@@ -149,7 +148,7 @@ extensions:
 ```rust
 use mcp_methods::server::manifest;
 let m = manifest::load(yaml_path)?;
-println!("{}", m.trust.allow_query_preprocessor);
+println!("{}", m.trust.allow_embedder);
 let json = m.to_json();   // serde_json::Value for FFI bridging
 ```
 
@@ -157,7 +156,7 @@ let json = m.to_json();   // serde_json::Value for FFI bridging
 # Via the pyo3 wrapper (e.g. kglite-mcp-server's PyManifest)
 m = PyManifest.load("workspace_mcp.yaml")
 d = m.as_dict()
-print(d["trust"]["allow_query_preprocessor"])
+print(d["trust"]["allow_embedder"])
 ```
 
 ## JSON shape from `Manifest::to_json()`

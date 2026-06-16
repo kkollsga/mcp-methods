@@ -9,11 +9,10 @@ The framework parses the `trust:` block in a manifest but doesn't enforce its fl
 pub struct TrustConfig {
     pub allow_python_tools: bool,
     pub allow_embedder: bool,
-    pub allow_query_preprocessor: bool,
 }
 ```
 
-It parses the YAML, validates each value is a bool, surfaces it via `Manifest::to_json()` and the Rust struct. **Then it stops.** No code in `mcp-methods` ever reads `manifest.trust.allow_embedder` and decides to load or skip an embedder — because the framework doesn't load embedders. The same is true for `allow_query_preprocessor` and `allow_python_tools` after the 0.3.26 framework-cleanup pass.
+It parses the YAML, validates each value is a bool, surfaces it via `Manifest::to_json()` and the Rust struct. **Then it stops.** No code in `mcp-methods` ever reads `manifest.trust.allow_embedder` and decides to load or skip an embedder — because the framework doesn't load embedders. The same is true for `allow_python_tools` after the 0.3.26 framework-cleanup pass.
 
 ## Why advisory
 
@@ -30,11 +29,8 @@ An operator reviewing a manifest for security implications wants one place to se
 ```yaml
 trust:
   allow_python_tools: true           # operator approved Python factories
-  allow_embedder: true               # operator approved embedder loading
-  allow_query_preprocessor: false    # operator denied query rewriting
-extensions:
-  embedder: { ... }                  # has approval → boots
-  cypher_preprocessor: { ... }       # NO approval → consumer refuses to boot
+  allow_embedder: false              # operator denied embedder loading
+embedder: { ... }                    # NO approval → consumer refuses to boot
 ```
 
 If trust were spread across `extensions:` (e.g. `extensions.embedder.allow_unsafe: true`), the operator would have to grep through the full manifest to audit. Centralizing it in `trust:` makes the security review a single read.
@@ -50,7 +46,7 @@ Adding a new trust gate is a non-breaking patch release. We:
 
 Downstream consumers adopt the new gate at their own pace. Consumers that don't know about the new flag read `false` (the default) and refuse to boot the new hook — which is the safe default.
 
-This is exactly the path `allow_query_preprocessor` followed for kglite's 0.9.25 release. Proposed by kglite, shipped as 0.3.29 same-day, kglite enforces it in their boot-time check. Zero coordination overhead.
+This is exactly the path `allow_embedder` followed for kglite's semantic-search work. Proposed by kglite, added upstream as a non-breaking patch, kglite enforces it in their boot-time check. Zero coordination overhead.
 
 ## What enforcement looks like
 
@@ -58,11 +54,11 @@ In a downstream binary's manifest loader:
 
 ```rust
 // Rust example
-if manifest.extensions.get("cypher_preprocessor").is_some()
-    && !manifest.trust.allow_query_preprocessor
+if manifest.embedder.is_some()
+    && !manifest.trust.allow_embedder
 {
     anyhow::bail!(
-        "extensions.cypher_preprocessor requires trust.allow_query_preprocessor: true"
+        "embedder requires trust.allow_embedder: true"
     );
 }
 ```
@@ -70,12 +66,12 @@ if manifest.extensions.get("cypher_preprocessor").is_some()
 ```python
 # Python example (kglite's pattern)
 if (
-    manifest.extensions.get("cypher_preprocessor") is not None
-    and not manifest.trust.allow_query_preprocessor
+    manifest.embedder is not None
+    and not manifest.trust.allow_embedder
 ):
     raise ManifestError(
-        "extensions.cypher_preprocessor requires "
-        "trust.allow_query_preprocessor: true"
+        "embedder requires "
+        "trust.allow_embedder: true"
     )
 ```
 
@@ -83,7 +79,7 @@ One check per gate, fail-loud at boot, before any hook is instantiated.
 
 ## What can go wrong
 
-The framework can't catch a consumer that forgets to enforce. If a downstream binary reads `manifest.extensions.cypher_preprocessor` and instantiates the hook without checking `manifest.trust.allow_query_preprocessor`, the operator's `false` is silently ignored.
+The framework can't catch a consumer that forgets to enforce. If a downstream binary reads `manifest.extensions.embedder` and instantiates the hook without checking `manifest.trust.allow_embedder`, the operator's `false` is silently ignored.
 
 Mitigations:
 
@@ -109,4 +105,4 @@ The advisory pattern is well-suited to a *library framework* like mcp-methods. A
 
 - [Trust Gates (how-to)](../guides/trust-gates.md) — usage + enforcement patterns
 - [Architecture](architecture.md) — three-crate layout
-- The `allow_query_preprocessor` 0.3.29 release notes in [CHANGELOG](../changelog.md) — worked example
+- The [CHANGELOG](../changelog.md) — every trust-gate change ships with its consumer-enforcement contract

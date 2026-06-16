@@ -1,23 +1,21 @@
 # Example: Tools + Trust Gates
 
-A manifest declaring Cypher tools (for downstream binaries with a graph backend), an embedder, and a query preprocessor — illustrating all three trust gates.
+A manifest declaring Cypher tools (for downstream binaries with a graph backend) and an embedder — illustrating the trust gates.
 
 ```yaml
 name: KGLite-style Knowledge Graph Server
 instructions: |
-  A knowledge graph server with Cypher querying, semantic search via
-  text_score(), and a query preprocessor that normalizes incoming
-  Cypher before dispatch.
+  A knowledge graph server with Cypher querying and semantic search
+  via text_score().
 
 source_roots:
   - ./source
 
-# All three gates set to true — the operator has approved each
-# corresponding extension category.
+# Gates set to match the extension categories below — the operator has
+# approved each one.
 trust:
   allow_python_tools: false           # no python: tools below
   allow_embedder: true                # embedder block below requires this
-  allow_query_preprocessor: true      # extensions.cypher_preprocessor requires this
 
 builtins:
   save_graph: true                    # register save_graph tool
@@ -54,16 +52,6 @@ embedder:
     model_name: BAAI/bge-m3
     cache_dir: ./.cache/embedder
 
-# Opaque passthrough — downstream-binary-specific config.
-# kglite's preprocessor reads this block when
-# trust.allow_query_preprocessor: true.
-extensions:
-  cypher_preprocessor:
-    module: ./preprocessor.py
-    class: WikidataPreprocessor
-    kwargs:
-      log_rewrites: false
-
 env_file: .env
 ```
 
@@ -78,42 +66,39 @@ mcp-server --mcp-config kglite_style.yaml
 3. Registers `read_source`, `grep`, `list_source`, plus `ping`.
 4. **Does NOT dispatch `prospects_in_region` or `missing_required_edges`** — no graph backend. Logs a warning.
 5. **Does NOT instantiate the embedder** — framework doesn't load embedders.
-6. **Does NOT load `extensions.cypher_preprocessor`** — framework doesn't know what it is.
-7. Serves over stdio.
+6. Serves over stdio.
 
 ## What kglite-mcp-server does with the same manifest
 
 1. Parses + validates (same framework code).
-2. Reads `trust.allow_embedder` and `trust.allow_query_preprocessor`. Both are `true`. ✓
+2. Reads `trust.allow_embedder`. It is `true`. ✓
 3. Reads `embedder:`, instantiates the Python class via pyo3, wires it into `text_score()`.
-4. Reads `extensions.cypher_preprocessor`, instantiates the Python class, wires it into the Cypher dispatch path.
-5. Registers `cypher_query`, `graph_overview`, `save_graph`, `read_code_source` tools.
-6. Dispatches `prospects_in_region` and `missing_required_edges` against the active graph.
-7. Serves over stdio.
+4. Registers `cypher_query`, `graph_overview`, `save_graph`, `read_code_source` tools.
+5. Dispatches `prospects_in_region` and `missing_required_edges` against the active graph.
+6. Serves over stdio.
 
 Same manifest, different runtime behaviour. The trust-gate split is what makes this safe to share across binaries — kglite enforces, generic mcp-server ignores (because it has nothing to enforce).
 
 ## Enforcement failure mode
 
-If the manifest declares an extension WITHOUT the corresponding trust gate:
+If the manifest declares a dynamic-code hook WITHOUT the corresponding trust gate:
 
 ```yaml
 trust:
-  allow_query_preprocessor: false      # ← denied
-extensions:
-  cypher_preprocessor:                 # ← but block is present
-    module: ./preprocessor.py
-    class: WikidataPreprocessor
+  allow_embedder: false                # ← denied
+embedder:                              # ← but block is present
+  module: ./embedder.py
+  class: SentenceTransformerEmbedder
 ```
 
 kglite-mcp-server's boot-time check refuses to start:
 
 ```text
 $ kglite-mcp-server --mcp-config kglite_style.yaml
-ManifestError: extensions.cypher_preprocessor requires trust.allow_query_preprocessor: true
+ManifestError: embedder requires trust.allow_embedder: true
 ```
 
-The generic `mcp-server` boots fine (it doesn't read `extensions.cypher_preprocessor`). This is intentional — see [Trust Pattern](../explanation/trust-pattern.md).
+The generic `mcp-server` boots fine (it doesn't load embedders). This is intentional — see [Trust Pattern](../explanation/trust-pattern.md).
 
 ## See also
 
