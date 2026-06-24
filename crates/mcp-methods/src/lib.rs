@@ -34,6 +34,7 @@ pub mod grep;
 pub mod html;
 pub mod json_grep;
 pub mod list_dir;
+pub mod screen;
 
 #[cfg(feature = "server")]
 pub mod server;

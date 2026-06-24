@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.3.44 — 2026-06-24
+
+### Added — `screen_stargazers`: cheap GitHub people-screening
+
+A new built-in GitHub tool that screens the people around a project —
+the stargazers of a repo, or an explicit user list — to surface
+relevant developers, notable / "coding-legend" devs, architectural
+peers, and *actual adopters*, at minimal API + token cost.
+
+It reuses the `github_issues` drill-down shape: one bulk pass fetches
+each person's public repo portfolio over plain REST (~1 request per
+person — no GraphQL, no READMEs), classifies them into cohorts, and
+enriches only a bounded shortlist (follower counts, dependency-adoption,
+Rust+Python co-location, external contributions). The whole fetch lives
+in an in-memory store (the stargazer analogue of `ElementCache`); the
+agent drills via `element_id` (`cohort:<key>` / `user:<login>` /
+`…/repo:<name>` / `…/readme`) as cache hits, and re-ranks for free. Only
+the README drill costs a request.
+
+It lives in the framework, not a downstream binary, because it is
+*generic* GitHub access — no graph / Cypher / domain knowledge — so it
+sits next to `github_issues` / `github_api`. It auto-configures from the
+seed repo (derives relevance keywords + tech stack from the repo's
+topics, description, and languages), so `screen_stargazers(repo=…)`
+works with zero tuning; or seed an explicit `users=` list.
+
+Ranking is the heart of it. Every person gets a normalized 0–100 vector
+on four orthogonal axes — relatedness, popularity, effort, recency
+(log-damped + percentile-ranked so power-law signals are comparable). A
+`filter → rank → take` selection — named presets (`outreach`, `peers`,
+`legends`, `intel`, `adopters`) or a raw `rank_by` + filters
+(`min_keywords`, `active_since`, `adopters_only`, `stack_only`, `top`) —
+turns one bulk fetch into materially different, decision-relevant
+orderings from the same cached data, which is also the mechanism for
+bounding breadth (rank then take the top-N).
+
+### Added — `builtins.screen_stargazers` toggle
+
+Operators get the tool **for free on upgrade**: it auto-registers when a
+GitHub token is reachable, exactly like the other GitHub tools, and
+existing manifests are unchanged. Set `builtins.screen_stargazers:
+false` to keep `github_issues` / `github_api` but drop stargazer
+screening. Default on.
+
+Note for downstream Rust consumers: `BuiltinsConfig` gained a
+`screen_stargazers: bool` field. If you construct it by struct literal
+rather than via the manifest loader or `Default`, add
+`..Default::default()`.
+
 ## 0.3.43 — 2026-06-16
 
 ### Removed — `trust.allow_query_preprocessor`

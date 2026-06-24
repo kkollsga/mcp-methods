@@ -17,14 +17,17 @@ you intend to release from.
 
 ### Steps
 
-1. **Bump the version in all four places** (they must match — the
-   version is the single source of truth in
-   `crates/mcp-methods/Cargo.toml`):
-   - `crates/mcp-methods/Cargo.toml` → `version`
-   - `crates/mcp-methods-py/Cargo.toml` → `version`
-   - `crates/mcp-server/Cargo.toml` → `version` **and** its
-     `mcp-methods = { version = "..." }` dependency pin
-   - (`Cargo.lock` is gitignored — no need to touch it)
+1. **Bump the version in one place** — `version` under
+   `[workspace.package]` in the **root `Cargo.toml`**. All three crates
+   inherit it via `version.workspace = true`, so a release is a single
+   edit.
+   - The `mcp-server` → `mcp-methods` dependency is a minor-level req
+     (`mcp-methods = { version = "0.3", … }`), so patch bumps don't
+     touch it. Only bump that pin on a **minor/major** release (e.g.
+     `0.3` → `0.4`).
+   - `mcp-methods-py` depends on `mcp-methods` by path only (no version
+     req) — it's the wheel builder, never published standalone.
+   - (`Cargo.lock` is gitignored — no need to touch it.)
 2. **Finalize the CHANGELOG** top block: set the date, drop any
    `(proposed)` marker. Entries are required; match the prose quality
    of recent entries (explain the *why*).
