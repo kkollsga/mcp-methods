@@ -2,7 +2,8 @@ name: Publish to crates.io
 on:
   push:
     paths:
-      - 'crates/mcp-methods/Cargo.toml'
+      # Version is single-sourced in the root [workspace.package].version.
+      - 'Cargo.toml'
   workflow_dispatch:
 
 jobs:
@@ -17,7 +18,8 @@ jobs:
       - name: Extract version from Cargo.toml
         id: get_version
         run: |
-          VERSION=$(grep -m 1 "version" crates/mcp-methods/Cargo.toml | cut -d '"' -f 2)
+          # Single source of truth: [workspace.package].version in root Cargo.toml.
+          VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Package version: $VERSION"
       - name: Check if version exists on crates.io
