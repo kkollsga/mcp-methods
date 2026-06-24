@@ -575,11 +575,11 @@ impl McpServer {
         // (keeping the other GitHub tools) via `builtins.screen_stargazers:
         // false`; default on.
         if self.options.builtins.screen_stargazers {
-        let screen_store: Arc<Mutex<crate::screen::ScreenStore>> =
-            Arc::new(Mutex::new(crate::screen::ScreenStore::new()));
-        self.register_typed_tool::<ScreenStargazersArgs, _>(
-            "screen_stargazers",
-            "Screen the people around a GitHub project to find relevant developers, \
+            let screen_store: Arc<Mutex<crate::screen::ScreenStore>> =
+                Arc::new(Mutex::new(crate::screen::ScreenStore::new()));
+            self.register_typed_tool::<ScreenStargazersArgs, _>(
+                "screen_stargazers",
+                "Screen the people around a GitHub project to find relevant developers, \
              notable/legendary devs, architectural peers, and actual users — cheaply. \
              Seed on a repo (`repo=\"owner/repo\"` → screens its stargazers) OR an \
              explicit user list (`users=\"alice,bob\"` → screens them directly). With \
@@ -613,74 +613,79 @@ impl McpServer {
              or `\"user:<login>/repo:<name>/readme\"` (README gist — the only drill that \
              costs a request). `max_stargazers` samples the most-recent N (the overview \
              reports if results are partial); `refresh=true` re-fetches.",
-            move |args: ScreenStargazersArgs| {
-                use crate::screen::{self, Filters, RankBy, Seed, Selection};
-                let split_csv = |s: Option<String>| -> Vec<String> {
-                    s.map(|v| {
-                        v.split(',')
-                            .map(|t| t.trim().to_string())
-                            .filter(|t| !t.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-                };
-                // Seed: explicit user list wins; else the repo (or active repo).
-                let seed = if let Some(u) = &args.users {
-                    Seed::Users(split_csv(Some(u.clone())))
-                } else {
-                    let repo = match resolve_repo_from(repo_for_screen.as_ref(), args.repo.clone()) {
-                        Ok(r) => r,
-                        Err(msg) => return msg,
+                move |args: ScreenStargazersArgs| {
+                    use crate::screen::{self, Filters, RankBy, Seed, Selection};
+                    let split_csv = |s: Option<String>| -> Vec<String> {
+                        s.map(|v| {
+                            v.split(',')
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default()
                     };
-                    if let Some(err) = crate::git_refs::validate_repo(&repo) {
-                        return err;
-                    }
-                    Seed::Repo(repo)
-                };
-                let cfg = screen::ScreenConfig {
-                    max_stargazers: args.max_stargazers,
-                    max_repos_per_user: 100,
-                    relevance_keywords: split_csv(args.keywords)
-                        .into_iter()
-                        .map(|k| k.to_lowercase())
-                        .collect(),
-                    stack_languages: split_csv(args.stack),
-                };
-                // Selection: preset, else explicit rank/filters, else none.
-                let top = args.top.unwrap_or(10);
-                let filters = Filters {
-                    min_keywords: args.min_keywords,
-                    active_since: args.active_since.clone(),
-                    adopters_only: args.adopters_only,
-                    stack_only: args.stack_only,
-                    ..Default::default()
-                };
-                let filters_active = filters.min_keywords.is_some()
-                    || filters.active_since.is_some()
-                    || filters.adopters_only
-                    || filters.stack_only;
-                let selection: Option<Selection> = if let Some(name) = &args.preset {
-                    screen::preset(name, top)
-                } else if args.rank_by.is_some() || filters_active {
-                    Some(Selection {
-                        filters,
-                        rank: args.rank_by.as_deref().and_then(RankBy::parse).unwrap_or(RankBy::Relatedness),
-                        label: "SELECTION".into(),
-                        take: top,
-                    })
-                } else {
-                    None
-                };
-                screen::screen_dispatch(
-                    &screen_store,
-                    &seed,
-                    &cfg,
-                    selection.as_ref(),
-                    args.element_id.as_deref(),
-                    args.refresh,
-                )
-            },
-        );
+                    // Seed: explicit user list wins; else the repo (or active repo).
+                    let seed = if let Some(u) = &args.users {
+                        Seed::Users(split_csv(Some(u.clone())))
+                    } else {
+                        let repo =
+                            match resolve_repo_from(repo_for_screen.as_ref(), args.repo.clone()) {
+                                Ok(r) => r,
+                                Err(msg) => return msg,
+                            };
+                        if let Some(err) = crate::git_refs::validate_repo(&repo) {
+                            return err;
+                        }
+                        Seed::Repo(repo)
+                    };
+                    let cfg = screen::ScreenConfig {
+                        max_stargazers: args.max_stargazers,
+                        max_repos_per_user: 100,
+                        relevance_keywords: split_csv(args.keywords)
+                            .into_iter()
+                            .map(|k| k.to_lowercase())
+                            .collect(),
+                        stack_languages: split_csv(args.stack),
+                    };
+                    // Selection: preset, else explicit rank/filters, else none.
+                    let top = args.top.unwrap_or(10);
+                    let filters = Filters {
+                        min_keywords: args.min_keywords,
+                        active_since: args.active_since.clone(),
+                        adopters_only: args.adopters_only,
+                        stack_only: args.stack_only,
+                        ..Default::default()
+                    };
+                    let filters_active = filters.min_keywords.is_some()
+                        || filters.active_since.is_some()
+                        || filters.adopters_only
+                        || filters.stack_only;
+                    let selection: Option<Selection> = if let Some(name) = &args.preset {
+                        screen::preset(name, top)
+                    } else if args.rank_by.is_some() || filters_active {
+                        Some(Selection {
+                            filters,
+                            rank: args
+                                .rank_by
+                                .as_deref()
+                                .and_then(RankBy::parse)
+                                .unwrap_or(RankBy::Relatedness),
+                            label: "SELECTION".into(),
+                            take: top,
+                        })
+                    } else {
+                        None
+                    };
+                    screen::screen_dispatch(
+                        &screen_store,
+                        &seed,
+                        &cfg,
+                        selection.as_ref(),
+                        args.element_id.as_deref(),
+                        args.refresh,
+                    )
+                },
+            );
         }
     }
 

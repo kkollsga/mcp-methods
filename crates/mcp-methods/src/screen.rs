@@ -214,7 +214,10 @@ pub fn project_repo(raw: &Value) -> RepoLite {
             .unwrap_or("")
             .to_string(),
         fork: raw.get("fork").and_then(Value::as_bool).unwrap_or(false),
-        archived: raw.get("archived").and_then(Value::as_bool).unwrap_or(false),
+        archived: raw
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         lang: raw
             .get("language")
             .and_then(Value::as_str)
@@ -254,9 +257,9 @@ fn tokenize(s: &str) -> std::collections::HashSet<String> {
 /// `graphql` (no boundary) and NOT `storage` for `rag`. Kills the
 /// substring false positives the first tester flagged.
 fn token_set_has(tokens: &std::collections::HashSet<String>, kw: &str) -> bool {
-    tokens.iter().any(|t| {
-        t == kw || t.strip_suffix('s') == Some(kw) || t.strip_prefix(kw) == Some("s")
-    })
+    tokens
+        .iter()
+        .any(|t| t == kw || t.strip_suffix('s') == Some(kw) || t.strip_prefix(kw) == Some("s"))
 }
 
 /// Weighted relevance of a repo against the keyword list, plus the distinct
@@ -303,17 +306,27 @@ fn repo_relevance(r: &RepoLite, kws: &[String]) -> (u32, Vec<String>) {
 }
 
 /// Classify a user from their (already projected) owned repos.
-pub fn profile_user(login: &str, repos: Vec<RepoLite>, capped: bool, cfg: &ScreenConfig) -> UserProfile {
+pub fn profile_user(
+    login: &str,
+    repos: Vec<RepoLite>,
+    capped: bool,
+    cfg: &ScreenConfig,
+) -> UserProfile {
     let originals: Vec<&RepoLite> = repos.iter().filter(|r| !r.fork).collect();
     let original_count = originals.len();
     let fork_count = repos.len() - original_count;
 
     let max_stars = originals.iter().map(|r| r.stars).max().unwrap_or(0);
     let total_stars: u64 = originals.iter().map(|r| r.stars).sum();
-    let last_active = repos.iter().map(|r| r.pushed.clone()).max().unwrap_or_default();
+    let last_active = repos
+        .iter()
+        .map(|r| r.pushed.clone())
+        .max()
+        .unwrap_or_default();
 
     // Top languages over original repos.
-    let mut lang_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut lang_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for r in &originals {
         if let Some(l) = &r.lang {
             *lang_counts.entry(l.clone()).or_default() += 1;
@@ -325,7 +338,7 @@ pub fn profile_user(login: &str, repos: Vec<RepoLite>, capped: bool, cfg: &Scree
 
     // Flagship = the most-starred original, if it stands out.
     let mut by_stars: Vec<&RepoLite> = originals.clone();
-    by_stars.sort_by(|a, b| b.stars.cmp(&a.stars));
+    by_stars.sort_by_key(|r| std::cmp::Reverse(r.stars));
     let second = by_stars.get(1).map(|r| r.stars).unwrap_or(0);
     let flagship = by_stars.first().copied().filter(|r| r.stars >= 10).cloned();
     let flagship_dominant = flagship
@@ -379,7 +392,10 @@ pub fn profile_user(login: &str, repos: Vec<RepoLite>, capped: bool, cfg: &Scree
     });
     let relevant: Vec<RepoLite> = scored.iter().map(|(_, _, r)| (**r).clone()).collect();
     let best_relevant_score = scored.first().map(|(s, _, _)| *s).unwrap_or(0);
-    let hit_terms: Vec<String> = scored.first().map(|(_, t, _)| t.clone()).unwrap_or_default();
+    let hit_terms: Vec<String> = scored
+        .first()
+        .map(|(_, t, _)| t.clone())
+        .unwrap_or_default();
 
     // Stack match: count original repos in each of the seed project's
     // languages. A dev is a stack match if they have ≥1 repo in *every*
@@ -390,13 +406,18 @@ pub fn profile_user(login: &str, repos: Vec<RepoLite>, capped: bool, cfg: &Scree
         .map(|sl| {
             let n = originals
                 .iter()
-                .filter(|r| r.lang.as_deref().map(|l| l.eq_ignore_ascii_case(sl)).unwrap_or(false))
+                .filter(|r| {
+                    r.lang
+                        .as_deref()
+                        .map(|l| l.eq_ignore_ascii_case(sl))
+                        .unwrap_or(false)
+                })
                 .count();
             (sl.clone(), n)
         })
         .collect();
-    let stack_match = !stack_lang_counts.is_empty()
-        && stack_lang_counts.iter().all(|(_, n)| *n >= 1);
+    let stack_match =
+        !stack_lang_counts.is_empty() && stack_lang_counts.iter().all(|(_, n)| *n >= 1);
 
     UserProfile {
         login: login.to_string(),
@@ -488,7 +509,10 @@ pub fn normalize_scores(profiles: &mut [UserProfile]) {
             (size as f64 + 1.0).ln() + p.original_count as f64
         })
         .collect();
-    let rec: Vec<f64> = profiles.iter().map(|p| date_ordinal(&p.last_active)).collect();
+    let rec: Vec<f64> = profiles
+        .iter()
+        .map(|p| date_ordinal(&p.last_active))
+        .collect();
 
     let (rel, pop, eff, rec) = (
         percentile_ranks(&rel),
@@ -526,7 +550,15 @@ fn repo_line(r: &RepoLite) -> String {
     let topics = if r.topics.is_empty() {
         String::new()
     } else {
-        format!(" [{}]", r.topics.iter().take(4).cloned().collect::<Vec<_>>().join(","))
+        format!(
+            " [{}]",
+            r.topics
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     };
     format!("{} {}★ ({}) \"{}\"{}", r.name, r.stars, lang, desc, topics)
 }
@@ -598,7 +630,12 @@ fn contrib_tag(p: &UserProfile) -> String {
     } else {
         format!(
             " · contributes: {}",
-            p.contributes_to.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            p.contributes_to
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }
@@ -624,11 +661,11 @@ fn cohort_key(a: Archetype) -> &'static str {
 /// stars, dates) + percentile thresholds on the normalized axes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filters {
-    pub min_keywords: Option<usize>,      // relatedness gate (distinct kw hits)
-    pub min_stars: Option<u64>,           // popularity gate (best repo stars)
-    pub active_since: Option<String>,     // recency gate (YYYY-MM-DD)
-    pub adopters_only: bool,              // decisive: actual users
-    pub stack_only: bool,                 // architectural peers
+    pub min_keywords: Option<usize>, // relatedness gate (distinct kw hits)
+    pub min_stars: Option<u64>,      // popularity gate (best repo stars)
+    pub active_since: Option<String>, // recency gate (YYYY-MM-DD)
+    pub adopters_only: bool,         // decisive: actual users
+    pub stack_only: bool,            // architectural peers
     pub min_relatedness_pct: Option<f64>, // percentile gate, 0–1
     pub min_effort_pct: Option<f64>,
 }
@@ -717,7 +754,10 @@ fn passes(p: &UserProfile, f: &Filters) -> bool {
 /// Filter → rank → take. The selection function, reused for the overview
 /// view and the fan-out gate (expand only these top-K).
 pub fn select<'a>(profiles: &'a [UserProfile], sel: &Selection) -> Vec<&'a UserProfile> {
-    let mut v: Vec<&UserProfile> = profiles.iter().filter(|p| passes(p, &sel.filters)).collect();
+    let mut v: Vec<&UserProfile> = profiles
+        .iter()
+        .filter(|p| passes(p, &sel.filters))
+        .collect();
     v.sort_by(|a, b| sel.rank.value(b).total_cmp(&sel.rank.value(a)));
     v.truncate(sel.take.max(1));
     v
@@ -730,14 +770,22 @@ pub fn preset(name: &str, take: usize) -> Option<Selection> {
     Some(match name.to_lowercase().as_str() {
         // relevant + active, ranked by reach — who to email
         "outreach" => Selection {
-            filters: Filters { min_keywords: Some(2), active_since: Some(recent), ..Default::default() },
+            filters: Filters {
+                min_keywords: Some(2),
+                active_since: Some(recent),
+                ..Default::default()
+            },
             rank: RankBy::Popularity,
             label: "OUTREACH (relevant + active, by reach)".into(),
             take,
         },
         // architectural peers, ranked by substance
         "peers" => Selection {
-            filters: Filters { stack_only: true, active_since: Some(recent), ..Default::default() },
+            filters: Filters {
+                stack_only: true,
+                active_since: Some(recent),
+                ..Default::default()
+            },
             rank: RankBy::Effort,
             label: "PEERS (build in your stack, by effort)".into(),
             take,
@@ -751,14 +799,20 @@ pub fn preset(name: &str, take: usize) -> Option<Selection> {
         },
         // anything on-domain, by popularity — competitive intel
         "intel" => Selection {
-            filters: Filters { min_keywords: Some(1), ..Default::default() },
+            filters: Filters {
+                min_keywords: Some(1),
+                ..Default::default()
+            },
             rank: RankBy::Popularity,
             label: "INTEL (on-domain, by popularity)".into(),
             take,
         },
         // people who already depend on you
         "adopters" => Selection {
-            filters: Filters { adopters_only: true, ..Default::default() },
+            filters: Filters {
+                adopters_only: true,
+                ..Default::default()
+            },
             rank: RankBy::Popularity,
             label: "ADOPTERS (actual users)".into(),
             take,
@@ -849,7 +903,11 @@ pub fn build_overview(
         Scale::Large => "standouts only, rest by count",
         Scale::Extreme => "statistics — drill cohorts",
     };
-    let noun = if meta.noun.is_empty() { "people" } else { meta.noun.as_str() };
+    let noun = if meta.noun.is_empty() {
+        "people"
+    } else {
+        meta.noun.as_str()
+    };
     let scope = if meta.partial && meta.total_stargazers > 0 {
         format!("{total} of {} {noun}", meta.total_stargazers)
     } else {
@@ -877,13 +935,18 @@ pub fn build_overview(
     // highest-value signal: not "might be interested", but "is a user".
     let adopters: Vec<&UserProfile> = profiles.iter().filter(|p| p.adopter).collect();
     if !adopters.is_empty() {
-        out.push_str(&format!("\n✅ ADOPTERS — already depend on you ({}):\n", adopters.len()));
+        out.push_str(&format!(
+            "\n✅ ADOPTERS — already depend on you ({}):\n",
+            adopters.len()
+        ));
         for p in &adopters {
             out.push_str(&format!(
                 "  • {}{} — {}\n",
                 p.login,
                 reach_tag(p),
-                p.adoption_evidence.as_deref().unwrap_or("(dependency declared)")
+                p.adoption_evidence
+                    .as_deref()
+                    .unwrap_or("(dependency declared)")
             ));
         }
     } else if meta.noun != "users" {
@@ -904,7 +967,11 @@ pub fn build_overview(
             .push(p);
     }
     for (_, (_, members)) in buckets.iter_mut() {
-        members.sort_by(|a, b| b.max_stars.cmp(&a.max_stars).then(b.total_stars.cmp(&a.total_stars)));
+        members.sort_by(|a, b| {
+            b.max_stars
+                .cmp(&a.max_stars)
+                .then(b.total_stars.cmp(&a.total_stars))
+        });
     }
 
     // Focused selection (filter → rank → take) when requested; otherwise
@@ -914,181 +981,201 @@ pub fn build_overview(
     }
 
     if selection.is_none() {
-    // ── Most relevant devs first (the answer to "who matters") ──
-    // The screening goal is relevance, not traction, so this leads — and
-    // it cross-cuts cohorts, surfacing on-domain repos that the star-ranked
-    // cohort lines bury.
-    let mut hits: Vec<&UserProfile> = profiles.iter().filter(|p| p.strong_hit).collect();
-    // Rank by distinct-keyword breadth (the visible `Nkw` prefix), then
-    // traction — once a repo clears the ≥2-keyword on-domain bar, stars are
-    // a credibility signal, so a 40★ builder outranks a 0★ name-match at the
-    // same breadth. Score only breaks remaining ties.
-    hits.sort_by(|a, b| {
-        b.hit_terms
-            .len()
-            .cmp(&a.hit_terms.len())
-            .then(b.relevant[0].stars.cmp(&a.relevant[0].stars))
-            .then(b.hit_score.cmp(&a.hit_score))
-    });
-    if !cfg.relevance_keywords.is_empty() {
-        let cap = match scale {
-            Scale::Small | Scale::Medium => 12,
-            Scale::Large => 8,
-            Scale::Extreme => 5,
-        };
-        out.push_str(&format!(
+        // ── Most relevant devs first (the answer to "who matters") ──
+        // The screening goal is relevance, not traction, so this leads — and
+        // it cross-cuts cohorts, surfacing on-domain repos that the star-ranked
+        // cohort lines bury.
+        let mut hits: Vec<&UserProfile> = profiles.iter().filter(|p| p.strong_hit).collect();
+        // Rank by distinct-keyword breadth (the visible `Nkw` prefix), then
+        // traction — once a repo clears the ≥2-keyword on-domain bar, stars are
+        // a credibility signal, so a 40★ builder outranks a 0★ name-match at the
+        // same breadth. Score only breaks remaining ties.
+        hits.sort_by(|a, b| {
+            b.hit_terms
+                .len()
+                .cmp(&a.hit_terms.len())
+                .then(b.relevant[0].stars.cmp(&a.relevant[0].stars))
+                .then(b.hit_score.cmp(&a.hit_score))
+        });
+        if !cfg.relevance_keywords.is_empty() {
+            let cap = match scale {
+                Scale::Small | Scale::Medium => 12,
+                Scale::Large => 8,
+                Scale::Extreme => 5,
+            };
+            out.push_str(&format!(
             "\n★ MOST RELEVANT — on-domain repo per dev (≥2 keyword hits), ranked by `Nkw` then traction · keys=[{}] ({} devs):\n",
             cfg.relevance_keywords.join(","),
             hits.len()
         ));
-        for p in hits.iter().take(cap) {
-            out.push_str(&format!("  • {}\n", relevance_line(p)));
-        }
-        if hits.len() > cap {
-            out.push_str(&format!("  …+{} more\n", hits.len() - cap));
-        }
+            for p in hits.iter().take(cap) {
+                out.push_str(&format!("  • {}\n", relevance_line(p)));
+            }
+            if hits.len() > cap {
+                out.push_str(&format!("  …+{} more\n", hits.len() - cap));
+            }
 
-        // Weak single-keyword matches: kept as a one-line footnote so they
-        // are available without competing with the real leads.
-        let weak: Vec<&UserProfile> = profiles
-            .iter()
-            .filter(|p| !p.strong_hit && !p.relevant.is_empty())
-            .collect();
-        if !weak.is_empty() {
-            let listed: Vec<String> = weak
+            // Weak single-keyword matches: kept as a one-line footnote so they
+            // are available without competing with the real leads.
+            let weak: Vec<&UserProfile> = profiles
                 .iter()
-                .take(10)
-                .map(|p| format!("{}/{}({})", p.login, p.relevant[0].name, p.hit_terms.join("/")))
+                .filter(|p| !p.strong_hit && !p.relevant.is_empty())
                 .collect();
-            out.push_str(&format!(
-                "  ~ weak 1-keyword matches ({}): {}{}\n",
-                weak.len(),
-                listed.join(", "),
-                if weak.len() > 10 { ", …" } else { "" }
-            ));
-        }
-    }
-
-    // ── Popularity / reach lens — coding legends, regardless of domain ──
-    let mut notable: Vec<&UserProfile> = profiles
-        .iter()
-        .filter(|p| p.max_stars >= 50 || p.followers.map(|f| f >= 200).unwrap_or(false))
-        .collect();
-    notable.sort_by(|a, b| {
-        b.followers
-            .unwrap_or(0)
-            .cmp(&a.followers.unwrap_or(0))
-            .then(b.max_stars.cmp(&a.max_stars))
-            .then(b.total_stars.cmp(&a.total_stars))
-    });
-    if !notable.is_empty() {
-        out.push_str("\n🏆 NOTABLE — biggest reach/traction (popularity lens):\n");
-        for p in notable.iter().take(6) {
-            let legend = if is_legend(p) { " ⟵ LEGEND" } else { "" };
-            let top = p
-                .repos
-                .iter()
-                .filter(|r| !r.fork)
-                .max_by_key(|r| r.stars)
-                .map(|r| format!("{} {}★", r.name, r.stars))
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "  • {}{} — {}★ total · top: {}{}\n",
-                p.login,
-                reach_tag(p),
-                p.total_stars,
-                top,
-                legend
-            ));
-        }
-    }
-
-    // ── Quality lens — best-kept serious projects (maintenance + stars) ──
-    let mut byq: Vec<&UserProfile> = profiles.iter().filter(|p| quality_score(p) >= 3.5).collect();
-    byq.sort_by(|a, b| quality_score(b).total_cmp(&quality_score(a)));
-    if !byq.is_empty() {
-        out.push_str("\n✦ QUALITY — best-kept projects (maintained + topic-tagged + active):\n");
-        for p in byq.iter().take(5) {
-            let best = p
-                .repos
-                .iter()
-                .filter(|r| !r.fork)
-                .max_by(|a, b| repo_quality(a).total_cmp(&repo_quality(b)));
-            if let Some(r) = best {
-                let topics = if r.topics.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", r.topics.iter().take(3).cloned().collect::<Vec<_>>().join(","))
-                };
+            if !weak.is_empty() {
+                let listed: Vec<String> = weak
+                    .iter()
+                    .take(10)
+                    .map(|p| {
+                        format!(
+                            "{}/{}({})",
+                            p.login,
+                            p.relevant[0].name,
+                            p.hit_terms.join("/")
+                        )
+                    })
+                    .collect();
                 out.push_str(&format!(
-                    "  • {} — {} {}★ ({}) active {}{}\n",
-                    p.login,
-                    r.name,
-                    r.stars,
-                    r.lang.as_deref().unwrap_or("—"),
-                    r.pushed,
-                    topics
+                    "  ~ weak 1-keyword matches ({}): {}{}\n",
+                    weak.len(),
+                    listed.join(", "),
+                    if weak.len() > 10 { ", …" } else { "" }
                 ));
             }
         }
-    }
 
-    // ── Stack match: shares the seed project's languages (PyO3 signal) ──
-    // Catches relevant devs whose repo names don't contain the keywords.
-    if !cfg.stack_languages.is_empty() {
-        let already: std::collections::HashSet<&str> =
-            hits.iter().take(20).map(|p| p.login.as_str()).collect();
-        let mut stack: Vec<&UserProfile> = profiles
+        // ── Popularity / reach lens — coding legends, regardless of domain ──
+        let mut notable: Vec<&UserProfile> = profiles
             .iter()
-            .filter(|p| p.stack_match && !already.contains(p.login.as_str()))
+            .filter(|p| p.max_stars >= 50 || p.followers.map(|f| f >= 200).unwrap_or(false))
             .collect();
-        // Rank by depth of stack commitment (total in-stack repos): a serial
-        // Rust+Python builder — the kglite/maturin pattern — outranks an
-        // incidental one. This is the signal that catches architectural
-        // peers keywords structurally cannot (descriptions don't name the
-        // toolchain). We show the *counts*, not a sample repo: the most-
-        // starred in-stack repo is often off-domain, so the verifiable
-        // signal is "builds N things in your exact stack" — then drill.
-        stack.sort_by(|a, b| {
-            stack_depth(b)
-                .cmp(&stack_depth(a))
+        notable.sort_by(|a, b| {
+            b.followers
+                .unwrap_or(0)
+                .cmp(&a.followers.unwrap_or(0))
+                .then(b.max_stars.cmp(&a.max_stars))
                 .then(b.total_stars.cmp(&a.total_stars))
         });
-        if !stack.is_empty() {
-            out.push_str(&format!(
+        if !notable.is_empty() {
+            out.push_str("\n🏆 NOTABLE — biggest reach/traction (popularity lens):\n");
+            for p in notable.iter().take(6) {
+                let legend = if is_legend(p) { " ⟵ LEGEND" } else { "" };
+                let top = p
+                    .repos
+                    .iter()
+                    .filter(|r| !r.fork)
+                    .max_by_key(|r| r.stars)
+                    .map(|r| format!("{} {}★", r.name, r.stars))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  • {}{} — {}★ total · top: {}{}\n",
+                    p.login,
+                    reach_tag(p),
+                    p.total_stars,
+                    top,
+                    legend
+                ));
+            }
+        }
+
+        // ── Quality lens — best-kept serious projects (maintenance + stars) ──
+        let mut byq: Vec<&UserProfile> = profiles
+            .iter()
+            .filter(|p| quality_score(p) >= 3.5)
+            .collect();
+        byq.sort_by(|a, b| quality_score(b).total_cmp(&quality_score(a)));
+        if !byq.is_empty() {
+            out.push_str(
+                "\n✦ QUALITY — best-kept projects (maintained + topic-tagged + active):\n",
+            );
+            for p in byq.iter().take(5) {
+                let best = p
+                    .repos
+                    .iter()
+                    .filter(|r| !r.fork)
+                    .max_by(|a, b| repo_quality(a).total_cmp(&repo_quality(b)));
+                if let Some(r) = best {
+                    let topics = if r.topics.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " [{}]",
+                            r.topics
+                                .iter()
+                                .take(3)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    };
+                    out.push_str(&format!(
+                        "  • {} — {} {}★ ({}) active {}{}\n",
+                        p.login,
+                        r.name,
+                        r.stars,
+                        r.lang.as_deref().unwrap_or("—"),
+                        r.pushed,
+                        topics
+                    ));
+                }
+            }
+        }
+
+        // ── Stack match: shares the seed project's languages (PyO3 signal) ──
+        // Catches relevant devs whose repo names don't contain the keywords.
+        if !cfg.stack_languages.is_empty() {
+            let already: std::collections::HashSet<&str> =
+                hits.iter().take(20).map(|p| p.login.as_str()).collect();
+            let mut stack: Vec<&UserProfile> = profiles
+                .iter()
+                .filter(|p| p.stack_match && !already.contains(p.login.as_str()))
+                .collect();
+            // Rank by depth of stack commitment (total in-stack repos): a serial
+            // Rust+Python builder — the kglite/maturin pattern — outranks an
+            // incidental one. This is the signal that catches architectural
+            // peers keywords structurally cannot (descriptions don't name the
+            // toolchain). We show the *counts*, not a sample repo: the most-
+            // starred in-stack repo is often off-domain, so the verifiable
+            // signal is "builds N things in your exact stack" — then drill.
+            stack.sort_by(|a, b| {
+                stack_depth(b)
+                    .cmp(&stack_depth(a))
+                    .then(b.total_stars.cmp(&a.total_stars))
+            });
+            if !stack.is_empty() {
+                out.push_str(&format!(
                 "\n⚙ STACK MATCH — builds in your stack ({}), ranked by depth · drill to confirm ({} devs):\n",
                 cfg.stack_languages.join("+"),
                 stack.len()
             ));
-            for p in stack.iter().take(8) {
-                let breakdown = p
-                    .stack_lang_counts
-                    .iter()
-                    .map(|(l, n)| format!("{n} {l}"))
-                    .collect::<Vec<_>>()
-                    .join(" + ");
-                // [item 4] co-location: repos combining all stack langs (PyO3).
-                let coloc = match p.colocated_repos {
-                    Some(n) if n > 0 => format!(" · {n} combine both (PyO3-style)"),
-                    Some(_) => " · none combine both".to_string(),
-                    None => String::new(),
-                };
-                out.push_str(&format!(
-                    "  • {} — {} ({} in-stack of {} repos){}{}{}\n",
-                    p.login,
-                    breakdown,
-                    stack_depth(p),
-                    p.original_count,
-                    coloc,
-                    reach_tag(p),
-                    contrib_tag(p),
-                ));
-            }
-            if stack.len() > 8 {
-                out.push_str(&format!("  …+{} more\n", stack.len() - 8));
+                for p in stack.iter().take(8) {
+                    let breakdown = p
+                        .stack_lang_counts
+                        .iter()
+                        .map(|(l, n)| format!("{n} {l}"))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    // [item 4] co-location: repos combining all stack langs (PyO3).
+                    let coloc = match p.colocated_repos {
+                        Some(n) if n > 0 => format!(" · {n} combine both (PyO3-style)"),
+                        Some(_) => " · none combine both".to_string(),
+                        None => String::new(),
+                    };
+                    out.push_str(&format!(
+                        "  • {} — {} ({} in-stack of {} repos){}{}{}\n",
+                        p.login,
+                        breakdown,
+                        stack_depth(p),
+                        p.original_count,
+                        coloc,
+                        reach_tag(p),
+                        contrib_tag(p),
+                    ));
+                }
+                if stack.len() > 8 {
+                    out.push_str(&format!("  …+{} more\n", stack.len() - 8));
+                }
             }
         }
-    }
     } // end multi-lens browse (selection.is_none())
 
     // Devs already surfaced as leads above — skip them in the cohort detail
@@ -1101,7 +1188,7 @@ pub fn build_overview(
 
     // ── Inventory: cohort counts (the audience shape) ──
     out.push_str("\nCOHORTS (drill 'cohort:<key>' for the full list):\n");
-    for (_, (arch, members)) in &buckets {
+    for (arch, members) in buckets.values() {
         out.push_str(&format!(
             "  {:<20} {:>3}  {:<18} {}\n",
             arch.label(),
@@ -1112,14 +1199,17 @@ pub fn build_overview(
     }
 
     // ── Per-cohort detail, depth by scale, leads excluded ──
-    for (_, (arch, members)) in &buckets {
+    for (arch, members) in buckets.values() {
         let n = members.len();
         let show = inline_quota(*arch, scale, n);
         if show == 0 {
             continue;
         }
         // Only members not already surfaced as leads above.
-        let rest: Vec<&&UserProfile> = members.iter().filter(|p| !shown.contains(p.login.as_str())).collect();
+        let rest: Vec<&&UserProfile> = members
+            .iter()
+            .filter(|p| !shown.contains(p.login.as_str()))
+            .collect();
         let lead_count = n - rest.len();
         if rest.is_empty() {
             continue;
@@ -1139,7 +1229,11 @@ pub fn build_overview(
             tail.push_str(&format!("{} shown as leads above", lead_count));
         }
         if !tail.is_empty() {
-            out.push_str(&format!("  …{} — drill 'cohort:{}'\n", tail, cohort_key(*arch)));
+            out.push_str(&format!(
+                "  …{} — drill 'cohort:{}'\n",
+                tail,
+                cohort_key(*arch)
+            ));
         }
     }
 
@@ -1159,7 +1253,12 @@ fn relevance_line(p: &UserProfile) -> String {
         Some(d) => format!("\"{}\"", trunc(d, 85)),
         None if !r.topics.is_empty() => format!(
             "topics:[{}]",
-            r.topics.iter().take(5).cloned().collect::<Vec<_>>().join(",")
+            r.topics
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         None => "(no description)".into(),
     };
@@ -1226,8 +1325,17 @@ pub fn archetype_from_key(key: &str) -> Option<Archetype> {
 /// Members of a cohort, rendered in full (the `cohort:<name>` drill).
 pub fn render_cohort(arch: Archetype, profiles: &[UserProfile]) -> String {
     let mut members: Vec<&UserProfile> = profiles.iter().filter(|p| p.archetype == arch).collect();
-    members.sort_by(|a, b| b.max_stars.cmp(&a.max_stars).then(b.total_stars.cmp(&a.total_stars)));
-    let mut out = format!("{} ({}) — {}\n\n", arch.label(), members.len(), cohort_blurb(arch));
+    members.sort_by(|a, b| {
+        b.max_stars
+            .cmp(&a.max_stars)
+            .then(b.total_stars.cmp(&a.total_stars))
+    });
+    let mut out = format!(
+        "{} ({}) — {}\n\n",
+        arch.label(),
+        members.len(),
+        cohort_blurb(arch)
+    );
     for p in &members {
         out.push_str(&format!("  • {}\n", user_overview_line(p)));
     }
@@ -1245,16 +1353,28 @@ pub fn render_user(p: &UserProfile) -> String {
         p.fork_count,
         p.total_stars,
         p.last_active,
-        if p.top_langs.is_empty() { "—".into() } else { p.top_langs.join(", ") },
+        if p.top_langs.is_empty() {
+            "—".into()
+        } else {
+            p.top_langs.join(", ")
+        },
     ));
     let mut originals: Vec<&RepoLite> = p.repos.iter().filter(|r| !r.fork).collect();
     originals.sort_by(|a, b| b.stars.cmp(&a.stars).then(b.pushed.cmp(&a.pushed)));
     for r in originals.iter().take(30) {
         let arch = if r.archived { " [archived]" } else { "" };
-        out.push_str(&format!("  • {}{}  (pushed {})\n", repo_line(r), arch, r.pushed));
+        out.push_str(&format!(
+            "  • {}{}  (pushed {})\n",
+            repo_line(r),
+            arch,
+            r.pushed
+        ));
     }
     if originals.len() > 30 {
-        out.push_str(&format!("  …+{} more original repos\n", originals.len() - 30));
+        out.push_str(&format!(
+            "  …+{} more original repos\n",
+            originals.len() - 30
+        ));
     }
     out
 }
@@ -1307,7 +1427,12 @@ fn compact_readme(md: &str) -> String {
             continue;
         }
         // Drop badge lines, HTML, comments, raw image refs.
-        if t.starts_with("<!--") || t.starts_with('<') || t.starts_with("![") || t.contains("shields.io") || t.contains("badge") {
+        if t.starts_with("<!--")
+            || t.starts_with('<')
+            || t.starts_with("![")
+            || t.contains("shields.io")
+            || t.contains("badge")
+        {
             continue;
         }
         kept.push(line.to_string());
@@ -1354,7 +1479,10 @@ impl Seed {
             Seed::Repo(t.to_string())
         } else {
             Seed::Users(
-                t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             )
         }
     }
@@ -1379,10 +1507,51 @@ pub struct ScreenMeta {
 
 /// Words too generic to be useful relevance keywords.
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "is", "it", "its",
-    "via", "using", "used", "based", "written", "powered", "support", "library", "lib", "tool",
-    "tools", "framework", "simple", "lightweight", "fast", "high", "performance", "easy", "small",
-    "modern", "minimal", "your", "you", "this", "that", "from", "by", "as", "at", "be", "are",
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "is",
+    "it",
+    "its",
+    "via",
+    "using",
+    "used",
+    "based",
+    "written",
+    "powered",
+    "support",
+    "library",
+    "lib",
+    "tool",
+    "tools",
+    "framework",
+    "simple",
+    "lightweight",
+    "fast",
+    "high",
+    "performance",
+    "easy",
+    "small",
+    "modern",
+    "minimal",
+    "your",
+    "you",
+    "this",
+    "that",
+    "from",
+    "by",
+    "as",
+    "at",
+    "be",
+    "are",
 ];
 
 /// Auto-derive relevance keywords + stack from the seed repo itself, so a
@@ -1428,7 +1597,7 @@ pub fn derive_config(repo: &str) -> (Vec<String>, Vec<String>) {
                         .collect()
                 })
                 .unwrap_or_default();
-            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.sort_by_key(|x| std::cmp::Reverse(x.1));
             v.into_iter().take(2).map(|(l, _)| l).collect()
         }
         Err(_) => Vec::new(),
@@ -1460,7 +1629,11 @@ pub fn fetch_contributions(login: &str) -> Vec<String> {
         ) {
             continue;
         }
-        if let Some(full) = ev.get("repo").and_then(|r| r.get("name")).and_then(Value::as_str) {
+        if let Some(full) = ev
+            .get("repo")
+            .and_then(|r| r.get("name"))
+            .and_then(Value::as_str)
+        {
             let owner = full.split('/').next().unwrap_or("");
             if owner.to_lowercase() != login_lc && seen.insert(full.to_string()) {
                 out.push(full.to_string());
@@ -1516,7 +1689,12 @@ pub fn find_adopters(
     }
     let logins_lc: std::collections::HashSet<String> =
         logins.iter().map(|l| l.to_lowercase()).collect();
-    let manifests = ["Cargo.toml", "pyproject.toml", "requirements.txt", "package.json"];
+    let manifests = [
+        "Cargo.toml",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+    ];
     for mf in manifests {
         let q = format!("{pkg}+filename:{mf}");
         let results = match github::gh_get(&format!("search/code?q={q}&per_page=30")) {
@@ -1567,7 +1745,8 @@ fn verify_dependency(full_name: &str, path: &str, pkg: &str) -> Option<String> {
             let before = l[..idx].chars().next_back();
             let after = l[idx + pkg_lc.len()..].chars().next();
             let boundary = |c: Option<char>| {
-                c.map(|c| !(c.is_alphanumeric() || c == '_' || c == '-')).unwrap_or(true)
+                c.map(|c| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                    .unwrap_or(true)
             };
             if boundary(before) && boundary(after) {
                 return Some(line.trim().chars().take(80).collect());
@@ -1766,8 +1945,9 @@ fn enrich(pkg: &str, profiles: &mut [UserProfile], cfg: &ScreenConfig, meta: &mu
     // [item 4] Co-location for the top stack matches by depth (the ranking
     // shown in the overview), independent of the lead ordering.
     if !cfg.stack_languages.is_empty() {
-        let mut stack_idx: Vec<usize> =
-            (0..profiles.len()).filter(|&i| profiles[i].stack_match).collect();
+        let mut stack_idx: Vec<usize> = (0..profiles.len())
+            .filter(|&i| profiles[i].stack_match)
+            .collect();
         stack_idx.sort_by(|&a, &b| stack_depth(&profiles[b]).cmp(&stack_depth(&profiles[a])));
         for &i in stack_idx.iter().take(5) {
             let n = probe_colocation(&profiles[i], &cfg.stack_languages, 6);
@@ -1842,7 +2022,10 @@ pub fn drill(profiles: &[UserProfile], element_id: &str) -> String {
     let rest = element_id.strip_prefix("user:").unwrap_or(element_id);
     let mut parts = rest.splitn(2, "/repo:");
     let login = parts.next().unwrap_or("");
-    let prof = match profiles.iter().find(|p| p.login.eq_ignore_ascii_case(login)) {
+    let prof = match profiles
+        .iter()
+        .find(|p| p.login.eq_ignore_ascii_case(login))
+    {
         Some(p) => p,
         None => return format!("no such stargazer in this screen: '{login}'"),
     };
@@ -1853,7 +2036,11 @@ pub fn drill(profiles: &[UserProfile], element_id: &str) -> String {
                 Some(n) => (n, true),
                 None => (repo_part, false),
             };
-            let r = match prof.repos.iter().find(|r| r.name.eq_ignore_ascii_case(rname)) {
+            let r = match prof
+                .repos
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(rname))
+            {
                 Some(r) => r,
                 None => return format!("{login} has no repo '{rname}' in this screen"),
             };
@@ -1965,11 +2152,14 @@ pub fn screen_dispatch(
     match run_screen(seed, cfg) {
         Ok((profiles, meta, eff)) => {
             let out = build_overview(&key, &profiles, &meta, &eff, selection);
-            store
-                .lock()
-                .unwrap()
-                .store
-                .insert(key, CachedScreen { profiles, meta, cfg: eff });
+            store.lock().unwrap().store.insert(
+                key,
+                CachedScreen {
+                    profiles,
+                    meta,
+                    cfg: eff,
+                },
+            );
             out
         }
         Err(e) => e,
@@ -1991,7 +2181,10 @@ mod tests {
     }
 
     fn profiles_for(repos: Vec<Value>) -> UserProfile {
-        let cfg = ScreenConfig { relevance_keywords: vec!["graph".into()], ..Default::default() };
+        let cfg = ScreenConfig {
+            relevance_keywords: vec!["graph".into()],
+            ..Default::default()
+        };
         let lite: Vec<RepoLite> = repos.iter().map(project_repo).collect();
         profile_user("tester", lite, false, &cfg)
     }
@@ -1999,7 +2192,14 @@ mod tests {
     #[test]
     fn single_project_dev_detected() {
         let p = profiles_for(vec![
-            repo("flagship", false, 179, "Lua", "graph preview plugin", "2025-05-29"),
+            repo(
+                "flagship",
+                false,
+                179,
+                "Lua",
+                "graph preview plugin",
+                "2025-05-29",
+            ),
             repo("misc1", false, 1, "Python", "small thing", "2025-04-01"),
             repo("misc2", false, 0, "Lua", "another", "2025-03-01"),
         ]);
@@ -2012,7 +2212,14 @@ mod tests {
     fn prolific_builder_detected() {
         let mut repos = Vec::new();
         for i in 0..20 {
-            repos.push(repo(&format!("r{i}"), false, 0, "Rust", "experiment", "2026-05-01"));
+            repos.push(repo(
+                &format!("r{i}"),
+                false,
+                0,
+                "Rust",
+                "experiment",
+                "2026-05-01",
+            ));
         }
         let p = profiles_for(repos);
         assert_eq!(p.archetype, Archetype::Prolific);
@@ -2035,16 +2242,33 @@ mod tests {
     }
 
     fn two_profiles() -> Vec<UserProfile> {
-        let cfg = ScreenConfig { relevance_keywords: vec!["graph".into()], ..Default::default() };
+        let cfg = ScreenConfig {
+            relevance_keywords: vec!["graph".into()],
+            ..Default::default()
+        };
         let flagship = profile_user(
             "solo",
-            vec![project_repo(&repo("flag", false, 99, "Rust", "graph engine", "2025-05-01"))],
+            vec![project_repo(&repo(
+                "flag",
+                false,
+                99,
+                "Rust",
+                "graph engine",
+                "2025-05-01",
+            ))],
             false,
             &cfg,
         );
         let mut repos = Vec::new();
         for i in 0..8 {
-            repos.push(project_repo(&repo(&format!("r{i}"), false, 0, "Go", "x", "2026-01-01")));
+            repos.push(project_repo(&repo(
+                &format!("r{i}"),
+                false,
+                0,
+                "Go",
+                "x",
+                "2026-01-01",
+            )));
         }
         let prolific = profile_user("builder", repos, false, &cfg);
         vec![flagship, prolific]
@@ -2074,13 +2298,31 @@ mod tests {
         let store = std::sync::Mutex::new(ScreenStore::new());
         store.lock().unwrap().store.insert(
             "a/b".into(),
-            CachedScreen { profiles: two_profiles(), meta: ScreenMeta::default(), cfg: ScreenConfig::default() },
+            CachedScreen {
+                profiles: two_profiles(),
+                meta: ScreenMeta::default(),
+                cfg: ScreenConfig::default(),
+            },
         );
         let cfg = ScreenConfig::default();
-        let out = screen_dispatch(&store, &Seed::Repo("a/b".into()), &cfg, None, Some("user:solo"), false);
+        let out = screen_dispatch(
+            &store,
+            &Seed::Repo("a/b".into()),
+            &cfg,
+            None,
+            Some("user:solo"),
+            false,
+        );
         assert!(out.contains("Single-project"));
         // Missing repo → friendly "build it first".
-        let miss = screen_dispatch(&store, &Seed::Repo("x/y".into()), &cfg, None, Some("user:solo"), false);
+        let miss = screen_dispatch(
+            &store,
+            &Seed::Repo("x/y".into()),
+            &cfg,
+            None,
+            Some("user:solo"),
+            false,
+        );
         assert!(miss.contains("No screen cached"));
     }
 }

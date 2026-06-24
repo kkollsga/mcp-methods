@@ -15,7 +15,10 @@ use mcp_methods::screen::{
 use std::fs;
 
 fn cache_path(seed: &Seed) -> String {
-    format!(".screen-cache-{}.json", seed.key().replace(['/', ',', ':'], "-"))
+    format!(
+        ".screen-cache-{}.json",
+        seed.key().replace(['/', ',', ':'], "-")
+    )
 }
 
 fn load_cache(seed: &Seed) -> Option<CachedScreen> {
@@ -23,7 +26,10 @@ fn load_cache(seed: &Seed) -> Option<CachedScreen> {
 }
 
 fn csv(s: &str) -> Vec<String> {
-    s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 fn take(args: &[String], i: &mut usize) -> String {
@@ -49,7 +55,12 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--keywords" => cfg.relevance_keywords = csv(&take(&args, &mut i)).into_iter().map(|s| s.to_lowercase()).collect(),
+            "--keywords" => {
+                cfg.relevance_keywords = csv(&take(&args, &mut i))
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect()
+            }
             "--stack" => cfg.stack_languages = csv(&take(&args, &mut i)),
             "--max-stargazers" => cfg.max_stargazers = take(&args, &mut i).parse().ok(),
             "--preset" => preset_name = Some(take(&args, &mut i)),
@@ -108,7 +119,13 @@ fn main() {
                 })
                 .collect();
             normalize_scores(&mut reclassified);
-            let out = build_overview(&seed.key(), &reclassified, &c.meta, &c.cfg, selection.as_ref());
+            let out = build_overview(
+                &seed.key(),
+                &reclassified,
+                &c.meta,
+                &c.cfg,
+                selection.as_ref(),
+            );
             print!("{out}");
             eprintln!("\n[overview size: {} bytes]", out.len());
             return;
@@ -121,7 +138,12 @@ fn main() {
             let out = build_overview(&seed.key(), &profiles, &meta, &eff, selection.as_ref());
             let _ = fs::write(
                 cache_path(&seed),
-                serde_json::to_string(&CachedScreen { profiles, meta, cfg: eff }).unwrap(),
+                serde_json::to_string(&CachedScreen {
+                    profiles,
+                    meta,
+                    cfg: eff,
+                })
+                .unwrap(),
             );
             print!("{out}");
             eprintln!("\n[overview size: {} bytes]", out.len());
