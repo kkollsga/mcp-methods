@@ -114,7 +114,7 @@ pub fn detect_git_repo(cwd: &str) -> Option<String> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-fn gh_get(endpoint: &str) -> Result<Value, String> {
+pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
     let url = if endpoint.starts_with("http") {
         endpoint.to_string()
     } else {
@@ -232,7 +232,7 @@ fn parse_last_page(link: &str) -> Option<usize> {
     })
 }
 
-fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
+pub(crate) fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
     gh_get_paginated_bookends(endpoint, 0, 0)
 }
 

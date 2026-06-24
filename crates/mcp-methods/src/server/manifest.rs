@@ -63,7 +63,7 @@ const ALLOWED_TOOL_KEYS: &[&str] = &[
     "rename",
 ];
 const ALLOWED_EMBEDDER_KEYS: &[&str] = &["module", "class", "kwargs"];
-const ALLOWED_BUILTIN_KEYS: &[&str] = &["save_graph", "temp_cleanup"];
+const ALLOWED_BUILTIN_KEYS: &[&str] = &["save_graph", "temp_cleanup", "screen_stargazers"];
 const VALID_TEMP_CLEANUP: &[&str] = &["never", "on_overview"];
 
 #[derive(Debug, Error)]
@@ -181,10 +181,24 @@ pub struct EmbedderConfig {
     pub kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct BuiltinsConfig {
     pub save_graph: bool,
     pub temp_cleanup: TempCleanup,
+    /// Register the `screen_stargazers` GitHub tool. Default on; set
+    /// `builtins.screen_stargazers: false` to keep the other GitHub tools
+    /// (`github_issues` / `github_api`) but drop stargazer screening.
+    pub screen_stargazers: bool,
+}
+
+impl Default for BuiltinsConfig {
+    fn default() -> Self {
+        Self {
+            save_graph: false,
+            temp_cleanup: TempCleanup::default(),
+            screen_stargazers: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -417,6 +431,7 @@ impl Manifest {
             "builtins": {
                 "save_graph": self.builtins.save_graph,
                 "temp_cleanup": self.builtins.temp_cleanup.as_str(),
+                "screen_stargazers": self.builtins.screen_stargazers,
             },
             "env_file": self.env_file,
             "workspace": self.workspace.as_ref().map(|w| serde_json::json!({
@@ -1373,6 +1388,11 @@ fn build_builtins(
             .as_bool()
             .ok_or_else(|| ManifestError::at(yaml_path, "builtins.save_graph must be a bool"))?;
     }
+    if let Some(v) = map.get("screen_stargazers") {
+        cfg.screen_stargazers = v.as_bool().ok_or_else(|| {
+            ManifestError::at(yaml_path, "builtins.screen_stargazers must be a bool")
+        })?;
+    }
     if let Some(v) = map.get("temp_cleanup") {
         let s = v.as_str().ok_or_else(|| {
             ManifestError::at(
@@ -2199,7 +2219,7 @@ builtins:
                 "class": "SentenceTransformerEmbedder",
                 "kwargs": {},
             },
-            "builtins": { "save_graph": true, "temp_cleanup": "on_overview" },
+            "builtins": { "save_graph": true, "temp_cleanup": "on_overview", "screen_stargazers": true },
             "env_file": null,
             "workspace": null,
             "extensions": {},

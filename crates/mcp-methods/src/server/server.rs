@@ -344,6 +344,62 @@ fn default_depth() -> usize {
     1
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ScreenStargazersArgs {
+    /// Repo whose stargazers to screen, as "owner/repo".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Alternatively, screen an explicit set of users — comma-separated
+    /// logins ("octocat,torvalds"). Takes precedence over `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<String>,
+    /// Focused view via a named preset: "outreach" (relevant+active by
+    /// reach), "peers" (your stack by effort), "legends" (biggest reach),
+    /// "intel" (on-domain by popularity), "adopters" (actual users).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Or rank explicitly by one axis: relatedness | popularity | effort | recency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_by: Option<String>,
+    /// Top-K for the focused/preset view (default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<usize>,
+    /// Filter: minimum distinct keyword hits (relatedness gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_keywords: Option<usize>,
+    /// Filter: only people active since this date (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_since: Option<String>,
+    /// Filter: only people who actually depend on the seed package.
+    #[serde(default)]
+    pub adopters_only: bool,
+    /// Filter: only architectural (stack) peers.
+    #[serde(default)]
+    pub stack_only: bool,
+    /// Comma-separated topic keywords for the relevance gate (e.g.
+    /// "graph,rag,agent,llm"). Matched whole-word against repo
+    /// name/topics/description; devs hitting ≥2 distinct keywords are
+    /// surfaced as leads, single-keyword hits demoted to a footnote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<String>,
+    /// Comma-separated languages defining the seed project's stack (e.g.
+    /// "Rust,Python"). Stargazers using all of them are flagged as a
+    /// keyword-invisible "stack match" to drill into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    /// Cap the number of stargazers screened (most-recent first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stargazers: Option<usize>,
+    /// Drill into the cached screen instead of returning the overview:
+    /// "cohort:<key>", "user:<login>", "user:<login>/repo:<name>", or
+    /// ".../readme". Requires a prior no-element_id call for the repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
+    /// Re-fetch from GitHub instead of reusing the cached screen.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
 /// MCP server backed by the rmcp framework.
 ///
 /// The struct is cloned per request by rmcp's handler dispatch; the
@@ -488,7 +544,8 @@ impl McpServer {
                 )
             },
         );
-        let repo_provider = default_repo;
+        let repo_provider = default_repo.clone();
+        let repo_for_screen = default_repo;
         self.register_typed_tool::<GithubApiArgs, _>(
             "github_api",
             "Read-only GET against the GitHub REST API. `path` may be a \
@@ -509,6 +566,122 @@ impl McpServer {
                 Err(msg) => msg,
             },
         );
+
+        // screen_stargazers — bulk-screen a repo's stargazers over cheap
+        // REST into a per-server store, return a compact cohort+relevance
+        // overview, and let the agent drill via `element_id` (cache hits;
+        // only `.../readme` costs a request). The store is the stargazer
+        // analogue of `github_issues`' ElementCache. Operators can drop it
+        // (keeping the other GitHub tools) via `builtins.screen_stargazers:
+        // false`; default on.
+        if self.options.builtins.screen_stargazers {
+        let screen_store: Arc<Mutex<crate::screen::ScreenStore>> =
+            Arc::new(Mutex::new(crate::screen::ScreenStore::new()));
+        self.register_typed_tool::<ScreenStargazersArgs, _>(
+            "screen_stargazers",
+            "Screen the people around a GitHub project to find relevant developers, \
+             notable/legendary devs, architectural peers, and actual users — cheaply. \
+             Seed on a repo (`repo=\"owner/repo\"` → screens its stargazers) OR an \
+             explicit user list (`users=\"alice,bob\"` → screens them directly). With \
+             just a repo it auto-derives relevance keywords + tech stack from the repo \
+             itself, bulk-fetches each person's public repo portfolio over plain REST \
+             (~1 request per person, no GraphQL, no READMEs), classifies them, and \
+             enriches a bounded shortlist with follower counts, dependency-adoption, \
+             stack co-location, and contributions. Every person gets a normalized \
+             0–100 score vector on four axes — relatedness, popularity, effort, \
+             recency. RANK/FILTER: pass a `preset` (\"outreach\"=relevant+active by \
+             reach, \"peers\"=your stack by effort, \"legends\"=biggest reach any \
+             domain, \"intel\"=on-domain by popularity, \"adopters\"=actual users), or \
+             `rank_by`=relatedness|popularity|effort|recency with filters \
+             (`min_keywords`, `active_since`, `adopters_only`, `stack_only`) and \
+             `top`=N (rank-then-take-N, default 10) for a focused filter→rank→take \
+             view; with none, the full multi-lens browse: \
+             `✅ ADOPTERS` (stargazers whose repos actually declare your package as a \
+             dependency — real users, not just watchers), `★ MOST RELEVANT` \
+             (relatedness — repos matching your topic keywords, with follower counts \
+             and external contributions), `🏆 NOTABLE` (popularity/reach lens — your \
+             highest-traction stargazers, flagged `LEGEND` for big audiences/projects), \
+             `✦ QUALITY` (best-kept maintained projects), `⚙ STACK MATCH` (architectural \
+             peers who build in your stack — co-location-confirmed where possible), and \
+             a cohort inventory. Override the auto-config with `keywords=\"graph,rag,agent\"` \
+             (single words — \"knowledge,graph\" not \"knowledge-graph\") and \
+             `stack=\"Rust,Python\"`; re-calling with new values re-ranks the cached \
+             fetch for free. Treat description-based leads as candidates to verify by \
+             drilling. DRILL via `element_id`: `\"cohort:<key>\"` (established / single / \
+             prolific / casual / dormant / consumers — the overview lists each key), \
+             `\"user:<login>\"` (portfolio), `\"user:<login>/repo:<name>\"` (repo profile), \
+             or `\"user:<login>/repo:<name>/readme\"` (README gist — the only drill that \
+             costs a request). `max_stargazers` samples the most-recent N (the overview \
+             reports if results are partial); `refresh=true` re-fetches.",
+            move |args: ScreenStargazersArgs| {
+                use crate::screen::{self, Filters, RankBy, Seed, Selection};
+                let split_csv = |s: Option<String>| -> Vec<String> {
+                    s.map(|v| {
+                        v.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+                };
+                // Seed: explicit user list wins; else the repo (or active repo).
+                let seed = if let Some(u) = &args.users {
+                    Seed::Users(split_csv(Some(u.clone())))
+                } else {
+                    let repo = match resolve_repo_from(repo_for_screen.as_ref(), args.repo.clone()) {
+                        Ok(r) => r,
+                        Err(msg) => return msg,
+                    };
+                    if let Some(err) = crate::git_refs::validate_repo(&repo) {
+                        return err;
+                    }
+                    Seed::Repo(repo)
+                };
+                let cfg = screen::ScreenConfig {
+                    max_stargazers: args.max_stargazers,
+                    max_repos_per_user: 100,
+                    relevance_keywords: split_csv(args.keywords)
+                        .into_iter()
+                        .map(|k| k.to_lowercase())
+                        .collect(),
+                    stack_languages: split_csv(args.stack),
+                };
+                // Selection: preset, else explicit rank/filters, else none.
+                let top = args.top.unwrap_or(10);
+                let filters = Filters {
+                    min_keywords: args.min_keywords,
+                    active_since: args.active_since.clone(),
+                    adopters_only: args.adopters_only,
+                    stack_only: args.stack_only,
+                    ..Default::default()
+                };
+                let filters_active = filters.min_keywords.is_some()
+                    || filters.active_since.is_some()
+                    || filters.adopters_only
+                    || filters.stack_only;
+                let selection: Option<Selection> = if let Some(name) = &args.preset {
+                    screen::preset(name, top)
+                } else if args.rank_by.is_some() || filters_active {
+                    Some(Selection {
+                        filters,
+                        rank: args.rank_by.as_deref().and_then(RankBy::parse).unwrap_or(RankBy::Relatedness),
+                        label: "SELECTION".into(),
+                        take: top,
+                    })
+                } else {
+                    None
+                };
+                screen::screen_dispatch(
+                    &screen_store,
+                    &seed,
+                    &cfg,
+                    selection.as_ref(),
+                    args.element_id.as_deref(),
+                    args.refresh,
+                )
+            },
+        );
+        }
     }
 
     /// Read the manifest-declared `builtins:` config. Downstream
@@ -1044,6 +1217,7 @@ mod tests {
             builtins: BuiltinsConfig {
                 save_graph: true,
                 temp_cleanup: TempCleanup::OnOverview,
+                ..Default::default()
             },
             ..ServerOptions::default()
         };
