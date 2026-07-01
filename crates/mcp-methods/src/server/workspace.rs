@@ -24,7 +24,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,6 +103,14 @@ struct WorkspaceInner {
 struct WorkspaceState {
     active_repo_name: Option<String>,
     active_repo_path: Option<PathBuf>,
+    /// Repos whose post-activate hook has fired **in this process**.
+    /// Deliberately NOT persisted: `last_built_sha` records that the
+    /// git repo is at the built SHA (a cross-process fact), but the
+    /// hook's *product* — the consumer's in-memory graph — lives only
+    /// for the process lifetime. On a fresh process this set is empty,
+    /// so the first activate re-fires the hook to rehydrate even when
+    /// the persisted SHA already matches HEAD.
+    hydrated_this_process: HashSet<String>,
 }
 
 impl Workspace {
@@ -475,15 +483,24 @@ impl Workspace {
         let prev_built_sha = self.last_built_sha(name);
         let (action, repo_path, head_sha) = self.clone_or_update(name)?;
         self.bump_access(name, &action);
-        {
+        let hook_fired_here = {
             let mut state = self.inner.state.write().unwrap();
             state.active_repo_name = Some(name.to_string());
             state.active_repo_path = Some(repo_path.clone());
-        }
+            state.hydrated_this_process.contains(name)
+        };
 
+        // The skip gate must be satisfied on BOTH axes: the git repo is
+        // at its last-built SHA (persisted, cross-process) AND the hook
+        // has already run in *this* process (in-memory). Without the
+        // second axis a fresh process would inherit `last_built_sha` from
+        // disk, skip the hook, and leave the consumer's in-memory state
+        // (e.g. the code graph) empty — activate would report success
+        // with nothing loaded.
         let already_built = !force_rebuild
             && action == "current"
-            && prev_built_sha.as_deref() == Some(head_sha.as_str());
+            && prev_built_sha.as_deref() == Some(head_sha.as_str())
+            && hook_fired_here;
         let mut hook_skipped = false;
         let hook_ok = if already_built {
             hook_skipped = true;
@@ -503,6 +520,18 @@ impl Workspace {
         };
         if hook_ok {
             self.record_built_sha(name, &head_sha);
+        }
+        // Record in-memory hydration only when the hook actually ran this
+        // process (not on the cheap-skip path). A no-op "no hook
+        // configured" activation also counts as hydrated: there is no
+        // per-process product to lose, so future skips are safe.
+        if hook_ok && !hook_skipped {
+            self.inner
+                .state
+                .write()
+                .unwrap()
+                .hydrated_this_process
+                .insert(name.to_string());
         }
         let verb = match action.as_str() {
             "cloned" => "Cloned",
@@ -1226,6 +1255,64 @@ mod tests {
             seen_path.lock().unwrap().clone().unwrap(),
             child.canonicalize().unwrap(),
             "post_activate hook saw the wrong root after set_root_dir"
+        );
+    }
+
+    #[test]
+    fn hook_fires_once_per_process_even_when_sha_matches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Local mode fingerprints the dir instead of a git SHA, so we can
+        // drive the real `activate` path without git. A stable file keeps
+        // the fingerprint constant across both simulated processes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"stable").unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make_hook = || -> PostActivateHook {
+            let c = calls.clone();
+            Arc::new(move |_p, _n| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+
+        // --- Process 1 ---------------------------------------------------
+        let ws = Workspace::open_local(dir.path().to_path_buf(), Some(make_hook())).unwrap();
+        // First activate (fingerprint not yet recorded) → hook fires.
+        let _ = ws.repo_management(None, false, true, false);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first activate must hydrate"
+        );
+        // Second activate, same process, unchanged fingerprint → cheap-skip.
+        let out = ws.repo_management(None, false, true, false);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "repeat activate in same process must skip the hook"
+        );
+        assert!(
+            out.contains("build skipped"),
+            "expected skip suffix, got: {out}"
+        );
+        drop(ws);
+
+        // --- Process 2 (restart) ----------------------------------------
+        // Same dir → inventory.json + last_built_sha persist, but the
+        // in-memory hydration set does not. The first activate here must
+        // re-fire the hook to rehydrate the consumer's in-memory state.
+        let ws2 = Workspace::open_local(dir.path().to_path_buf(), Some(make_hook())).unwrap();
+        assert!(
+            ws2.last_built_sha(&ws2.active_repo_name().unwrap())
+                .is_some(),
+            "sanity: last_built_sha should survive the restart"
+        );
+        let _ = ws2.repo_management(None, false, true, false);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "fresh process must re-fire the hook even when the SHA matches"
         );
     }
 }

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.45 — 2026-07-01
+
+### Fixed — post-activate hook now re-fires on the first activate of each process
+
+`Workspace::activate` gated the post-activate hook on `last_built_sha`
+alone: if the git repo (github mode) or the directory fingerprint (local
+mode) already matched the recorded SHA, the hook was skipped as
+"already built". But `last_built_sha` is persisted to `inventory.json`
+and survives process restarts, whereas the hook's *product* — the
+consumer's in-memory state, e.g. kglite-mcp-server's code graph — does
+not. On a fresh process the persisted SHA still matched HEAD, so the
+first `repo_management(...)` / `set_root_dir(...)` reported success
+(`[build skipped: HEAD matches last-built SHA]`) while leaving no active
+graph; `graph_overview` / `cypher_query` then returned "No active
+graph" until a `force_rebuild=True` forced the hook. Both modes were
+affected (github mode's SHA and local mode's directory fingerprint hit
+the identical gate).
+
+The gate now requires two independent facts: the repo is at its
+last-built SHA (persisted, cross-process) **and** the hook has already
+fired in the current process (tracked in a new, deliberately
+non-persisted `hydrated_this_process` set on the workspace state). The
+first activate per process therefore always hydrates; repeated
+activations within the same process still cheap-skip, and
+`inventory.json` / `last_built_sha` semantics are unchanged. As a
+side-benefit the `build skipped` message is now honest — it only appears
+when the in-memory product genuinely exists. Reported by kglite against
+0.3.44 (kglite-mcp-server 0.12.4).
+
 ## 0.3.44 — 2026-06-24
 
 ### Added — `screen_stargazers`: cheap GitHub people-screening
