@@ -51,6 +51,44 @@ use crate::server::source::{
 /// active workspace repo; single-graph mode can pin a fixed value.
 pub type RepoProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Read-only runtime context handed to a [`ResultPostprocessHook`].
+/// Exposes the active source roots and repo so a consumer's hook can
+/// tailor its footer to the current binding without capturing the
+/// workspace itself. Decoupled by design — no framework types leak.
+pub struct ResultCtx {
+    /// Active source roots at call time (empty when none bound).
+    pub source_roots: Vec<String>,
+    /// Active workspace repo (`org/repo` or a synthetic local name),
+    /// or `None` when nothing is bound.
+    pub active_repo: Option<String>,
+}
+
+/// Hook invoked after every builtin tool produces its text result.
+///
+/// Receives the tool name, the call arguments (as JSON), the result
+/// body, and a read-only [`ResultCtx`]. Returns `Some(footer)` to
+/// append a steering line (the framework inserts a blank separator
+/// line), or `None` to leave the result byte-for-byte unchanged.
+///
+/// This is the framework's *runtime* consumer→agent text channel — the
+/// counterpart to the load-once tool descriptions. Consumers supply the
+/// domain-aware content: e.g. a graph-backed server can detect a
+/// definition-shaped `grep` pattern (or a zero-match result) and steer
+/// the agent to `cypher_query`. The framework owns the hook; the graph
+/// knowledge stays downstream.
+pub type ResultPostprocessHook =
+    Arc<dyn Fn(&str, &serde_json::Value, &str, &ResultCtx) -> Option<String> + Send + Sync>;
+
+/// Append a hook-produced footer to a result body, separated by a
+/// blank line. Empty/`None` footers leave the body untouched. Shared
+/// by both dispatch paths so the footer contract lives in one place.
+fn append_footer(body: String, footer: Option<String>) -> String {
+    match footer {
+        Some(f) if !f.is_empty() => format!("{body}\n\n{f}"),
+        _ => body,
+    }
+}
+
 /// Per-server runtime state shared by every tool dispatch.
 #[derive(Clone, Default)]
 pub struct ServerOptions {
@@ -76,6 +114,10 @@ pub struct ServerOptions {
     /// consumers can also read it for their own per-extension config.
     /// Empty map when no `extensions:` block is present.
     pub extensions: serde_json::Map<String, serde_json::Value>,
+    /// Optional consumer hook run after every builtin tool result to
+    /// append a runtime steering footer. `None` (default) leaves every
+    /// result unchanged. See [`ResultPostprocessHook`].
+    pub result_postprocess: Option<ResultPostprocessHook>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -107,6 +149,7 @@ impl ServerOptions {
             workspace: None,
             builtins: manifest.map(|m| m.builtins.clone()).unwrap_or_default(),
             extensions: manifest.map(|m| m.extensions.clone()).unwrap_or_default(),
+            result_postprocess: None,
         }
     }
 
@@ -146,6 +189,15 @@ impl ServerOptions {
                 .unwrap_or_default()
         }));
         self.default_repo = Some(Arc::new(move || ws_for_repo.default_github_repo()));
+        self
+    }
+
+    /// Register a [`ResultPostprocessHook`] run after every builtin
+    /// tool result. Consumers use this to append runtime steering (e.g.
+    /// a graph-backed server nudging the agent from `grep` toward
+    /// `cypher_query` when a pattern is definition-shaped).
+    pub fn with_result_postprocess(mut self, hook: ResultPostprocessHook) -> Self {
+        self.result_postprocess = Some(hook);
         self
     }
 }
@@ -753,6 +805,14 @@ impl McpServer {
             .unwrap_or_default();
         let attr = rmcp::model::Tool::new(name, description, Arc::new(schema_obj));
         let handler = std::sync::Arc::new(handler);
+        // Capture the result-postprocess plumbing: the dyn closure has
+        // no `&self`, so the hook and the state needed to build a
+        // `ResultCtx` are cloned in here (Arc-cheap). `tool_name` is a
+        // `&'static str`, Copy into the closure.
+        let tool_name = name;
+        let postprocess = self.options.result_postprocess.clone();
+        let source_roots = self.options.source_roots.clone();
+        let workspace = self.options.workspace.clone();
 
         self.tool_router
             .add_route(rmcp::handler::server::router::tool::ToolRoute::new_dyn(
@@ -761,7 +821,16 @@ impl McpServer {
                     -> DynFut<'_, Result<rmcp::model::CallToolResult, rmcp::ErrorData>> {
                     let handler = handler.clone();
                     let arguments = ctx.arguments.clone();
+                    let postprocess = postprocess.clone();
+                    let source_roots = source_roots.clone();
+                    let workspace = workspace.clone();
                     Box::pin(async move {
+                        // Preserve the raw args as JSON for the hook,
+                        // before consuming them into the typed `T`.
+                        let args_json = match &arguments {
+                            Some(map) => serde_json::Value::Object(map.clone()),
+                            None => serde_json::Value::Null,
+                        };
                         let args: T = match arguments {
                             Some(map) => {
                                 match serde_json::from_value(serde_json::Value::Object(map)) {
@@ -778,6 +847,22 @@ impl McpServer {
                             None => T::default(),
                         };
                         let body = handler(args);
+                        let body = match &postprocess {
+                            Some(hook) => {
+                                let ctx = ResultCtx {
+                                    source_roots: source_roots
+                                        .as_ref()
+                                        .map(|p| p())
+                                        .unwrap_or_default(),
+                                    active_repo: workspace
+                                        .as_ref()
+                                        .and_then(|w| w.active_repo_name()),
+                                };
+                                let footer = hook(tool_name, &args_json, &body, &ctx);
+                                append_footer(body, footer)
+                            }
+                            None => body,
+                        };
                         Ok(rmcp::model::CallToolResult::success(vec![
                             rmcp::model::Content::text(body),
                         ]))
@@ -791,6 +876,28 @@ impl McpServer {
             Some(provider) => provider(),
             None => Vec::new(),
         }
+    }
+
+    /// Run the consumer's result-postprocess hook (if any) against a
+    /// builtin tool's text `body`, appending any returned footer. The
+    /// single application point for the static `#[tool]` methods; the
+    /// dynamic `register_typed_tool` path applies the same contract at
+    /// its own choke point via captured clones (the closure has no
+    /// `&self`).
+    fn finish(&self, tool: &str, args: &serde_json::Value, body: String) -> String {
+        let Some(hook) = &self.options.result_postprocess else {
+            return body;
+        };
+        let ctx = ResultCtx {
+            source_roots: self.current_source_roots(),
+            active_repo: self
+                .options
+                .workspace
+                .as_ref()
+                .and_then(|w| w.active_repo_name()),
+        };
+        let footer = hook(tool, args, &body, &ctx);
+        append_footer(body, footer)
     }
 
     /// Resolve the active repo: per-call override → configured default →
@@ -811,7 +918,9 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<PingArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let body = args.message.unwrap_or_else(|| "pong".to_string());
+        let body = self.finish("ping", &args_json, body);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
@@ -830,6 +939,7 @@ impl McpServer {
                  or activate one (e.g. via repo_management in workspace mode).",
             )]));
         }
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let opts = ReadOpts {
             start_line: args.start_line,
             end_line: args.end_line,
@@ -839,6 +949,7 @@ impl McpServer {
             max_chars: args.max_chars,
         };
         let body = source::read_source(&args.file_path, &roots, &opts);
+        let body = self.finish("read_source", &args_json, body);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
@@ -860,6 +971,7 @@ impl McpServer {
                  or activate one (e.g. via repo_management in workspace mode).",
             )]));
         }
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let opts = GrepOpts {
             glob: args.glob,
             context: args.context,
@@ -867,6 +979,7 @@ impl McpServer {
             case_insensitive: args.case_insensitive,
         };
         let body = source::grep(&roots, &args.pattern, &opts);
+        let body = self.finish("grep", &args_json, body);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
@@ -898,12 +1011,14 @@ impl McpServer {
                 ))]));
             }
         };
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let opts = ListOpts {
             depth: args.depth,
             glob: args.glob,
             dirs_only: args.dirs_only,
         };
         let body = source::list_source(&target, &primary, &opts);
+        let body = self.finish("list_source", &args_json, body);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 
@@ -922,6 +1037,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<RepoManagementArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let body = match &self.options.workspace {
             Some(ws) => ws.repo_management(
                 args.name.as_deref(),
@@ -931,6 +1047,7 @@ impl McpServer {
             ),
             None => "repo_management requires --workspace mode.".to_string(),
         };
+        let body = self.finish("repo_management", &args_json, body);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
@@ -1280,6 +1397,64 @@ mod tests {
         assert!(
             names.contains(&"repo_management"),
             "repo_management should be registered with a workspace; tools were {names:?}"
+        );
+    }
+
+    #[test]
+    fn result_postprocess_appends_footer_and_sees_ctx() {
+        use std::sync::Mutex;
+        // Capture what the hook receives so we can assert the ctx.
+        type Seen = Option<(String, serde_json::Value, String, Vec<String>)>;
+        let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(None));
+        let seen_c = seen.clone();
+        let hook: ResultPostprocessHook = Arc::new(move |tool, args, body, ctx| {
+            *seen_c.lock().unwrap() = Some((
+                tool.to_string(),
+                args.clone(),
+                body.to_string(),
+                ctx.source_roots.clone(),
+            ));
+            // Only steer on grep — proves per-tool selectivity.
+            if tool == "grep" {
+                Some("↳ prefer cypher_query".to_string())
+            } else {
+                None
+            }
+        });
+        let opts = ServerOptions::default()
+            .with_static_source_roots(vec!["/src".to_string()])
+            .with_result_postprocess(hook);
+        let server = McpServer::new(opts);
+
+        let args = serde_json::json!({ "pattern": "^fn " });
+        let out = server.finish("grep", &args, "match line".to_string());
+        assert_eq!(out, "match line\n\n↳ prefer cypher_query");
+
+        let rec = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(rec.0, "grep");
+        assert_eq!(rec.1, args);
+        assert_eq!(rec.2, "match line");
+        assert_eq!(rec.3, vec!["/src".to_string()]);
+
+        // A tool the hook ignores → body byte-for-byte unchanged.
+        let out2 = server.finish("read_source", &args, "file body".to_string());
+        assert_eq!(out2, "file body");
+    }
+
+    #[test]
+    fn no_result_postprocess_leaves_body_unchanged() {
+        let server = McpServer::new(ServerOptions::default());
+        let out = server.finish("grep", &serde_json::Value::Null, "x".to_string());
+        assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn append_footer_ignores_empty_footers() {
+        assert_eq!(append_footer("a".to_string(), None), "a");
+        assert_eq!(append_footer("a".to_string(), Some(String::new())), "a");
+        assert_eq!(
+            append_footer("a".to_string(), Some("b".to_string())),
+            "a\n\nb"
         );
     }
 

@@ -63,6 +63,19 @@ fn validate_repo_name(name: &str) -> Result<()> {
 /// don't abort the activation — the repo is still registered as active.
 pub type PostActivateHook = Arc<dyn Fn(&Path, &str) -> Result<()> + Send + Sync>;
 
+/// Optional hook that returns a short agent-facing summary appended to
+/// the activation result message — the "graph ready" mini-map / opening
+/// steer (e.g. `"Graph ready: 9,999 Functions · 656 Classes · 31k CALLS.
+/// Open with graph_overview() → cypher_query; grep = literal text only."`).
+///
+/// Kept separate from [`PostActivateHook`] so adding it is a non-breaking
+/// addition — existing consumers that register only the build hook are
+/// unaffected. Receives the repo path + name; returns `Some(text)` to
+/// append (blank-line separated), or `None` for the terse default
+/// message. Called after a successful activation (skipped when the build
+/// hook failed).
+pub type ActivationSummaryHook = Arc<dyn Fn(&Path, &str) -> Option<String> + Send + Sync>;
+
 /// Per-repo inventory entry persisted in `inventory.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InventoryEntry {
@@ -97,6 +110,9 @@ struct WorkspaceInner {
     stale_after_days: u32,
     state: RwLock<WorkspaceState>,
     post_activate: Option<PostActivateHook>,
+    /// Optional summary hook (see [`ActivationSummaryHook`]). Set via
+    /// [`Workspace::with_activation_summary`], `None` by default.
+    activation_summary: Option<ActivationSummaryHook>,
 }
 
 #[derive(Debug, Default)]
@@ -137,6 +153,7 @@ impl Workspace {
                 stale_after_days,
                 state: RwLock::new(WorkspaceState::default()),
                 post_activate,
+                activation_summary: None,
             }),
         };
         ws.reconcile_inventory()?;
@@ -179,8 +196,24 @@ impl Workspace {
                 stale_after_days: u32::MAX, // sweeping is github-only
                 state: RwLock::new(state),
                 post_activate,
+                activation_summary: None,
             }),
         })
+    }
+
+    /// Attach an [`ActivationSummaryHook`]. Call immediately after
+    /// `open`/`open_local` (before the workspace is cloned into
+    /// `ServerOptions`): it mutates the still-unique inner `Arc`. Calling
+    /// it after the workspace has been cloned is a no-op with a warning —
+    /// the summary simply won't be attached.
+    pub fn with_activation_summary(mut self, hook: ActivationSummaryHook) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.activation_summary = Some(hook),
+            None => tracing::warn!(
+                "with_activation_summary called after the workspace was cloned; summary not attached"
+            ),
+        }
+        self
     }
 
     pub fn kind(&self) -> WorkspaceKind {
@@ -544,10 +577,24 @@ impl Workspace {
         } else {
             ""
         };
-        Ok(format!(
-            "{verb} '{name}' at {}.{suffix}",
-            repo_path.display()
-        ))
+        let base = format!("{verb} '{name}' at {}.{suffix}", repo_path.display());
+        // Append the consumer's opening-steer mini-map, if configured.
+        // Fired on any successful activation (fresh build or cheap-skip —
+        // in both cases the in-memory product is live this process); the
+        // hook recomputes the summary from that live state. Skipped only
+        // when the build hook itself failed.
+        let summary = if hook_ok {
+            self.inner
+                .activation_summary
+                .as_ref()
+                .and_then(|h| h(&repo_path, name))
+        } else {
+            None
+        };
+        Ok(match summary {
+            Some(s) if !s.is_empty() => format!("{base}\n\n{s}"),
+            _ => base,
+        })
     }
 
     fn record_built_sha(&self, name: &str, sha: &str) {
@@ -1255,6 +1302,35 @@ mod tests {
             seen_path.lock().unwrap().clone().unwrap(),
             child.canonicalize().unwrap(),
             "post_activate hook saw the wrong root after set_root_dir"
+        );
+    }
+
+    #[test]
+    fn activation_summary_appended_to_activate_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let summary: ActivationSummaryHook =
+            Arc::new(|_p, _n| Some("Graph ready: 3 Functions.".to_string()));
+        let ws = Workspace::open_local(dir.path().to_path_buf(), None)
+            .unwrap()
+            .with_activation_summary(summary);
+        let out = ws.repo_management(None, false, true, false);
+        assert!(
+            out.contains("Graph ready: 3 Functions."),
+            "activation message should include the summary; got: {out}"
+        );
+    }
+
+    #[test]
+    fn activation_summary_absent_when_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
+        let out = ws.repo_management(None, false, true, false);
+        assert!(!out.contains("Graph ready"));
+        assert!(
+            out.contains(" at "),
+            "expected the terse default message; got: {out}"
         );
     }
 

@@ -2,6 +2,44 @@
 
 ## 0.3.46 — 2026-07-02
 
+### Added — result-postprocess hook (runtime tool-result steering)
+
+The framework had exactly one consumer→agent text channel — tool
+descriptions, read once at select-time. Nothing corrected course at the
+moment of misuse. `ServerOptions::with_result_postprocess(hook)` adds a
+*runtime* channel: a `ResultPostprocessHook` (`Fn(&str tool, &Value args,
+&str body, &ResultCtx) -> Option<String>`) runs after every builtin tool
+produces its text result and may append a steering footer (blank-line
+separated); returning `None` leaves the result byte-for-byte unchanged.
+
+Both dispatch paths funnel through one footer contract: the static
+`#[tool]` methods (`grep` / `read_source` / `list_source` /
+`repo_management` / `ping`) via a shared `finish(...)` helper, and the
+dynamic `register_typed_tool` tools at their choke point. The hook sees
+the raw args (to detect, e.g., a definition-shaped `grep` pattern) and
+the result body (to detect a zero-match dead-end); `ResultCtx` exposes
+the active source roots + repo. The framework owns the mechanism; the
+graph-aware content stays downstream — a graph-backed consumer supplies
+the "prefer `cypher_query`" line from its own graph state. `None`
+(default) is a zero-cost no-op, so existing deployments are unaffected.
+Requested by kglite (petekSuite deployment, 2026-07-02).
+
+### Added — activation-summary hook (opening-steer mini-map)
+
+`Workspace::with_activation_summary(hook)` lets a consumer append a short
+mini-map to the activation result message — the one line every agent
+reads before choosing its first tool. `ActivationSummaryHook`
+(`Fn(&Path, &str) -> Option<String>`) is called after a successful
+activation (fresh build or cheap-skip — the in-memory product is live
+either way) and its `Some(text)` is appended to the terse
+`"Updated 'X' at …"` message, turning a dead slot into
+`"Graph ready: 9,999 Functions · 656 Classes · 31k CALLS. Open with
+graph_overview() → cypher_query; grep = literal text only."`. Kept
+separate from `PostActivateHook` (whose `Result<()>` signature is
+unchanged) so the addition is non-breaking; attach it immediately after
+`open`/`open_local`, before the workspace is cloned. Extends the richer
+activation payload flagged in the 2026-07-01 hydration thread.
+
 ### Changed — `grep` bundled skill: SKIP-first, structural-lookups-out-of-TRIGGER
 
 The bundled `grep` skill's description led with the structural use case
