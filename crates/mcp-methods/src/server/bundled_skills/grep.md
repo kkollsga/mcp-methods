@@ -1,6 +1,6 @@
 ---
 name: grep
-description: "Search code using regex patterns across the configured source roots, with file-glob scoping and result caps. TRIGGER when the user wants to find a symbol or string across files (function/class/variable name, error message, log line), locate call sites textually, hunt for patterns by file type, or sweep a codebase for occurrences of a name. ALSO TRIGGER when grep would be the natural shell tool — surfacing it here keeps the agent inside the framework's source sandbox. SKIP when the codebase has a knowledge graph and the question is structural (\"where is X defined?\", \"what calls Y?\") — graph queries are exact, grep is fuzzy. SKIP for single-file reads (use read_source) and directory layout questions (use list_source)."
+description: "Regex text search across the configured source roots, with file-glob scoping and result caps. SKIP FIRST for structural questions when a code graph / structural index is active — \"where is X defined?\", \"what calls Y?\", finding a function/class/variable by name, or locating call sites are graph queries (exact); grep is fuzzy text and will validate a wrong turn. Also SKIP single-file reads (use read_source) and directory-layout questions (use list_source). TRIGGER for literal text that no graph indexes: error-message strings, log lines, comments, config keys, string literals, TODO/FIXME markers, license headers — or, only when NO structural index is available for this source root, symbol/definition/call-site sweeps as a fallback."
 applies_to:
   mcp_methods: ">=0.3.35"
 references_tools:
@@ -13,6 +13,8 @@ auto_inject_hint: true
 ---
 
 # `grep` methodology
+
+> **Doctrine first.** If this deployment has a code graph / structural index, structural questions ("where is X defined?", "what calls Y?", find a symbol by name) go to the graph tools (`graph_overview` → `cypher_query`), not here — the graph is exact, grep is fuzzy and will happily confirm a wrong guess. Reach for `grep` for **literal text a graph can't index** (error strings, log lines, comments, config keys), or for symbol sweeps only when no structural index exists.
 
 ## Overview
 

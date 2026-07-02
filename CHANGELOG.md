@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.46 — 2026-07-02
+
+### Changed — `grep` bundled skill: SKIP-first, structural-lookups-out-of-TRIGGER
+
+The bundled `grep` skill's description led with the structural use case
+("find a symbol / function / class by name, locate call sites") and only
+mentioned the graph as a trailing SKIP. When two tools claim the same use
+case, an agent's prior intent wins — so `grep`'s own description was
+*validating* the exact anti-pattern the `code_graph_analysis` skill warns
+against (a downstream code-review agent opened a graph-backed repo with
+`grep` and never called `graph_overview`/`cypher_query`).
+
+The description now puts SKIP **first** — structural questions go to the
+graph — and narrows TRIGGER to literal text a graph can't index (error
+strings, log lines, comments, config keys, string literals). Symbol /
+definition / call-site sweeps remain a TRIGGER only as an explicit
+fallback *when no structural index is available for the source root* —
+grep is still the right tool in a plain source workspace with no graph.
+A doctrine-first banner leads the skill body to match. Because the
+bundled skill is domain-neutral by constraint (it can't know at authoring
+time whether a graph is live), the static text can only set the default;
+the *runtime* "graph is active → never grep for structure" nudge is
+delivered by the new result-postprocess hook (below). Reported by kglite
+(petekSuite deployment, 2026-07-02).
+
 ## 0.3.45 — 2026-07-01
 
 ### Fixed — post-activate hook now re-fires on the first activate of each process
