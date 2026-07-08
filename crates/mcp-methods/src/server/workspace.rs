@@ -24,7 +24,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -119,14 +119,23 @@ struct WorkspaceInner {
 struct WorkspaceState {
     active_repo_name: Option<String>,
     active_repo_path: Option<PathBuf>,
-    /// Repos whose post-activate hook has fired **in this process**.
-    /// Deliberately NOT persisted: `last_built_sha` records that the
-    /// git repo is at the built SHA (a cross-process fact), but the
-    /// hook's *product* — the consumer's in-memory graph — lives only
-    /// for the process lifetime. On a fresh process this set is empty,
-    /// so the first activate re-fires the hook to rehydrate even when
-    /// the persisted SHA already matches HEAD.
-    hydrated_this_process: HashSet<String>,
+    /// The name whose post-activate hook **most recently ran to
+    /// completion in this process** — i.e. the root whose product is
+    /// currently live. Deliberately NOT persisted: `last_built_sha`
+    /// records that the git repo is at the built SHA (a cross-process
+    /// fact), but the hook's *product* — the consumer's in-memory graph
+    /// — lives only for the process lifetime. On a fresh process this is
+    /// `None`, so the first activate re-fires the hook to rehydrate even
+    /// when the persisted SHA already matches HEAD.
+    ///
+    /// Crucially this is a **single** name, not a set of every name ever
+    /// hydrated. Many consumers keep a *single* active-graph slot that
+    /// each activate overwrites, so "hook fired for X at some point" does
+    /// NOT imply "X's product is still live". Only re-binding the
+    /// currently-active root is safe to skip; an A→B→A swap must rebuild
+    /// A because B overwrote the slot. Tracking one name makes the skip
+    /// gate correct for single-slot and per-name consumers alike.
+    active_built_name: Option<String>,
 }
 
 impl Workspace {
@@ -516,24 +525,28 @@ impl Workspace {
         let prev_built_sha = self.last_built_sha(name);
         let (action, repo_path, head_sha) = self.clone_or_update(name)?;
         self.bump_access(name, &action);
-        let hook_fired_here = {
+        let is_active_built = {
             let mut state = self.inner.state.write().unwrap();
             state.active_repo_name = Some(name.to_string());
             state.active_repo_path = Some(repo_path.clone());
-            state.hydrated_this_process.contains(name)
+            state.active_built_name.as_deref() == Some(name)
         };
 
         // The skip gate must be satisfied on BOTH axes: the git repo is
-        // at its last-built SHA (persisted, cross-process) AND the hook
-        // has already run in *this* process (in-memory). Without the
-        // second axis a fresh process would inherit `last_built_sha` from
-        // disk, skip the hook, and leave the consumer's in-memory state
-        // (e.g. the code graph) empty — activate would report success
-        // with nothing loaded.
+        // at its last-built SHA (persisted, cross-process) AND `name` is
+        // the *currently active* built root in this process (in-memory).
+        // Without the second axis a fresh process would inherit
+        // `last_built_sha` from disk, skip the hook, and leave the
+        // consumer's in-memory state (e.g. the code graph) empty —
+        // activate would report success with nothing loaded. The axis
+        // checks the *active* built name, not any name ever built, so an
+        // A→B→A swap correctly rebuilds A: after activate(B) the live
+        // slot holds B, so re-binding A must not skip (see the
+        // `active_built_name` field doc).
         let already_built = !force_rebuild
             && action == "current"
             && prev_built_sha.as_deref() == Some(head_sha.as_str())
-            && hook_fired_here;
+            && is_active_built;
         let mut hook_skipped = false;
         let hook_ok = if already_built {
             hook_skipped = true;
@@ -554,17 +567,15 @@ impl Workspace {
         if hook_ok {
             self.record_built_sha(name, &head_sha);
         }
-        // Record in-memory hydration only when the hook actually ran this
-        // process (not on the cheap-skip path). A no-op "no hook
-        // configured" activation also counts as hydrated: there is no
-        // per-process product to lose, so future skips are safe.
+        // Mark this name the currently-active built root only when the
+        // hook actually ran this process (not on the cheap-skip path,
+        // where it is already the active built name). A no-op "no hook
+        // configured" activation also counts: there is no per-process
+        // product to lose, so a future same-root skip is safe. This
+        // *overwrites* any prior name — modelling that each activate
+        // replaces the live product — so the next swap back rebuilds.
         if hook_ok && !hook_skipped {
-            self.inner
-                .state
-                .write()
-                .unwrap()
-                .hydrated_this_process
-                .insert(name.to_string());
+            self.inner.state.write().unwrap().active_built_name = Some(name.to_string());
         }
         let verb = match action.as_str() {
             "cloned" => "Cloned",
@@ -1389,6 +1400,86 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "fresh process must re-fire the hook even when the SHA matches"
+        );
+    }
+
+    #[test]
+    fn a_b_a_swap_rebuilds_intervening_root() {
+        // Regression for the single-slot-consumer stale-graph bug: an
+        // A→B→A swap must rebuild A on the second bind, because activating
+        // B overwrote the consumer's single live slot. Before the fix the
+        // skip gate keyed off "A was hydrated at some point this process"
+        // and wrongly skipped, leaving B's product live under A's name.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("projA");
+        let b = root.path().join("projB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // Stable, distinct contents so each root's fingerprint holds
+        // constant across re-binds (so `action == "current"` on the
+        // second bind of A — the exact condition the gate keys on).
+        std::fs::write(a.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(b.join("b.txt"), b"beta").unwrap();
+
+        // The hook records which root it last built into the single slot,
+        // mirroring a single-active-graph consumer.
+        let built: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::new(Default::default());
+        let built_h = built.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_h = calls.clone();
+        let hook: PostActivateHook = Arc::new(move |p, _n| {
+            *built_h.lock().unwrap() = Some(p.to_path_buf());
+            calls_h.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let ws = Workspace::open_local(a.clone(), Some(hook)).unwrap();
+        // open_local binds A but doesn't fire the hook; first set_root_dir(A)
+        // hydrates it.
+        let _ = ws.set_root_dir(&a);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first bind of A hydrates");
+        assert_eq!(
+            built.lock().unwrap().clone(),
+            Some(a.canonicalize().unwrap())
+        );
+
+        let _ = ws.set_root_dir(&b);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "bind of B rebuilds");
+        assert_eq!(
+            built.lock().unwrap().clone(),
+            Some(b.canonicalize().unwrap())
+        );
+
+        // The bug: re-binding A must rebuild (slot currently holds B), not
+        // cheap-skip. The single slot must end up holding A again.
+        let out = ws.set_root_dir(&a);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "A→B→A must rebuild A; the intervening B overwrote the live slot"
+        );
+        assert!(
+            !out.contains("build skipped"),
+            "re-bind of a non-active root must not skip; got: {out}"
+        );
+        assert_eq!(
+            built.lock().unwrap().clone(),
+            Some(a.canonicalize().unwrap()),
+            "after A→B→A the live slot must hold A, not B"
+        );
+
+        // And an immediate re-bind of the *currently active* root (A→A)
+        // still cheap-skips — the win the gate was added for is preserved.
+        let out = ws.set_root_dir(&a);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "re-binding the already-active root must skip the hook"
+        );
+        assert!(
+            out.contains("build skipped"),
+            "expected skip suffix, got: {out}"
         );
     }
 }

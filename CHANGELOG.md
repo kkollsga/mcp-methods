@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.47 — 2026-07-08
+
+### Fixed — activate skip-gate goes stale for single-slot consumers (A→B→A)
+
+The auto-rebuild skip gate keyed its in-memory axis off
+`hydrated_this_process` — a *set* of every root whose post-activate hook
+had fired at any point this process. The implicit invariant was "hook
+fired for X ⇒ X's product is still live", which only holds for a consumer
+that keeps a **per-name** product. A consumer with a *single* active-graph
+slot (kglite-mcp-server, and likely every graph consumer) overwrites that
+slot on each activate, so after `activate(A) → activate(B)` the slot holds
+B. Re-binding A then found `action=="current"` (fingerprint unchanged) AND
+`hydrated.contains(A)` → skipped the hook → the slot still held B, yet
+activate reported success and the summary hook read B. A code-review agent
+swapping `set_root_dir(projA → projB → projA)` got projB's graph back
+under projA's name. The bug rode through both `set_root_dir` (local) and
+`repo_management` (github) since both route through `activate()`.
+
+The fix tracks the **most-recently-activated** name
+(`WorkspaceState::active_built_name: Option<String>`) instead of a set,
+and skips only when re-binding the *currently active* root — never a root
+merely hydrated earlier and since overwritten. This preserves the cheap
+same-root `update=True` / re-bind win the gate was added for (A→A still
+skips), while an A→B→A swap correctly rebuilds A. Correct for single-slot
+and per-name consumers alike; cost is a rebuild only on an actual swap.
+Reported by kglite (petekSuite → kglite → us, 2026-07-06/07-08).
+
 ## 0.3.46 — 2026-07-02
 
 ### Added — result-postprocess hook (runtime tool-result steering)
