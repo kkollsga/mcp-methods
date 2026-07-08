@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.48 — 2026-07-08
+
+### Added — retry transient GitHub API failures with exponential backoff
+
+The `github_issues` / `github_api` tools issued every REST call as a
+single attempt: a transient GitHub 5xx or a momentary network blip
+failed the whole tool call outright, forcing the agent to re-run the
+query. GET-shaped calls now retry on transient failures (429, 5xx, and
+transport errors — DNS / connect / TLS / timeout) with exponential
+backoff (500 ms, doubling, capped at 30 s per sleep; 3 retries). The
+design mirrors KGLite's shared dataset HTTP client so both codebases
+classify and back off identically.
+
+Non-transient statuses bubble immediately, unchanged — a **403**
+rate-limit still returns its "set GITHUB_TOKEN" hint on the first
+response (retrying can't recover an hourly rate window and would only
+delay that guidance), and 404 "Not found" / 401 auth / 422
+search-validation are likewise not retried. The retry sits *under* each
+call site's existing error mapping, so it is invisible when the first
+attempt succeeds. POST / GraphQL mutations are never retried
+(non-idempotent).
+
 ## 0.3.47 — 2026-07-08
 
 ### Fixed — activate skip-gate goes stale for single-slot consumers (A→B→A)

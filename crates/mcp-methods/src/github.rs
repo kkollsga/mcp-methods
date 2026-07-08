@@ -39,6 +39,93 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .build()
 });
 
+// ---------------------------------------------------------------------------
+// Retry / backoff for transient GitHub API failures
+// ---------------------------------------------------------------------------
+//
+// Design ported from KGLite's shared dataset HTTP client
+// (`crates/kglite/src/datasets/http.rs`, 2026-07-08): retry transient
+// failures (429 / 5xx / transport errors) with exponential backoff and
+// bail immediately on non-transient statuses so the caller's existing
+// error-message mapping fires on the first attempt's response. Without
+// this a single transient GitHub 5xx or network blip fails a tool call
+// outright.
+
+/// Retries after the first attempt (total attempts = `RETRY_COUNT + 1`).
+const RETRY_COUNT: usize = 3;
+/// Initial backoff before the first retry; doubles each subsequent retry.
+const BASE_BACKOFF_MS: u64 = 500;
+/// Ceiling for a single backoff sleep between retries.
+const MAX_BACKOFF_MS: u64 = 30_000;
+
+/// Is this HTTP status worth retrying? Transient = 429 (rate limited)
+/// and 5xx (server) statuses. Non-transient 4xx (401 / 403 / 404 / 422)
+/// bubble immediately — a retry can't change the outcome, and each call
+/// site's error mapping (rate-limit hint, "Not found", auth message)
+/// must fire on the first response.
+///
+/// GitHub returns **403** for rate limiting (with a body hint), but we
+/// deliberately do NOT retry it: the existing message tells the agent to
+/// set a token, and a retry with the same (missing) token would only
+/// delay that guidance. Primary rate limits reset on an hourly window,
+/// far beyond our ~7 s total backoff budget, so retrying would not
+/// recover within the request anyway.
+fn status_is_transient(code: u16) -> bool {
+    code == 429 || (500..=599).contains(&code)
+}
+
+/// Classify a raw ureq error. Transport errors (DNS / connect / TLS /
+/// timeout) are always transient; status errors defer to
+/// [`status_is_transient`].
+fn is_transient(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Status(code, _) => status_is_transient(*code),
+        ureq::Error::Transport(_) => true,
+    }
+}
+
+/// Next backoff delay: double, capped at [`MAX_BACKOFF_MS`].
+fn next_backoff_ms(current: u64) -> u64 {
+    current.saturating_mul(2).min(MAX_BACKOFF_MS)
+}
+
+/// Run a GET-shaped request with retry on transient failures.
+///
+/// `build` must construct **and send** a fresh request on each call
+/// (ureq requests are consumed by `.call()`), returning ureq's raw
+/// `Result<Response, Error>`. Retries transient errors (see
+/// [`is_transient`]) with exponential backoff (`BASE_BACKOFF_MS × 2^n`,
+/// capped at `MAX_BACKOFF_MS`); the final attempt's result — success or
+/// error — is returned verbatim, so each call site's existing status /
+/// error mapping stays intact and the retry is transparent when the
+/// first attempt succeeds.
+///
+/// GET / idempotent requests only — never wrap a POST or mutation.
+// `ureq::Error` is a large enum (~272 B); returning it in a `Result`
+// trips `result_large_err`. Boxing it would force every call site's
+// `ureq::Error::Status(code, resp)` match arm into a deref pattern, so
+// we accept the large `Err` variant at this ureq API boundary instead.
+#[allow(clippy::result_large_err)]
+fn call_with_retry<F>(build: F) -> Result<ureq::Response, ureq::Error>
+where
+    F: Fn() -> Result<ureq::Response, ureq::Error>,
+{
+    let mut delay_ms = BASE_BACKOFF_MS;
+    for attempt in 0..=RETRY_COUNT {
+        match build() {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if !is_transient(&e) || attempt == RETRY_COUNT {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = next_backoff_ms(delay_ms);
+            }
+        }
+    }
+    unreachable!("call_with_retry loop returns or errors before completing")
+}
+
 /// Rough byte-size estimate for a serde_json::Value without allocating a string.
 pub fn estimate_json_size(val: &Value) -> usize {
     match val {
@@ -114,6 +201,8 @@ pub fn detect_git_repo(cwd: &str) -> Option<String> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+// Closure below returns ureq's large `Result` at the `.call()` boundary.
+#[allow(clippy::result_large_err)]
 pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
     let url = if endpoint.starts_with("http") {
         endpoint.to_string()
@@ -121,16 +210,19 @@ pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
         format!("{}/{}", GITHUB_API, endpoint)
     };
 
-    let mut req = AGENT
-        .get(&url)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "mcp-methods");
+    let result = call_with_retry(|| {
+        let mut req = AGENT
+            .get(&url)
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "mcp-methods");
 
-    if let Some(token) = auth_token() {
-        req = req.set("Authorization", &format!("Bearer {}", token));
-    }
+        if let Some(token) = auth_token() {
+            req = req.set("Authorization", &format!("Bearer {}", token));
+        }
+        req.call()
+    });
 
-    match req.call() {
+    match result {
         Ok(resp) => resp
             .into_json::<Value>()
             .map_err(|e| format!("JSON parse error: {}", e)),
@@ -237,15 +329,20 @@ pub(crate) fn gh_get_paginated(endpoint: &str) -> Result<Vec<Value>, String> {
 }
 
 /// Fetch a single page by URL (used for tail pages).
+// Closure returns ureq's large `Result` at the `.call()` boundary.
+#[allow(clippy::result_large_err)]
 fn gh_get_page(url: &str) -> Result<Vec<Value>, String> {
-    let mut req = AGENT
-        .get(url)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "mcp-methods");
-    if let Some(token) = auth_token() {
-        req = req.set("Authorization", &format!("Bearer {}", token));
-    }
-    let resp = req.call().map_err(|e| format!("GitHub API error: {}", e))?;
+    let resp = call_with_retry(|| {
+        let mut req = AGENT
+            .get(url)
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "mcp-methods");
+        if let Some(token) = auth_token() {
+            req = req.set("Authorization", &format!("Bearer {}", token));
+        }
+        req.call()
+    })
+    .map_err(|e| format!("GitHub API error: {}", e))?;
     let items: Value = resp
         .into_json()
         .map_err(|e| format!("JSON parse error: {}", e))?;
@@ -258,6 +355,8 @@ fn gh_get_page(url: &str) -> Result<Vec<Value>, String> {
 /// Fetch paginated results: first `head` pages + last `tail` pages.
 /// If head=0 and tail=0, fetch all pages (unlimited).
 /// When total pages <= head+tail, all pages are fetched (no gap).
+// Closure returns ureq's large `Result` at the `.call()` boundary.
+#[allow(clippy::result_large_err)]
 fn gh_get_paginated_bookends(
     endpoint: &str,
     head: usize,
@@ -272,16 +371,17 @@ fn gh_get_paginated_bookends(
     let mut skipped = false;
 
     loop {
-        let mut req = AGENT
-            .get(&url)
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", "mcp-methods");
+        let resp = match call_with_retry(|| {
+            let mut req = AGENT
+                .get(&url)
+                .set("Accept", "application/vnd.github+json")
+                .set("User-Agent", "mcp-methods");
 
-        if let Some(token) = auth_token() {
-            req = req.set("Authorization", &format!("Bearer {}", token));
-        }
-
-        let resp = match req.call() {
+            if let Some(token) = auth_token() {
+                req = req.set("Authorization", &format!("Bearer {}", token));
+            }
+            req.call()
+        }) {
             Ok(r) => r,
             Err(ureq::Error::Status(403, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
@@ -1229,6 +1329,8 @@ fn build_search_qualifiers(repo: &str, kind: &str, state: &str, labels: Option<&
 }
 
 /// SEARCH mode: issues + PRs via REST search/issues API.
+// Closure returns ureq's large `Result` at the `.call()` boundary.
+#[allow(clippy::result_large_err)]
 fn search_issues_internal(
     repo: &str,
     user_query: &str,
@@ -1245,23 +1347,26 @@ fn search_issues_internal(
     );
     let per_page = limit.min(100);
 
-    let mut req = AGENT
-        .get(&format!("{}/search/issues", GITHUB_API))
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "mcp-methods")
-        .query("q", &q)
-        .query("per_page", &per_page.to_string());
+    let result = call_with_retry(|| {
+        let mut req = AGENT
+            .get(&format!("{}/search/issues", GITHUB_API))
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "mcp-methods")
+            .query("q", &q)
+            .query("per_page", &per_page.to_string());
 
-    if let Some(s) = sort {
-        req = req.query("sort", s);
-    }
-    // When sort is None, GitHub defaults to "best match" (relevance)
+        if let Some(s) = sort {
+            req = req.query("sort", s);
+        }
+        // When sort is None, GitHub defaults to "best match" (relevance)
 
-    if let Some(token) = auth_token() {
-        req = req.set("Authorization", &format!("Bearer {}", token));
-    }
+        if let Some(token) = auth_token() {
+            req = req.set("Authorization", &format!("Bearer {}", token));
+        }
+        req.call()
+    });
 
-    match req.call() {
+    match result {
         Ok(resp) => {
             let data: Value = match resp.into_json() {
                 Ok(v) => v,
@@ -1883,6 +1988,37 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn transient_status_classification() {
+        // Retryable: 429 (rate limited) + the whole 5xx range.
+        assert!(status_is_transient(429));
+        assert!(status_is_transient(500));
+        assert!(status_is_transient(502));
+        assert!(status_is_transient(503));
+        assert!(status_is_transient(599));
+        // Non-transient: 2xx success + the 4xx statuses whose error
+        // mapping must fire immediately (403 rate-limit hint, 404 "Not
+        // found", 401 auth, 422 search-validation).
+        assert!(!status_is_transient(200));
+        assert!(!status_is_transient(401));
+        assert!(!status_is_transient(403));
+        assert!(!status_is_transient(404));
+        assert!(!status_is_transient(422));
+        assert!(!status_is_transient(600));
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        // Base 500 → 1000 → 2000 → 4000 → 8000 → 16000 → 30000 (capped).
+        assert_eq!(next_backoff_ms(BASE_BACKOFF_MS), 1_000);
+        assert_eq!(next_backoff_ms(1_000), 2_000);
+        assert_eq!(next_backoff_ms(2_000), 4_000);
+        assert_eq!(next_backoff_ms(16_000), MAX_BACKOFF_MS);
+        // Already at/over the ceiling stays clamped (no overflow).
+        assert_eq!(next_backoff_ms(MAX_BACKOFF_MS), MAX_BACKOFF_MS);
+        assert_eq!(next_backoff_ms(u64::MAX), MAX_BACKOFF_MS);
     }
 
     #[test]
