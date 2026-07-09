@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.50 — 2026-07-10
 
 ### Fixed — multi-revision activation hardening
 
