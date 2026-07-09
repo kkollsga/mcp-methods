@@ -76,6 +76,37 @@ pub type PostActivateHook = Arc<dyn Fn(&Path, &str) -> Result<()> + Send + Sync>
 /// hook failed).
 pub type ActivationSummaryHook = Arc<dyn Fn(&Path, &str) -> Option<String> + Send + Sync>;
 
+/// Hook fired after a successful clone/update **when revisions were
+/// requested** on the activation call (`repo_management(revs=…)` /
+/// `set_root_dir(revs=…)`). Receives the repo path, the `org/repo` (or
+/// synthetic local) name, and the resolved revspecs in **oldest→newest**
+/// order — for a `Count(n)` request the final entry is always `HEAD`, so
+/// a downstream multi-rev builder can merge oldest→newest with HEAD's
+/// signature winning. Set via [`Workspace::with_post_activate_revs`].
+///
+/// Additive by design (mirrors [`ActivationSummaryHook`]): existing
+/// consumers that register only the plain [`PostActivateHook`] are
+/// unaffected. When revs are requested but this hook is *not* set, the
+/// plain hook runs instead (a single-rev / HEAD build) and the resolved
+/// list is not reported in the activation message.
+pub type PostActivateRevsHook = Arc<dyn Fn(&Path, &str, &[String]) -> Result<()> + Send + Sync>;
+
+/// A revisions request carried by the activation tools. `Count(n)`
+/// resolves to the newest `n` version-sorted tags (plus `HEAD`);
+/// `List(revs)` is an explicit set of git revspecs used verbatim. The
+/// untagged deserialization maps a JSON integer to `Count` and a JSON
+/// array of strings to `List`, so the tool arg accepts `int | [str]`.
+/// Resolution happens at activate time — see [`Workspace::resolve_revs`].
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RevsRequest {
+    /// Last `n` release tags (`git tag --sort=-v:refname`, take `n`),
+    /// ordered oldest→newest with `HEAD` appended.
+    Count(usize),
+    /// Explicit git revspecs (tags, branches, or SHAs), used as given.
+    List(Vec<String>),
+}
+
 /// Per-repo inventory entry persisted in `inventory.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InventoryEntry {
@@ -113,6 +144,11 @@ struct WorkspaceInner {
     /// Optional summary hook (see [`ActivationSummaryHook`]). Set via
     /// [`Workspace::with_activation_summary`], `None` by default.
     activation_summary: Option<ActivationSummaryHook>,
+    /// Optional revs-aware hook (see [`PostActivateRevsHook`]). Set via
+    /// [`Workspace::with_post_activate_revs`], `None` by default. Called
+    /// in place of `post_activate` only when the activation carried a
+    /// revs request AND this hook is set.
+    post_activate_revs: Option<PostActivateRevsHook>,
 }
 
 #[derive(Debug, Default)]
@@ -163,6 +199,7 @@ impl Workspace {
                 state: RwLock::new(WorkspaceState::default()),
                 post_activate,
                 activation_summary: None,
+                post_activate_revs: None,
             }),
         };
         ws.reconcile_inventory()?;
@@ -206,6 +243,7 @@ impl Workspace {
                 state: RwLock::new(state),
                 post_activate,
                 activation_summary: None,
+                post_activate_revs: None,
             }),
         })
     }
@@ -220,6 +258,23 @@ impl Workspace {
             Some(inner) => inner.activation_summary = Some(hook),
             None => tracing::warn!(
                 "with_activation_summary called after the workspace was cloned; summary not attached"
+            ),
+        }
+        self
+    }
+
+    /// Attach a [`PostActivateRevsHook`]. Call immediately after
+    /// `open`/`open_local` (before the workspace is cloned into
+    /// `ServerOptions`): it mutates the still-unique inner `Arc`, exactly
+    /// like [`with_activation_summary`](Self::with_activation_summary).
+    /// Calling it after the workspace has been cloned is a no-op with a
+    /// warning. Additive — consumers that don't set it keep the plain
+    /// single-rev activation behaviour.
+    pub fn with_post_activate_revs(mut self, hook: PostActivateRevsHook) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.post_activate_revs = Some(hook),
+            None => tracing::warn!(
+                "with_post_activate_revs called after the workspace was cloned; revs hook not attached"
             ),
         }
         self
@@ -526,21 +581,112 @@ impl Workspace {
         Ok(("current".to_string(), repo_path, local))
     }
 
+    /// Resolve a [`RevsRequest`] against the git repo at `repo_path` into
+    /// a concrete, ordered list of git revspecs.
+    ///
+    /// - `Count(n)`: the newest `n` tags by version sort
+    ///   (`git tag --sort=-v:refname`, take `n`), **reversed to
+    ///   oldest→newest**, with `HEAD` appended as the final (newest) rev.
+    ///   Errors if the repo has no tags at all (nothing to resolve).
+    ///   Fewer than `n` tags is not an error — all available tags are
+    ///   used.
+    /// - `List(revs)`: each revspec is validated with
+    ///   `git rev-parse --verify <rev>^{commit}` and used verbatim (no
+    ///   sort, no `HEAD` appended). Errors on the first unknown rev.
+    ///
+    /// A non-git `repo_path` surfaces as the `git tag` / `git rev-parse`
+    /// failure with a clear message.
+    fn resolve_revs(&self, repo_path: &Path, req: &RevsRequest) -> Result<Vec<String>> {
+        match req {
+            RevsRequest::Count(n) => {
+                let out = Command::new("git")
+                    .args(["tag", "--sort=-v:refname"])
+                    .current_dir(repo_path)
+                    .output()
+                    .context("failed to spawn `git tag`")?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "cannot resolve revs: `git tag` failed in {} (is it a git repo?): {}",
+                        repo_path.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                let tags: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if tags.is_empty() {
+                    anyhow::bail!(
+                        "revs={n} requested but '{}' has no tags to resolve",
+                        repo_path.display()
+                    );
+                }
+                // Newest `n` (version-sorted desc), reversed to
+                // oldest→newest, then HEAD last so a multi-rev builder
+                // merges with HEAD's signature winning.
+                let mut chosen: Vec<String> = tags.into_iter().take(*n).collect();
+                chosen.reverse();
+                chosen.push("HEAD".to_string());
+                Ok(chosen)
+            }
+            RevsRequest::List(revs) => {
+                if revs.is_empty() {
+                    anyhow::bail!("revs list is empty — pass at least one revision");
+                }
+                for r in revs {
+                    let out = Command::new("git")
+                        .args([
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("{r}^{{commit}}"),
+                        ])
+                        .current_dir(repo_path)
+                        .output()
+                        .context("failed to spawn `git rev-parse`")?;
+                    if !out.status.success() {
+                        anyhow::bail!("revision '{r}' does not exist in '{}'", repo_path.display());
+                    }
+                }
+                Ok(revs.clone())
+            }
+        }
+    }
+
     /// Activate a repo: clone if needed, fast-forward, fire post-activate hook.
     ///
-    /// Auto-rebuild gating: if `force_rebuild` is false AND the repo
-    /// is already at the HEAD it was last built at (`action == "current"`
-    /// AND `prev_built_sha == new_head`), the post-activate hook is
-    /// skipped. This makes `repo_management(update=True)` cheap when
-    /// upstream hasn't moved. Set `force_rebuild=true` to bypass (e.g.
-    /// after upgrading the builder itself).
+    /// Auto-rebuild gating: if `force_rebuild` is false AND no `revs` were
+    /// requested AND the repo is already at the HEAD it was last built at
+    /// (`action == "current"` AND `prev_built_sha == new_head`), the
+    /// post-activate hook is skipped. This makes `repo_management(update=True)`
+    /// cheap when upstream hasn't moved. Set `force_rebuild=true` to bypass
+    /// (e.g. after upgrading the builder itself).
+    ///
+    /// When `revs` are requested the skip gate never applies — a
+    /// revs-requested activation always fires the hook (see the gate
+    /// comment below). If the revs-aware hook is set, it is called with
+    /// the resolved revspecs; otherwise the plain hook runs (single-rev
+    /// build) and the resolved list is not reported.
     ///
     /// On successful hook completion the new HEAD SHA is persisted to
     /// `inventory.json[name].last_built_sha`. If the hook fails the SHA
     /// is NOT recorded, so the next `update=True` re-attempts the build.
-    fn activate(&self, name: &str, force_rebuild: bool) -> Result<String> {
+    fn activate(
+        &self,
+        name: &str,
+        force_rebuild: bool,
+        revs: Option<&RevsRequest>,
+    ) -> Result<String> {
         let prev_built_sha = self.last_built_sha(name);
         let (action, repo_path, head_sha) = self.clone_or_update(name)?;
+        // Resolve any requested revs before mutating active state, so a
+        // bad request (no tags / unknown rev) returns a clean error with
+        // the repo cloned-but-not-activated rather than half-bound.
+        let resolved_revs = match revs {
+            Some(req) => Some(self.resolve_revs(&repo_path, req)?),
+            None => None,
+        };
         self.bump_access(name, &action);
         let is_active_built = {
             let mut state = self.inner.state.write().unwrap();
@@ -560,15 +706,42 @@ impl Workspace {
         // A→B→A swap correctly rebuilds A: after activate(B) the live
         // slot holds B, so re-binding A must not skip (see the
         // `active_built_name` field doc).
+        // Skip-gate / revs interaction (SIMPLEST CORRECT, by design): a
+        // revs-requested activation ALWAYS fires the hook — the SHA-skip
+        // gate only applies to the plain (no-revs) path. Rationale: the
+        // gate keys off HEAD's SHA alone, which says nothing about which
+        // *set* of revs a prior build loaded; a request for a different
+        // rev-set at the same HEAD must rebuild. Rev-aware skip logic
+        // (hashing the resolved rev-set into the inventory) is deliberately
+        // NOT built here — the tradeoff is that repeat `revs=` calls at an
+        // unchanged HEAD re-parse every rev, which is acceptable for an
+        // explicit multi-rev request.
         let already_built = !force_rebuild
+            && resolved_revs.is_none()
             && action == "current"
             && prev_built_sha.as_deref() == Some(head_sha.as_str())
             && is_active_built;
         let mut hook_skipped = false;
+        // Tracks whether the revs-aware hook actually ran (revs requested
+        // AND that hook set) — only then do we report the resolved list.
+        let mut revs_hook_ran = false;
         let hook_ok = if already_built {
             hook_skipped = true;
             true
+        } else if let (Some(resolved), Some(revs_hook)) =
+            (resolved_revs.as_ref(), &self.inner.post_activate_revs)
+        {
+            revs_hook_ran = true;
+            match revs_hook(&repo_path, name, resolved) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("post-activate revs hook for {name} failed: {e}");
+                    false
+                }
+            }
         } else if let Some(hook) = &self.inner.post_activate {
+            // No revs requested, or revs requested with no revs-hook set:
+            // fall back to the plain single-rev (HEAD) build.
             match hook(&repo_path, name) {
                 Ok(()) => true,
                 Err(e) => {
@@ -605,7 +778,16 @@ impl Workspace {
         } else {
             ""
         };
-        let base = format!("{verb} '{name}' at {}.{suffix}", repo_path.display());
+        let mut base = format!("{verb} '{name}' at {}.{suffix}", repo_path.display());
+        // Name the resolved revisions on their own line so agents see
+        // exactly what got loaded. Only when the revs-hook actually ran
+        // (revs requested AND hook set AND it succeeded) — a fallback to
+        // the plain hook loads HEAD only, so claiming a rev-set would lie.
+        if revs_hook_ran && hook_ok {
+            if let Some(resolved) = &resolved_revs {
+                base.push_str(&format!("\nrevs: {}", resolved.join(", ")));
+            }
+        }
         // Append the consumer's opening-steer mini-map, if configured.
         // Fired on any successful activation (fresh build or cheap-skip —
         // in both cases the in-memory product is live this process); the
@@ -740,6 +922,7 @@ impl Workspace {
         delete: bool,
         update: bool,
         force_rebuild: bool,
+        revs: Option<&RevsRequest>,
     ) -> String {
         // Local mode: most github-only semantics are nonsensical here.
         if matches!(self.inner.kind, WorkspaceKind::Local) {
@@ -765,7 +948,7 @@ impl Workspace {
             // force flag plus the SHA comparison.
             let _ = update; // explicit: update is implicit in local mode
             return self
-                .activate(&active, force_rebuild)
+                .activate(&active, force_rebuild, revs)
                 .unwrap_or_else(|e| format!("rebuild failed: {e}"));
         }
 
@@ -791,7 +974,7 @@ impl Workspace {
             };
             return prefix
                 + &self
-                    .activate(&active, force_rebuild)
+                    .activate(&active, force_rebuild, revs)
                     .unwrap_or_else(|e| format!("update failed: {e}"));
         }
 
@@ -809,13 +992,17 @@ impl Workspace {
         }
         prefix
             + &self
-                .activate(name, force_rebuild)
+                .activate(name, force_rebuild, revs)
                 .unwrap_or_else(|e| format!("activate failed: {e}"))
     }
 
     /// Swap the active root (local mode only). Re-fires the post-activate
     /// hook against the new root. Errors if the workspace is github-flavoured.
-    pub fn set_root_dir(&self, new_root: &Path) -> String {
+    ///
+    /// `revs` (optional): resolve revisions against the new root (which
+    /// must be a git repo) and fire the revs-aware hook — see
+    /// [`activate`](Self::activate) / [`RevsRequest`].
+    pub fn set_root_dir(&self, new_root: &Path, revs: Option<&RevsRequest>) -> String {
         if !matches!(self.inner.kind, WorkspaceKind::Local) {
             return "set_root_dir is only valid in local-workspace mode.".to_string();
         }
@@ -838,7 +1025,7 @@ impl Workspace {
         // Note: the WorkspaceInner.workspace_dir field is the path the
         // inventory is stored under. We keep the *original* one (from
         // open_local) so the inventory survives across root swaps.
-        self.activate(&synthetic, false)
+        self.activate(&synthetic, false, revs)
             .unwrap_or_else(|e| format!("set_root_dir failed: {e}"))
     }
 }
@@ -1057,7 +1244,7 @@ mod tests {
     fn empty_list() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let out = ws.repo_management(None, false, false, false);
+        let out = ws.repo_management(None, false, false, false, None);
         assert!(out.contains("No repos cloned yet"));
     }
 
@@ -1065,7 +1252,7 @@ mod tests {
     fn invalid_repo_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let out = ws.repo_management(Some("bad name with spaces"), false, false, false);
+        let out = ws.repo_management(Some("bad name with spaces"), false, false, false, None);
         assert!(out.contains("Invalid repo name"));
     }
 
@@ -1073,7 +1260,7 @@ mod tests {
     fn delete_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let out = ws.repo_management(Some("nope/none"), true, false, false);
+        let out = ws.repo_management(Some("nope/none"), true, false, false, None);
         assert!(out.contains("Nothing to delete"));
     }
 
@@ -1176,9 +1363,9 @@ mod tests {
     fn local_workspace_rejects_github_ops() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
-        let out = ws.repo_management(Some("acme/widgets"), false, false, false);
+        let out = ws.repo_management(Some("acme/widgets"), false, false, false, None);
         assert!(out.contains("does not accept a repo name"));
-        let out = ws.repo_management(None, true, false, false);
+        let out = ws.repo_management(None, true, false, false, None);
         assert!(out.contains("does not support `delete`"));
     }
 
@@ -1196,10 +1383,10 @@ mod tests {
         });
         let ws = Workspace::open_local(dir.path().to_path_buf(), Some(hook)).unwrap();
         // First update: nothing built yet → hook fires.
-        let _ = ws.repo_management(None, false, true, false);
+        let _ = ws.repo_management(None, false, true, false, None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // Second update without changes → SHA matches → hook skipped.
-        let out = ws.repo_management(None, false, true, false);
+        let out = ws.repo_management(None, false, true, false, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1286,7 +1473,7 @@ mod tests {
     fn set_root_dir_only_in_local_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let out = ws.set_root_dir(dir.path());
+        let out = ws.set_root_dir(dir.path(), None);
         assert!(out.contains("only valid in local-workspace"));
     }
 
@@ -1294,7 +1481,7 @@ mod tests {
     fn update_with_no_active_repo() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let out = ws.repo_management(None, false, true, false);
+        let out = ws.repo_management(None, false, true, false, None);
         assert!(out.contains("No active repository"));
     }
 
@@ -1304,7 +1491,7 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::create_dir_all(&child).unwrap();
         let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
-        let _ = ws.set_root_dir(&child);
+        let _ = ws.set_root_dir(&child, None);
         assert_eq!(
             ws.active_repo_path().unwrap(),
             child.canonicalize().unwrap(),
@@ -1325,7 +1512,7 @@ mod tests {
             Ok(())
         });
         let ws = Workspace::open_local(dir.path().to_path_buf(), Some(hook)).unwrap();
-        let _ = ws.set_root_dir(&child);
+        let _ = ws.set_root_dir(&child, None);
         assert_eq!(
             seen_path.lock().unwrap().clone().unwrap(),
             child.canonicalize().unwrap(),
@@ -1342,7 +1529,7 @@ mod tests {
         let ws = Workspace::open_local(dir.path().to_path_buf(), None)
             .unwrap()
             .with_activation_summary(summary);
-        let out = ws.repo_management(None, false, true, false);
+        let out = ws.repo_management(None, false, true, false, None);
         assert!(
             out.contains("Graph ready: 3 Functions."),
             "activation message should include the summary; got: {out}"
@@ -1354,7 +1541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
         let ws = Workspace::open_local(dir.path().to_path_buf(), None).unwrap();
-        let out = ws.repo_management(None, false, true, false);
+        let out = ws.repo_management(None, false, true, false, None);
         assert!(!out.contains("Graph ready"));
         assert!(
             out.contains(" at "),
@@ -1383,14 +1570,14 @@ mod tests {
         // --- Process 1 ---------------------------------------------------
         let ws = Workspace::open_local(dir.path().to_path_buf(), Some(make_hook())).unwrap();
         // First activate (fingerprint not yet recorded) → hook fires.
-        let _ = ws.repo_management(None, false, true, false);
+        let _ = ws.repo_management(None, false, true, false, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "first activate must hydrate"
         );
         // Second activate, same process, unchanged fingerprint → cheap-skip.
-        let out = ws.repo_management(None, false, true, false);
+        let out = ws.repo_management(None, false, true, false, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1412,7 +1599,7 @@ mod tests {
                 .is_some(),
             "sanity: last_built_sha should survive the restart"
         );
-        let _ = ws2.repo_management(None, false, true, false);
+        let _ = ws2.repo_management(None, false, true, false, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -1454,14 +1641,14 @@ mod tests {
         let ws = Workspace::open_local(a.clone(), Some(hook)).unwrap();
         // open_local binds A but doesn't fire the hook; first set_root_dir(A)
         // hydrates it.
-        let _ = ws.set_root_dir(&a);
+        let _ = ws.set_root_dir(&a, None);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "first bind of A hydrates");
         assert_eq!(
             built.lock().unwrap().clone(),
             Some(a.canonicalize().unwrap())
         );
 
-        let _ = ws.set_root_dir(&b);
+        let _ = ws.set_root_dir(&b, None);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "bind of B rebuilds");
         assert_eq!(
             built.lock().unwrap().clone(),
@@ -1470,7 +1657,7 @@ mod tests {
 
         // The bug: re-binding A must rebuild (slot currently holds B), not
         // cheap-skip. The single slot must end up holding A again.
-        let out = ws.set_root_dir(&a);
+        let out = ws.set_root_dir(&a, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
@@ -1488,7 +1675,7 @@ mod tests {
 
         // And an immediate re-bind of the *currently active* root (A→A)
         // still cheap-skips — the win the gate was added for is preserved.
-        let out = ws.set_root_dir(&a);
+        let out = ws.set_root_dir(&a, None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
@@ -1497,6 +1684,214 @@ mod tests {
         assert!(
             out.contains("build skipped"),
             "expected skip suffix, got: {out}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // revs (multi-revision activation)
+    // ------------------------------------------------------------------
+
+    /// Stand up a real git repo at a fresh tempdir with the given tags
+    /// created in order (so version-sort ordering is exercised). Returns
+    /// the tempdir (keep alive) + its path, or `None` if git is
+    /// unavailable in the environment (test then skips).
+    fn git_repo_with_tags(tags: &[&str]) -> Option<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        if !git(&["init"]).status.success() {
+            return None; // git unavailable — caller skips.
+        }
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        for (i, tag) in tags.iter().enumerate() {
+            std::fs::write(root.join("f.txt"), format!("rev {i}")).unwrap();
+            git(&["add", "-A"]);
+            assert!(
+                git(&["commit", "-m", &format!("c{i}")]).status.success(),
+                "git commit failed"
+            );
+            assert!(git(&["tag", tag]).status.success(), "git tag {tag} failed");
+        }
+        Some((dir, root))
+    }
+
+    #[test]
+    fn resolve_revs_count_picks_newest_n_oldest_first_head_last() {
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0", "v1.1.0", "v2.0.0"]) else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        let resolved = ws
+            .resolve_revs(&root, &RevsRequest::Count(2))
+            .expect("resolve should succeed");
+        // Newest 2 = v2.0.0, v1.1.0 → oldest→newest → v1.1.0, v2.0.0, then HEAD.
+        assert_eq!(resolved, vec!["v1.1.0", "v2.0.0", "HEAD"]);
+    }
+
+    #[test]
+    fn resolve_revs_count_fewer_tags_than_requested_uses_all() {
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0", "v2.0.0"]) else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        let resolved = ws.resolve_revs(&root, &RevsRequest::Count(10)).unwrap();
+        assert_eq!(resolved, vec!["v1.0.0", "v2.0.0", "HEAD"]);
+    }
+
+    #[test]
+    fn resolve_revs_count_errors_when_no_tags() {
+        let Some((_d, root)) = git_repo_with_tags(&[]) else {
+            return;
+        };
+        // Empty repo has no commits yet; make one commit but no tags.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        std::fs::write(root.join("f.txt"), b"x").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "c0"]);
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        let err = ws
+            .resolve_revs(&root, &RevsRequest::Count(3))
+            .expect_err("no tags → error");
+        assert!(
+            err.to_string().contains("no tags"),
+            "expected a 'no tags' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_revs_list_validates_and_rejects_unknown() {
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0", "v1.1.0"]) else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        // Explicit list is used verbatim (no HEAD appended, no sort).
+        let ok = ws
+            .resolve_revs(
+                &root,
+                &RevsRequest::List(vec!["v1.1.0".into(), "v1.0.0".into()]),
+            )
+            .unwrap();
+        assert_eq!(ok, vec!["v1.1.0", "v1.0.0"]);
+        // An unknown rev is a clear error naming the bad rev.
+        let err = ws
+            .resolve_revs(&root, &RevsRequest::List(vec!["v9.9.9".into()]))
+            .expect_err("unknown rev → error");
+        assert!(
+            err.to_string().contains("v9.9.9") && err.to_string().contains("does not exist"),
+            "expected an unknown-rev error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn revs_hook_receives_resolved_revs_and_plain_hook_untouched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0", "v1.1.0", "v2.0.0"]) else {
+            return;
+        };
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let seen_revs: Arc<std::sync::Mutex<Option<Vec<String>>>> = Arc::new(Default::default());
+        let pc = plain_calls.clone();
+        let plain: PostActivateHook = Arc::new(move |_p, _n| {
+            pc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let sr = seen_revs.clone();
+        let revs_hook: PostActivateRevsHook = Arc::new(move |_p, _n, revs| {
+            *sr.lock().unwrap() = Some(revs.to_vec());
+            Ok(())
+        });
+        let ws = Workspace::open_local(root.clone(), Some(plain))
+            .unwrap()
+            .with_post_activate_revs(revs_hook);
+        let out = ws.repo_management(None, false, true, false, Some(&RevsRequest::Count(2)));
+        // The revs-hook ran with the resolved list; the plain hook did NOT.
+        assert_eq!(
+            seen_revs.lock().unwrap().clone().unwrap(),
+            vec!["v1.1.0", "v2.0.0", "HEAD"]
+        );
+        assert_eq!(
+            plain_calls.load(Ordering::SeqCst),
+            0,
+            "plain hook must not fire when the revs-hook handled the request"
+        );
+        // The activation message names the resolved revs on one line.
+        assert!(
+            out.contains("revs: v1.1.0, v2.0.0, HEAD"),
+            "activation message should list the resolved revs; got: {out}"
+        );
+    }
+
+    #[test]
+    fn plain_hook_used_and_no_revs_line_when_no_revs_requested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0"]) else {
+            return;
+        };
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let revs_seen = Arc::new(AtomicUsize::new(0));
+        let pc = plain_calls.clone();
+        let plain: PostActivateHook = Arc::new(move |_p, _n| {
+            pc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let rs = revs_seen.clone();
+        let revs_hook: PostActivateRevsHook = Arc::new(move |_p, _n, _revs| {
+            rs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let ws = Workspace::open_local(root.clone(), Some(plain))
+            .unwrap()
+            .with_post_activate_revs(revs_hook);
+        // No revs → plain hook fires, revs-hook untouched, no `revs:` line.
+        let out = ws.repo_management(None, false, true, false, None);
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            revs_seen.load(Ordering::SeqCst),
+            0,
+            "revs-hook must not fire when no revs were requested"
+        );
+        assert!(
+            !out.contains("revs:"),
+            "no revs line expected on a plain activation; got: {out}"
+        );
+    }
+
+    #[test]
+    fn revs_requested_without_revs_hook_falls_back_to_plain_no_revs_line() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0", "v2.0.0"]) else {
+            return;
+        };
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let pc = plain_calls.clone();
+        let plain: PostActivateHook = Arc::new(move |_p, _n| {
+            pc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        // No revs-hook attached: a revs request degrades to the plain
+        // (HEAD-only) build and does NOT claim a rev-set in the message.
+        let ws = Workspace::open_local(root.clone(), Some(plain)).unwrap();
+        let out = ws.repo_management(None, false, true, false, Some(&RevsRequest::Count(1)));
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !out.contains("revs:"),
+            "must not report a rev-set when only the plain hook ran; got: {out}"
         );
     }
 }

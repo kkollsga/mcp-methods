@@ -65,4 +65,6 @@ pub use skills::{
 };
 pub use source::SourceRootsProvider;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};
-pub use workspace::{ActivationSummaryHook, PostActivateHook, Workspace};
+pub use workspace::{
+    ActivationSummaryHook, PostActivateHook, PostActivateRevsHook, RevsRequest, Workspace,
+};

@@ -10,6 +10,7 @@ references_arguments:
   - repo_management.action
   - repo_management.name
   - repo_management.expire_days
+  - repo_management.revs
 auto_inject_hint: true
 ---
 
@@ -48,6 +49,25 @@ Workspace mode tracks the last-built SHA per repo. When you `set` or `update`:
 4. If they differ (or the entry is brand new), the hook fires and the new SHA is recorded.
 
 This is the "incremental warm cache" behaviour kglite and other downstream graphs depend on. Don't bypass it lightly. `force_rebuild` is the explicit escape hatch.
+
+## Loading multiple revisions (`revs`)
+
+Pass `revs` to load several git revisions of the repo into one graph
+(when the downstream builder supports it — e.g. kglite's multi-rev code
+graph). Two forms:
+
+- **`revs=N`** (integer): the last **N version-sorted release tags plus
+  HEAD** — e.g. `repo_management(name="numpy/numpy", revs=10)` loads the
+  10 newest tags and HEAD. Errors if the repo has no tags.
+- **`revs=["v2.0.0", "v2.1.0", "main"]`** (list): those git revspecs
+  (tags, branches, or SHAs) verbatim, in the order given. Errors on the
+  first revision that doesn't exist.
+
+Resolved revisions are reported on a `revs:` line in the activation
+message (oldest→newest, HEAD last), so you can see exactly what got
+loaded. A `revs` request **always rebuilds** — the SHA-skip gate applies
+only to plain single-revision activations. Omit `revs` for the default
+(HEAD-only) behaviour.
 
 ## TTL cleanup
 

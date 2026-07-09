@@ -35,6 +35,35 @@ tree only; read a known file at a rev instead. Both changes were
 requested by kglite from a concrete cross-tag native-crash
 investigation (comparing microsoft/mimalloc across three release tags).
 
+### Added — multi-revision workspace activation (`revs`)
+
+The workspace activation tools gained an optional `revs` argument
+(`repo_management` in github mode, `set_root_dir` in local mode):
+`int | [str] | null`. An integer **N** resolves to the last N
+version-sorted release tags (`git tag --sort=-v:refname`, take N),
+ordered oldest→newest with `HEAD` appended; a list of strings is used as
+explicit git revspecs (tags, branches, or SHAs) verbatim. Resolution
+happens at activate time — a repo with no tags (when an int was
+requested) or an unknown named rev returns a clear `Error: …`. This lets
+a downstream builder (e.g. kglite's multi-revision code graph) load
+several revisions of a repo into one graph from a single activation
+call.
+
+Additively, the framework gained a second post-activate hook slot,
+`PostActivateRevsHook = Fn(&Path, &str, &[String])`, set via
+`Workspace::with_post_activate_revs` (mirroring `with_activation_summary`
+— existing consumers that register only the plain `PostActivateHook`
+compile and behave unchanged). When revs are requested **and** the
+revs-hook is set, it is called with the resolved revspecs instead of the
+plain hook; otherwise the plain hook runs (a HEAD-only build) and no
+rev-set is claimed. On a successful revs-hook run the resolved list is
+appended to the activation message on a one-line `revs: …` so agents see
+exactly what got loaded. The SHA-skip gate deliberately applies only to
+the plain path — a `revs` request always fires the hook (HEAD's SHA says
+nothing about which rev-*set* a prior build loaded; rev-aware skip logic
+is intentionally not built). Stacks on the treeless-clone `--tags`
+fetching above, which makes the tags available to resolve.
+
 ## 0.3.48 — 2026-07-08
 
 ### Added — retry transient GitHub API failures with exponential backoff
