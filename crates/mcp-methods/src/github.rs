@@ -1763,7 +1763,7 @@ fn list_pulls(repo: &str, state: &str, sort: &str, direction: &str, per_page: us
         "repos/{}/pulls?state={}&sort={}&direction={}&per_page={}",
         repo, state, sort, direction, per_page
     );
-    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+    match gh_get(&format!("{}/{}", GITHUB_API, path)) {
         Ok(Value::Array(items)) => format_pull_list(repo, state, &items),
         Ok(_) => "Unexpected response format.".to_string(),
         Err(e) => e,
@@ -1787,7 +1787,7 @@ fn list_issues_only(
             path.push_str(&format!("&labels={}", lbls));
         }
     }
-    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+    match gh_get(&format!("{}/{}", GITHUB_API, path)) {
         Ok(Value::Array(items)) => {
             // Filter out PRs (GitHub Issues API returns both)
             let issues: Vec<&Value> = items
@@ -1818,7 +1818,7 @@ fn list_all(
             path.push_str(&format!("&labels={}", lbls));
         }
     }
-    match gh_get(&format!("{}/{}", GITHUB_API, &path)) {
+    match gh_get(&format!("{}/{}", GITHUB_API, path)) {
         Ok(Value::Array(items)) => {
             let refs: Vec<&Value> = items.iter().collect();
             format_mixed_list(repo, state, &refs)

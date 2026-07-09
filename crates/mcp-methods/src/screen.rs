@@ -966,7 +966,7 @@ pub fn build_overview(
             .1
             .push(p);
     }
-    for (_, (_, members)) in buckets.iter_mut() {
+    for (_, members) in buckets.values_mut() {
         members.sort_by(|a, b| {
             b.max_stars
                 .cmp(&a.max_stars)
