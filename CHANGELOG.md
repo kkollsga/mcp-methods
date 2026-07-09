@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.49 — 2026-07-09
+
+### Added — history-capable github-workspace clones
+
+`repo_management` cloned each repo with `git clone --depth 1`, which
+strips all but the tip commit: `git log -S` (pickaxe — "which commit
+introduced symbol X") and any history/tag walk were impossible on a
+cloned repo, forcing a manual tag-by-tag content sweep for
+cross-release comparison. The clone now uses a **treeless partial
+clone** (`--filter=tree:0 --tags`): the full commit history and all
+tags come down, while tree/blob objects are fetched lazily on demand —
+keeping the initial transfer near a shallow clone's cost but making
+history queries and tag-scoped reads work. The update path fetches with
+plain `git fetch origin --tags` (no `--depth 1`) so history stays
+complete and newly-pushed tags become available; FETCH_HEAD still
+records the remote default-branch tip, so the SHA-gate that skips
+no-op rebuilds is unchanged. Local-workspace (fingerprint) mode is
+untouched.
+
+### Added — rev-aware `read_source`
+
+`read_source` gained an optional `rev` parameter (a tag, branch, or
+commit SHA). When set, the file content is read at that git revision via
+`git show <rev>:<path>` instead of the working tree, then the existing
+slicing / `grep` / `max_chars` pipeline is applied to the historical
+content unchanged — so an agent can compare a file across releases (e.g.
+how a function differs between two tags) without a manual `git checkout`.
+The path argument keeps its traversal protection (absolute paths and
+`..` escapes reject before reaching git); a non-git source root or an
+unknown rev/path returns a clear `Error: …` string. Rev-scoped *search*
+across a tree is intentionally not offered — `grep` walks the working
+tree only; read a known file at a rev instead. Both changes were
+requested by kglite from a concrete cross-tag native-crash
+investigation (comparing microsoft/mimalloc across three release tags).
+
 ## 0.3.48 — 2026-07-08
 
 ### Added — retry transient GitHub API failures with exponential backoff

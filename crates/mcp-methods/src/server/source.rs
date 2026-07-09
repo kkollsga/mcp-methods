@@ -45,6 +45,11 @@ pub struct ReadOpts {
     pub grep_context: Option<usize>,
     pub max_matches: Option<usize>,
     pub max_chars: Option<usize>,
+    /// When set, read the file's content at this git revision
+    /// (tag / branch / SHA) via `git show <rev>:<path>` instead of the
+    /// working tree. The slicing / grep / max_chars pipeline is applied
+    /// to the historical content unchanged.
+    pub rev: Option<String>,
 }
 
 /// Read a file from one of the allowed source dirs.
@@ -54,6 +59,9 @@ pub struct ReadOpts {
 /// the existing Python-server behaviour so the agent sees a clean
 /// error in tool output rather than an MCP error envelope.
 pub fn read_source(file_path: &str, allowed_dirs: &[String], opts: &ReadOpts) -> String {
+    if let Some(rev) = opts.rev.as_deref() {
+        return read_source_at_rev(file_path, rev, allowed_dirs, opts);
+    }
     let resolved = match resolve_under_roots(file_path, allowed_dirs) {
         Some(p) => p,
         None => return format!("Error: file not found or access denied: {file_path}"),
@@ -63,6 +71,76 @@ pub fn read_source(file_path: &str, allowed_dirs: &[String], opts: &ReadOpts) ->
         Err(e) => return format!("Error reading file: {e}"),
     };
     apply_read_options(file_path, &raw, opts)
+}
+
+/// Read `file_path` at git revision `rev` via `git show <rev>:<path>`,
+/// then run the same slicing / grep / max_chars pipeline as a live read.
+///
+/// The path is validated to be a safe repo-relative path *before* it
+/// reaches git (no absolute paths, no `..` escape), so a rev read can't
+/// be used to smuggle a traversal past the sandbox. The active source
+/// root must be a git work tree; otherwise a clear error is returned.
+fn read_source_at_rev(
+    file_path: &str,
+    rev: &str,
+    allowed_dirs: &[String],
+    opts: &ReadOpts,
+) -> String {
+    if !is_safe_relative_path(file_path) {
+        return format!("Error: file not found or access denied: {file_path}");
+    }
+    let root = match git_work_tree_root(allowed_dirs) {
+        Some(r) => r,
+        None => {
+            return "Error: rev-aware read requires a git repository as the active source root, \
+                    but the current root is not a git work tree."
+                .to_string()
+        }
+    };
+    // `<rev>:<path>` — git treats the path as relative to the repo root.
+    let spec = format!("{rev}:{file_path}");
+    let out = match std::process::Command::new("git")
+        .args(["-C", &root, "show", &spec])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("Error: failed to run git: {e}"),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let msg = stderr.trim();
+        let msg = msg.strip_prefix("fatal: ").unwrap_or(msg);
+        return format!("Error reading {file_path}@{rev}: {msg}");
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    apply_read_options(&format!("{file_path}@{rev}"), &raw, opts)
+}
+
+/// True if `p` is a repo-relative path that cannot escape the repo root:
+/// not absolute, and with no `..` / root / prefix components.
+fn is_safe_relative_path(p: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(p);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Return the first allowed dir that is a git work tree, if any.
+fn git_work_tree_root(allowed_dirs: &[String]) -> Option<String> {
+    for d in allowed_dirs {
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", d, "rev-parse", "--is-inside-work-tree"])
+            .output()
+        {
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true" {
+                return Some(d.clone());
+            }
+        }
+    }
+    None
 }
 
 fn apply_read_options(file_path: &str, raw: &str, opts: &ReadOpts) -> String {
@@ -653,5 +731,140 @@ mod tests {
             outside.path().file_name().unwrap().to_string_lossy()
         );
         assert!(resolve_under_roots(&escape, &roots).is_none());
+    }
+
+    // --- rev-aware read_source ---------------------------------------------
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Init a repo with two commits of `file.txt`, tagging the first as
+    /// `v1`. Returns the tempdir.
+    fn make_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        std::fs::write(p.join("file.txt"), "old content v1\n").unwrap();
+        git(p, &["add", "file.txt"]);
+        git(p, &["commit", "-q", "-m", "v1"]);
+        git(p, &["tag", "v1"]);
+        std::fs::write(p.join("file.txt"), "new content v2\n").unwrap();
+        git(p, &["add", "file.txt"]);
+        git(p, &["commit", "-q", "-m", "v2"]);
+        dir
+    }
+
+    #[test]
+    fn read_source_rev_reads_historical_content() {
+        let dir = make_git_repo();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        // Working tree has v2; rev=v1 must surface the old content.
+        let opts = ReadOpts {
+            rev: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("file.txt", &roots, &opts);
+        assert!(out.contains("old content v1"), "got: {out}");
+        assert!(!out.contains("new content v2"), "got: {out}");
+        assert!(out.contains("file.txt@v1"), "header missing rev: {out}");
+
+        // Without rev, the working tree (v2) is read.
+        let live = read_source("file.txt", &roots, &ReadOpts::default());
+        assert!(live.contains("new content v2"), "got: {live}");
+    }
+
+    #[test]
+    fn read_source_rev_pipeline_applies() {
+        let dir = make_git_repo();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let opts = ReadOpts {
+            rev: Some("v1".to_string()),
+            grep: Some("old".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("file.txt", &roots, &opts);
+        assert!(out.contains("old content v1"), "got: {out}");
+        assert!(out.contains("matches"), "grep header missing: {out}");
+    }
+
+    #[test]
+    fn read_source_rev_bad_rev_errors() {
+        let dir = make_git_repo();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let opts = ReadOpts {
+            rev: Some("no-such-rev".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("file.txt", &roots, &opts);
+        assert!(out.starts_with("Error"), "got: {out}");
+    }
+
+    #[test]
+    fn read_source_rev_bad_path_errors() {
+        let dir = make_git_repo();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let opts = ReadOpts {
+            rev: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("does_not_exist.txt", &roots, &opts);
+        assert!(out.starts_with("Error"), "got: {out}");
+    }
+
+    #[test]
+    fn read_source_rev_non_git_root_errors() {
+        // A plain (non-git) tempdir must be rejected with a clear message.
+        let dir = make_tree();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let opts = ReadOpts {
+            rev: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("hello.txt", &roots, &opts);
+        assert!(out.starts_with("Error"), "got: {out}");
+        assert!(out.contains("git"), "should mention git requirement: {out}");
+    }
+
+    #[test]
+    fn read_source_rev_blocks_traversal() {
+        let dir = make_git_repo();
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let opts = ReadOpts {
+            rev: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let out = read_source("../escape.txt", &roots, &opts);
+        assert!(out.starts_with("Error"), "got: {out}");
+        // Must be rejected by our lexical guard, not handed to git.
+        assert!(
+            !out.contains("@v1"),
+            "traversal path reached git show: {out}"
+        );
+    }
+
+    #[test]
+    fn is_safe_relative_path_guards() {
+        assert!(is_safe_relative_path("a/b.txt"));
+        assert!(is_safe_relative_path("./a.txt"));
+        assert!(!is_safe_relative_path("../a.txt"));
+        assert!(!is_safe_relative_path("a/../../b"));
+        assert!(!is_safe_relative_path("/etc/passwd"));
     }
 }

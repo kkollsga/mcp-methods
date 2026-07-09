@@ -231,6 +231,13 @@ pub struct ReadSourceArgs {
     /// Cap output size in characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chars: Option<usize>,
+    /// Read the file at this git revision (tag, branch, or commit SHA)
+    /// via `git show` instead of the working tree. Requires the active
+    /// source root to be a git repository. All other options
+    /// (`start_line`/`grep`/`max_chars`/…) apply to the historical
+    /// content unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -926,8 +933,12 @@ impl McpServer {
 
     #[tool(description = "Read a file from the configured source root(s). Pass \
                        `start_line`/`end_line` to slice, `grep` to filter to matching \
-                       lines, `max_chars` to cap output. Path traversal attempts are \
-                       rejected. Available only when source roots are configured.")]
+                       lines, `max_chars` to cap output. Pass `rev` (a tag, branch, or \
+                       commit SHA) to read the file's content at that git revision via \
+                       `git show` instead of the working tree — useful for comparing a \
+                       file across releases (requires a git repo source root). Path \
+                       traversal attempts are rejected. Available only when source roots \
+                       are configured.")]
     async fn read_source(
         &self,
         Parameters(args): Parameters<ReadSourceArgs>,
@@ -947,6 +958,7 @@ impl McpServer {
             grep_context: args.grep_context,
             max_matches: args.max_matches,
             max_chars: args.max_chars,
+            rev: args.rev,
         };
         let body = source::read_source(&args.file_path, &roots, &opts);
         let body = self.finish("read_source", &args_json, body);

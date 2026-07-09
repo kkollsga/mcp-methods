@@ -12,6 +12,7 @@ references_arguments:
   - read_source.grep
   - read_source.grep_context
   - read_source.max_chars
+  - read_source.rev
 auto_inject_hint: true
 ---
 
@@ -55,6 +56,22 @@ The `grep` argument filters to lines matching a regex *within the requested slic
 - `grep="impl Display", grep_context=5` → matches plus 5 lines on each side.
 
 Use this when the file is large and you only need the methodology-relevant parts (e.g. "show me every `impl Display` in this 2000-line file"). For one or two known line ranges, plain `start_line`/`end_line` is simpler.
+
+## Reading a past revision with `rev`
+
+When the source root is a git repository, `rev` reads the file's content
+at a tag, branch, or commit SHA via `git show <rev>:<path>` instead of the
+working tree:
+
+- `file_path="src/lib.rs", rev="v3.1.5"` → the file as it stood at tag `v3.1.5`.
+- `rev` composes with every other option — `start_line`/`end_line`, `grep`,
+  `max_chars` all apply to the historical content unchanged.
+- Use it to compare a file across releases (e.g. how a function changed
+  between two tags) without a manual `git checkout`.
+- The path is still traversal-protected, and a non-git root or a bad
+  rev/path returns a clear `Error: …` string. (Rev-scoped *search* across a
+  tree is not offered — `grep` operates on the working tree only; read a
+  known file at a rev instead.)
 
 ## Output sizing
 

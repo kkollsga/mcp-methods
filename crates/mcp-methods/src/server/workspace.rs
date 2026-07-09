@@ -475,8 +475,21 @@ impl Workspace {
         if !repo_path.exists() {
             fs::create_dir_all(repo_path.parent().unwrap()).ok();
             let url = format!("https://github.com/{name}.git");
+            // Treeless clone (`--filter=tree:0`): keeps the FULL commit
+            // history — so `git log -S` (pickaxe) and any rev walk work —
+            // while fetching tree/blob objects lazily on demand, keeping
+            // the initial transfer near a shallow clone's cost. `--tags`
+            // pulls all tags up front so tag-scoped rev reads
+            // (`read_source rev=v1.2.3`) resolve without a follow-up fetch.
+            // (Was `--depth 1`, which truncated history and broke pickaxe.)
             let out = Command::new("git")
-                .args(["clone", "--depth", "1", &url, repo_path.to_str().unwrap()])
+                .args([
+                    "clone",
+                    "--filter=tree:0",
+                    "--tags",
+                    &url,
+                    repo_path.to_str().unwrap(),
+                ])
                 .output()
                 .context("failed to spawn `git clone`")?;
             if !out.status.success() {
@@ -489,9 +502,13 @@ impl Workspace {
             return Ok(("cloned".to_string(), repo_path, sha));
         }
 
-        // Fetch + check head delta
+        // Fetch + check head delta. Plain `git fetch origin --tags` (no
+        // `--depth 1`) so the treeless clone stays history-complete and
+        // newly-pushed tags become available for rev-scoped reads; blobs
+        // are still fetched lazily. FETCH_HEAD records the remote's
+        // default-branch tip, so the SHA-gate below is unchanged.
         Command::new("git")
-            .args(["fetch", "--depth", "1", "origin"])
+            .args(["fetch", "origin", "--tags"])
             .current_dir(&repo_path)
             .output()
             .context("git fetch failed")?;
