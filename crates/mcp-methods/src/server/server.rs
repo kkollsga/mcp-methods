@@ -263,10 +263,12 @@ pub struct SetRootDirArgs {
     /// Absolute or relative path to bind as the new source root.
     pub path: String,
     /// Optionally load multiple git revisions of the new root into one
-    /// graph. An integer N loads the last N version-sorted release tags
-    /// plus HEAD; a list of strings uses those git revspecs (tags,
-    /// branches, or SHAs) verbatim. Requires the root to be a git repo.
-    /// Omit for the default single-revision (working tree) activation.
+    /// graph. An integer N loads the newest N stable release tags of the
+    /// repo's dominant tag family plus HEAD (prereleases like rc/dev and
+    /// unrelated tag families are skipped); a list of strings uses those
+    /// git revspecs (tags, branches, or SHAs) verbatim. Requires the root
+    /// to be a git repo. Omit for the default single-revision (working
+    /// tree) activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revs: Option<crate::server::workspace::RevsRequest>,
 }
@@ -288,11 +290,12 @@ pub struct RepoManagementArgs {
     #[serde(default)]
     pub force_rebuild: bool,
     /// Optionally load multiple git revisions of the repo into one graph.
-    /// An integer N loads the last N version-sorted release tags plus
-    /// HEAD; a list of strings uses those git revspecs (tags, branches,
-    /// or SHAs) verbatim. Omit for the default single-revision (HEAD)
-    /// activation. A revs request always rebuilds (the SHA-skip gate
-    /// applies only to the plain path).
+    /// An integer N loads the newest N stable release tags of the repo's
+    /// dominant tag family plus HEAD (prereleases like rc/dev and
+    /// unrelated tag families are skipped); a list of strings uses those
+    /// git revspecs (tags, branches, or SHAs) verbatim. Omit for the
+    /// default single-revision (HEAD) activation. A revs request always
+    /// rebuilds (the SHA-skip gate applies only to the plain path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revs: Option<crate::server::workspace::RevsRequest>,
 }
@@ -533,8 +536,10 @@ impl McpServer {
              tools (`read_source`, `grep`, `list_source`), and fires the post-\
              activate hook so any downstream graph rebuilds against the new root. \
              Pass `revs` (an integer N, or a list of git revspecs) to load multiple \
-             revisions of the root into one graph — requires the root to be a git \
-             repo. Inventory persists across swaps; SHA-gating skips rebuilds when \
+             revisions of the root into one graph — N loads the newest N stable \
+             release tags of the dominant tag family plus HEAD (prereleases and \
+             unrelated tag families skipped); requires the root to be a git repo. \
+             Inventory persists across swaps; SHA-gating skips rebuilds when \
              the same root is re-bound with no content changes.",
             move |args: SetRootDirArgs| {
                 let p = std::path::PathBuf::from(&args.path);
@@ -1059,8 +1064,10 @@ impl McpServer {
                        repo (rebuild auto-skipped when HEAD hasn't moved since the last \
                        build; set `force_rebuild=true` to bypass). Pass `revs` (an \
                        integer N, or a list of git revspecs) to load multiple revisions \
-                       of the repo into one graph — N loads the last N release tags plus \
-                       HEAD; a revs request always rebuilds. Call with no \
+                       of the repo into one graph — N loads the newest N stable release \
+                       tags of the dominant tag family plus HEAD (prereleases and \
+                       unrelated tag families skipped); a revs request always rebuilds. \
+                       Call with no \
                        arguments to list all known repos with their last-access counts. \
                        Idle repos auto-sweep on each call (default 7 days, configurable \
                        via --stale-after-days)."

@@ -92,16 +92,24 @@ pub type ActivationSummaryHook = Arc<dyn Fn(&Path, &str) -> Option<String> + Sen
 pub type PostActivateRevsHook = Arc<dyn Fn(&Path, &str, &[String]) -> Result<()> + Send + Sync>;
 
 /// A revisions request carried by the activation tools. `Count(n)`
-/// resolves to the newest `n` version-sorted tags (plus `HEAD`);
-/// `List(revs)` is an explicit set of git revspecs used verbatim. The
-/// untagged deserialization maps a JSON integer to `Count` and a JSON
-/// array of strings to `List`, so the tool arg accepts `int | [str]`.
-/// Resolution happens at activate time — see [`Workspace::resolve_revs`].
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// resolves to the newest `n` **stable release** tags of the repo's
+/// dominant tag family (plus `HEAD`); `List(revs)` is an explicit set of
+/// git revspecs used verbatim. The untagged deserialization maps a JSON
+/// integer to `Count` and a JSON array of strings to `List`, so the tool
+/// arg accepts `int | [str]`. Resolution happens at activate time — see
+/// [`Workspace::resolve_revs`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum RevsRequest {
-    /// Last `n` release tags (`git tag --sort=-v:refname`, take `n`),
-    /// ordered oldest→newest with `HEAD` appended.
+    /// Last `n` **stable** release tags of the repo's dominant tag family,
+    /// ordered oldest→newest with `HEAD` appended. Tags are classified
+    /// into `(prefix, version, is_prerelease)` and grouped by prefix; the
+    /// family with the most stable tags wins, so on a repo with several
+    /// tag families (e.g. `apache-arrow-*`, `go/v*`, `r-*`) the release
+    /// line is chosen, not an unrelated package family. Prereleases (rc,
+    /// alpha, beta, dev, pre, preview) and non-version tags (e.g.
+    /// `r-universe-release`) are excluded. See [`Workspace::resolve_revs`]
+    /// for the full selection + fallback semantics.
     Count(usize),
     /// Explicit git revspecs (tags, branches, or SHAs), used as given.
     List(Vec<String>),
@@ -584,12 +592,21 @@ impl Workspace {
     /// Resolve a [`RevsRequest`] against the git repo at `repo_path` into
     /// a concrete, ordered list of git revspecs.
     ///
-    /// - `Count(n)`: the newest `n` tags by version sort
-    ///   (`git tag --sort=-v:refname`, take `n`), **reversed to
-    ///   oldest→newest**, with `HEAD` appended as the final (newest) rev.
-    ///   Errors if the repo has no tags at all (nothing to resolve).
-    ///   Fewer than `n` tags is not an error — all available tags are
-    ///   used.
+    /// - `Count(n)`: the newest `n` **stable release** tags of the repo's
+    ///   dominant tag family, **oldest→newest**, with `HEAD` appended as
+    ///   the final (newest) rev. Selection (see [`select_family_tags`]):
+    ///   every tag is classified into `(prefix, version, is_prerelease)`
+    ///   by stripping a trailing version component; tags with no version
+    ///   component (e.g. `r-universe-release`) are excluded. Tags are
+    ///   grouped by prefix and the family with the most **stable**
+    ///   (non-prerelease) tags is chosen; within it the newest `n` stable
+    ///   tags (version-sorted) are taken. Prerelease markers (rc, alpha,
+    ///   beta, dev, pre, preview — case-insensitive) never count as
+    ///   releases. Fallback chain for degenerate repos: if the winning
+    ///   family has no stable tags its prereleases are used; if no tag is
+    ///   version-like at all, the raw `git tag --sort=-v:refname` top-`n`
+    ///   is used. Errors only if the repo has no tags whatsoever. Fewer
+    ///   than `n` matching tags is not an error — all available are used.
     /// - `List(revs)`: each revspec is validated with
     ///   `git rev-parse --verify <rev>^{commit}` and used verbatim (no
     ///   sort, no `HEAD` appended). Errors on the first unknown rev.
@@ -597,7 +614,7 @@ impl Workspace {
     /// A non-git `repo_path` surfaces as the `git tag` / `git rev-parse`
     /// failure with a clear message.
     fn resolve_revs(&self, repo_path: &Path, req: &RevsRequest) -> Result<Vec<String>> {
-        match req {
+        let resolved = match req {
             RevsRequest::Count(n) => {
                 let out = Command::new("git")
                     .args(["tag", "--sort=-v:refname"])
@@ -622,13 +639,18 @@ impl Workspace {
                         repo_path.display()
                     );
                 }
-                // Newest `n` (version-sorted desc), reversed to
-                // oldest→newest, then HEAD last so a multi-rev builder
-                // merges with HEAD's signature winning.
-                let mut chosen: Vec<String> = tags.into_iter().take(*n).collect();
-                chosen.reverse();
+                // Classify + pick the dominant release family's newest `n`
+                // stable tags (oldest→newest). Falls back to the raw
+                // version-sorted top-`n` when no tag is version-like.
+                let mut chosen = select_family_tags(&tags, *n).unwrap_or_else(|| {
+                    let mut raw: Vec<String> = tags.into_iter().take(*n).collect();
+                    raw.reverse();
+                    raw
+                });
+                // HEAD last so a multi-rev builder merges oldest→newest
+                // with HEAD's signature winning.
                 chosen.push("HEAD".to_string());
-                Ok(chosen)
+                chosen
             }
             RevsRequest::List(revs) => {
                 if revs.is_empty() {
@@ -649,9 +671,10 @@ impl Workspace {
                         anyhow::bail!("revision '{r}' does not exist in '{}'", repo_path.display());
                     }
                 }
-                Ok(revs.clone())
+                revs.clone()
             }
-        }
+        };
+        Ok(resolved)
     }
 
     /// Activate a repo: clone if needed, fast-forward, fire post-activate hook.
@@ -1028,6 +1051,154 @@ impl Workspace {
         self.activate(&synthetic, false, revs)
             .unwrap_or_else(|e| format!("set_root_dir failed: {e}"))
     }
+}
+
+/// Prerelease markers recognised in a tag's trailing suffix
+/// (case-insensitive, with an optional `-`/`.`/`_` separator). A tag
+/// whose version is followed by one of these is never treated as a
+/// stable release.
+const PRERELEASE_MARKERS: &[&str] = &["rc", "alpha", "beta", "dev", "pre", "preview"];
+
+/// A git tag decomposed into its release family `prefix`, numeric
+/// `version` components, and whether it carries a prerelease marker.
+/// Produced by [`classify_tag`]; consumed by [`select_family_tags`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifiedTag {
+    raw: String,
+    prefix: String,
+    version: Vec<u64>,
+    is_prerelease: bool,
+}
+
+/// Classify a single tag into `(prefix, version, is_prerelease)` by
+/// locating its trailing version component.
+///
+/// The version is the *first* `DIGITS(.DIGITS)*` run whose remainder is
+/// empty or a recognised prerelease suffix; everything before it is the
+/// family `prefix`. Taking the first *cleanly-parsing* run resolves both
+/// tricky shapes: `arrow2-0.17.0` skips the `2` in `arrow2` (its
+/// remainder `-0.17.0` isn't a recognised suffix, so that run is
+/// rejected) and lands on `0.17.0`; while `v3.0.0-rc1` stops at `3.0.0`
+/// (with `-rc1` recognised as a prerelease) rather than mistaking the
+/// trailing `1` of `rc1` for a version. Returns `None` when the tag has
+/// no version-like component at all (e.g. `r-universe-release`), so such
+/// tags are excluded from family selection.
+fn classify_tag(tag: &str) -> Option<ClassifiedTag> {
+    let bytes = tag.as_bytes();
+    for i in 0..bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            continue;
+        }
+        // Only consider the *start* of a digit run as a version start.
+        if i > 0 && bytes[i - 1].is_ascii_digit() {
+            continue;
+        }
+        if let Some((version, is_prerelease)) = parse_version_at(&tag[i..]) {
+            return Some(ClassifiedTag {
+                raw: tag.to_string(),
+                prefix: tag[..i].to_string(),
+                version,
+                is_prerelease,
+            });
+        }
+    }
+    None
+}
+
+/// Parse `s` as `DIGITS(.DIGITS)*` optionally followed by a recognised
+/// prerelease suffix. Returns the numeric components and whether a
+/// prerelease marker follows. `None` if `s` doesn't start with a digit,
+/// or carries an *unrecognised* trailing suffix (so the caller rejects
+/// this candidate start and tries an earlier digit run).
+fn parse_version_at(s: &str) -> Option<(Vec<u64>, bool)> {
+    let bytes = s.as_bytes();
+    let mut nums: Vec<u64> = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx == start {
+            return None; // expected digits (leading, or after a '.')
+        }
+        nums.push(s[start..idx].parse().ok()?);
+        // Continue only when a '.' is followed by another digit.
+        if idx + 1 < bytes.len() && bytes[idx] == b'.' && bytes[idx + 1].is_ascii_digit() {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    let rest = &s[idx..];
+    if rest.is_empty() {
+        return Some((nums, false));
+    }
+    // A single optional separator, then a recognised prerelease marker.
+    let after_sep = rest
+        .strip_prefix(|c| c == '-' || c == '.' || c == '_')
+        .unwrap_or(rest);
+    let lower = after_sep.to_ascii_lowercase();
+    if PRERELEASE_MARKERS.iter().any(|m| lower.starts_with(m)) {
+        Some((nums, true))
+    } else {
+        None
+    }
+}
+
+/// From a repo's tag list, choose the dominant **release family** and
+/// return its newest `n` tags **oldest→newest** (HEAD is appended by the
+/// caller, not here). Returns `None` when no tag is version-like, so the
+/// caller can fall back to the raw version-sorted top-`n`.
+///
+/// Tags are classified ([`classify_tag`]) and grouped by prefix. The
+/// family with the most **stable** (non-prerelease) tags wins; if no
+/// family has any stable tag, the family with the most tags overall wins
+/// and its prereleases are used. Within the winning family the newest
+/// `n` tags in the applicable pool (stable if any exist, else
+/// prerelease) are taken by descending version, then reversed to
+/// oldest→newest. Deterministic: grouping iterates prefixes in sorted
+/// order and the version/`raw` sort is total, so a given tag set always
+/// resolves to the same list. Family ties are broken toward the
+/// lexicographically-greatest prefix.
+fn select_family_tags(tags: &[String], n: usize) -> Option<Vec<String>> {
+    let classified: Vec<ClassifiedTag> = tags.iter().filter_map(|t| classify_tag(t)).collect();
+    if classified.is_empty() {
+        return None;
+    }
+    // Group by family prefix (BTreeMap → deterministic prefix order).
+    let mut families: BTreeMap<String, Vec<&ClassifiedTag>> = BTreeMap::new();
+    for c in &classified {
+        families.entry(c.prefix.clone()).or_default().push(c);
+    }
+    let stable_count = |v: &Vec<&ClassifiedTag>| v.iter().filter(|c| !c.is_prerelease).count();
+    let any_stable = families.values().any(|v| stable_count(v) > 0);
+    // Prefer the family with the most stable tags; when nothing is
+    // stable anywhere, prefer the family with the most tags overall.
+    // `max_by` returns the last maximum, and BTreeMap yields ascending
+    // prefixes, so ties resolve to the greatest prefix — deterministic.
+    let chosen = families.values().max_by(|a, b| {
+        if any_stable {
+            stable_count(a).cmp(&stable_count(b))
+        } else {
+            a.len().cmp(&b.len())
+        }
+    })?;
+    let mut pool: Vec<&ClassifiedTag> = if any_stable {
+        chosen
+            .iter()
+            .copied()
+            .filter(|c| !c.is_prerelease)
+            .collect()
+    } else {
+        chosen.to_vec()
+    };
+    // Newest first: descending version, then descending raw for a total,
+    // stable order on identical versions.
+    pool.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| b.raw.cmp(&a.raw)));
+    let mut newest: Vec<String> = pool.into_iter().take(n).map(|c| c.raw.clone()).collect();
+    newest.reverse(); // oldest→newest
+    Some(newest)
 }
 
 /// Synthesise a stable "repo name" for a local workspace from its path.
@@ -1722,6 +1893,138 @@ mod tests {
             assert!(git(&["tag", tag]).status.success(), "git tag {tag} failed");
         }
         Some((dir, root))
+    }
+
+    // ---- tag classification (pure, no git) --------------------------
+
+    #[test]
+    fn classify_tag_extracts_prefix_version_prerelease() {
+        let c = classify_tag("apache-arrow-25.0.0").unwrap();
+        assert_eq!(c.prefix, "apache-arrow-");
+        assert_eq!(c.version, vec![25, 0, 0]);
+        assert!(!c.is_prerelease);
+
+        // Prerelease markers with various separators, case-insensitive.
+        for t in [
+            "apache-arrow-25.0.0.dev",
+            "apache-arrow-25.0.0-rc1",
+            "apache-arrow-25.0.0-RC0",
+            "v1.2.3-beta2",
+            "v1.2.3_alpha",
+            "v2.0.0-preview",
+        ] {
+            assert!(
+                classify_tag(t).unwrap().is_prerelease,
+                "{t} should be prerelease"
+            );
+        }
+
+        // Distinct families keyed on prefix.
+        assert_eq!(classify_tag("go/v18.0.0").unwrap().prefix, "go/v");
+        assert_eq!(classify_tag("r-15.0.1").unwrap().prefix, "r-");
+        assert_eq!(classify_tag("v1.2.3").unwrap().prefix, "v");
+
+        // Last digit run wins: the `2` in `arrow2` is not the version.
+        let c = classify_tag("arrow2-0.17.0").unwrap();
+        assert_eq!(c.prefix, "arrow2-");
+        assert_eq!(c.version, vec![0, 17, 0]);
+    }
+
+    #[test]
+    fn classify_tag_excludes_non_version_tags() {
+        assert_eq!(classify_tag("r-universe-release"), None);
+        assert_eq!(classify_tag("latest"), None);
+        assert_eq!(classify_tag("nightly"), None);
+        // A version followed by an *unrecognised* suffix is not version-like.
+        assert_eq!(classify_tag("v1.2.3-foobar"), None);
+    }
+
+    #[test]
+    fn select_family_tags_picks_dominant_release_family_skipping_prereleases() {
+        // Mirrors the apache/arrow shape: a large `apache-arrow-*` release
+        // family (with newest entries being prereleases), plus unrelated
+        // `r-*` / `go/v*` families and a rolling non-version pointer.
+        let tags: Vec<String> = [
+            "apache-arrow-22.0.0",
+            "apache-arrow-23.0.0",
+            "apache-arrow-24.0.0",
+            "apache-arrow-25.0.0-rc0",
+            "apache-arrow-25.0.0-rc1",
+            "apache-arrow-25.0.0.dev",
+            "go/v18.0.0",
+            "r-15.0.1",
+            "r-16.1.0",
+            "r-universe-release",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Newest 2 STABLE of the dominant (apache-arrow-) family,
+        // oldest→newest; the 25.0.0 prereleases and r-*/go/v* are excluded.
+        let got = select_family_tags(&tags, 2).unwrap();
+        assert_eq!(got, vec!["apache-arrow-23.0.0", "apache-arrow-24.0.0"]);
+    }
+
+    #[test]
+    fn select_family_tags_fewer_stable_than_requested_uses_all_stable() {
+        let tags: Vec<String> = ["v1.0.0", "v2.0.0", "v3.0.0-rc1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Only two stable; the rc is skipped even though it's newest.
+        let got = select_family_tags(&tags, 5).unwrap();
+        assert_eq!(got, vec!["v1.0.0", "v2.0.0"]);
+    }
+
+    #[test]
+    fn select_family_tags_prerelease_only_family_falls_back_to_prereleases() {
+        let tags: Vec<String> = ["v1.0.0-rc1", "v1.0.0-rc2", "v0.9.0-beta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // No stable tag anywhere → newest prereleases of the family.
+        let got = select_family_tags(&tags, 2).unwrap();
+        assert_eq!(got, vec!["v1.0.0-rc1", "v1.0.0-rc2"]);
+    }
+
+    #[test]
+    fn select_family_tags_no_version_like_tags_returns_none() {
+        let tags: Vec<String> = ["latest", "nightly", "stable"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(select_family_tags(&tags, 3), None);
+    }
+
+    // ---- resolve_revs Count (git-gated) -----------------------------
+
+    #[test]
+    fn resolve_revs_count_falls_back_to_raw_when_no_version_tags() {
+        // Non-version tags → the family selector yields None and
+        // resolve_revs preserves the raw version-sorted top-n behaviour.
+        let Some((_d, root)) = git_repo_with_tags(&["latest", "nightly", "stable"]) else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        let resolved = ws.resolve_revs(&root, &RevsRequest::Count(2)).unwrap();
+        // Exactly 2 tags + HEAD, HEAD last; contents come from raw top-n.
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.last().unwrap(), "HEAD");
+        assert!(resolved[..2].iter().all(|r| r != "HEAD"));
+    }
+
+    #[test]
+    fn resolve_revs_count_skips_prereleases_of_dominant_family() {
+        let Some((_d, root)) =
+            git_repo_with_tags(&["v1.0.0", "v2.0.0", "v3.0.0-rc1", "v3.0.0.dev"])
+        else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        let resolved = ws.resolve_revs(&root, &RevsRequest::Count(2)).unwrap();
+        // Newest 2 stable (v1.0.0, v2.0.0) oldest→newest, then HEAD —
+        // the v3 prereleases are excluded.
+        assert_eq!(resolved, vec!["v1.0.0", "v2.0.0", "HEAD"]);
     }
 
     #[test]
