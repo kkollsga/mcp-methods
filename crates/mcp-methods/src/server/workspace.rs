@@ -627,6 +627,14 @@ impl Workspace {
     ///   `git rev-parse --verify <rev>^{commit}` and used verbatim (no
     ///   sort, no `HEAD` appended). Errors on the first unknown rev.
     ///
+    /// The resolved list is deduplicated order-preserving on the label
+    /// string (first occurrence wins) before being returned — see
+    /// [`dedup_labels`] — so a downstream hook never receives duplicate
+    /// revspecs (e.g. `revs=["HEAD","HEAD"]`). Dedup is on the label, not
+    /// the resolved commit: two *different* revspecs that happen to point
+    /// at the same commit are deliberately both kept, because labels are
+    /// the graph-facing names a multi-rev builder attaches.
+    ///
     /// A non-git `repo_path` surfaces as the `git tag` / `git rev-parse`
     /// failure with a clear message.
     fn resolve_revs(&self, repo_path: &Path, req: &RevsRequest) -> Result<Vec<String>> {
@@ -690,7 +698,7 @@ impl Workspace {
                 revs.clone()
             }
         };
-        Ok(resolved)
+        Ok(dedup_labels(resolved))
     }
 
     /// Activate a repo: clone if needed, fast-forward, fire post-activate hook.
@@ -1117,6 +1125,19 @@ impl Workspace {
         self.activate(&synthetic, false, revs)
             .unwrap_or_else(|e| format!("set_root_dir failed: {e}"))
     }
+}
+
+/// Deduplicate a resolved revspec list order-preserving, first
+/// occurrence wins. Dedup is on the **label** string, not the resolved
+/// commit: a downstream multi-rev builder attaches each label as a
+/// graph-facing name, so two *different* labels pointing at the same
+/// commit are deliberately kept — only literal repeats (e.g. a `HEAD`
+/// that appears twice) collapse.
+fn dedup_labels(revs: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    revs.into_iter()
+        .filter(|r| seen.insert(r.clone()))
+        .collect()
 }
 
 /// Prerelease markers recognised in a tag's trailing suffix
@@ -2141,6 +2162,53 @@ mod tests {
             err.to_string().contains("no tags"),
             "expected a 'no tags' error, got: {err}"
         );
+    }
+
+    // ---- dedup of resolved revs -------------------------------------
+
+    #[test]
+    fn dedup_labels_is_order_preserving_first_wins() {
+        assert_eq!(
+            dedup_labels(vec!["HEAD".into(), "HEAD".into()]),
+            vec!["HEAD"]
+        );
+        assert_eq!(
+            dedup_labels(vec![
+                "v1".into(),
+                "v2".into(),
+                "v1".into(),
+                "v3".into(),
+                "v2".into(),
+            ]),
+            vec!["v1", "v2", "v3"]
+        );
+        // Empty and already-unique lists pass through untouched.
+        assert_eq!(dedup_labels(vec![]), Vec::<String>::new());
+        assert_eq!(dedup_labels(vec!["a".into(), "b".into()]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn resolve_revs_list_dedups_duplicate_revspecs() {
+        let Some((_d, root)) = git_repo_with_tags(&["v1.0.0"]) else {
+            return;
+        };
+        let ws = Workspace::open_local(root.clone(), None).unwrap();
+        // `["HEAD","HEAD"]` collapses to a single `HEAD`.
+        let got = ws
+            .resolve_revs(
+                &root,
+                &RevsRequest::List(vec!["HEAD".into(), "HEAD".into()]),
+            )
+            .unwrap();
+        assert_eq!(got, vec!["HEAD"]);
+        // First-occurrence order is preserved across mixed duplicates.
+        let got = ws
+            .resolve_revs(
+                &root,
+                &RevsRequest::List(vec!["v1.0.0".into(), "HEAD".into(), "v1.0.0".into()]),
+            )
+            .unwrap();
+        assert_eq!(got, vec!["v1.0.0", "HEAD"]);
     }
 
     #[test]
