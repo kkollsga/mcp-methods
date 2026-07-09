@@ -131,6 +131,20 @@ struct InventoryEntry {
     /// older inventory.json files (without this field) loading cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_built_sha: Option<String>,
+    /// The revisions request last **successfully** built for this repo,
+    /// when that build was a multi-rev (`revs=`) activation via the
+    /// revs-aware hook. `None` when the last build was a plain
+    /// (single-rev / HEAD) activation, or the revs hook was absent (the
+    /// plain-hook fallback loads HEAD only, so it records no request).
+    /// Two jobs: (1) the skip gate refuses to skip a plain re-activation
+    /// when the last build was multi-rev (else the tool would report a
+    /// plain activation while the live product is still the rev-set);
+    /// (2) `update=True` with no explicit `revs` re-applies this stored
+    /// request (re-resolving it so `HEAD`/`Count(n)` re-point). Additive:
+    /// `serde(default)` keeps older inventory.json files (without this
+    /// field) loading cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_built_revs: Option<RevsRequest>,
 }
 
 // `WorkspaceKind` is re-used from the manifest module so config and
@@ -392,6 +406,7 @@ impl Workspace {
                             access_count: 0,
                             stale: false,
                             last_built_sha: None,
+                            last_built_revs: None,
                         }
                     });
                 }
@@ -417,6 +432,7 @@ impl Workspace {
                 access_count: 0,
                 stale: false,
                 last_built_sha: None,
+                last_built_revs: None,
             });
         entry.last_accessed = now.clone();
         entry.access_count += 1;
@@ -702,6 +718,7 @@ impl Workspace {
         revs: Option<&RevsRequest>,
     ) -> Result<String> {
         let prev_built_sha = self.last_built_sha(name);
+        let prev_built_revs = self.last_built_revs(name);
         let (action, repo_path, head_sha) = self.clone_or_update(name)?;
         // Resolve any requested revs before mutating active state, so a
         // bad request (no tags / unknown rev) returns a clean error with
@@ -729,18 +746,25 @@ impl Workspace {
         // A→B→A swap correctly rebuilds A: after activate(B) the live
         // slot holds B, so re-binding A must not skip (see the
         // `active_built_name` field doc).
-        // Skip-gate / revs interaction (SIMPLEST CORRECT, by design): a
-        // revs-requested activation ALWAYS fires the hook — the SHA-skip
-        // gate only applies to the plain (no-revs) path. Rationale: the
-        // gate keys off HEAD's SHA alone, which says nothing about which
-        // *set* of revs a prior build loaded; a request for a different
-        // rev-set at the same HEAD must rebuild. Rev-aware skip logic
-        // (hashing the resolved rev-set into the inventory) is deliberately
-        // NOT built here — the tradeoff is that repeat `revs=` calls at an
-        // unchanged HEAD re-parse every rev, which is acceptable for an
+        // Skip-gate / revs interaction: a revs-requested activation ALWAYS
+        // fires the hook — the SHA-skip gate only applies to the plain
+        // (no-revs) path (`resolved_revs.is_none()`). Rationale: the gate
+        // keys off HEAD's SHA alone, which says nothing about which *set*
+        // of revs a prior build loaded, so a rev-set request at the same
+        // HEAD must rebuild. The tradeoff is that repeat `revs=` calls at
+        // an unchanged HEAD re-parse every rev — acceptable for an
         // explicit multi-rev request.
+        //
+        // The plain path additionally requires `prev_built_revs.is_none()`
+        // — a plain re-activation must NOT skip when the last build was
+        // multi-rev. Without this the tool would report a plain activation
+        // (and, downstream, the plain hook rebuilding a single-rev graph
+        // was bypassed) while the live product is still the rev-set union.
+        // A non-skip here means the plain hook runs and `record_built`
+        // clears the stored request — resetting to a genuine plain graph.
         let already_built = !force_rebuild
             && resolved_revs.is_none()
+            && prev_built_revs.is_none()
             && action == "current"
             && prev_built_sha.as_deref() == Some(head_sha.as_str())
             && is_active_built;
@@ -778,7 +802,12 @@ impl Workspace {
             true
         };
         if hook_ok {
-            self.record_built_sha(name, &head_sha);
+            // Record the request that actually built: `Some` only when the
+            // revs hook ran (a plain-hook fallback loads HEAD only, and a
+            // cheap-skip / no-hook path built nothing new), so a plain
+            // build clears any previously-stored request.
+            let built_revs = if revs_hook_ran { revs } else { None };
+            self.record_built(name, &head_sha, built_revs);
         }
         // Mark this name the currently-active built root only when the
         // hook actually ran this process (not on the cheap-skip path,
@@ -830,10 +859,16 @@ impl Workspace {
         })
     }
 
-    fn record_built_sha(&self, name: &str, sha: &str) {
+    /// Record the outcome of a successful build: the HEAD SHA plus the
+    /// revisions request that produced it (`Some` only for a multi-rev
+    /// build via the revs hook; `None` for a plain / HEAD-only build,
+    /// which *clears* any previously-stored request). Called only on hook
+    /// success — a failed build records nothing, so the next `update` retries.
+    fn record_built(&self, name: &str, sha: &str, revs: Option<&RevsRequest>) {
         let mut inv = self.load_inventory();
         if let Some(entry) = inv.get_mut(name) {
             entry.last_built_sha = Some(sha.to_string());
+            entry.last_built_revs = revs.cloned();
             let _ = self.save_inventory(&inv);
         }
     }
@@ -846,6 +881,16 @@ impl Workspace {
         self.load_inventory()
             .get(name)
             .and_then(|e| e.last_built_sha.clone())
+    }
+
+    /// Read the revisions request last successfully built for the named
+    /// repo — `Some` when the last build was multi-rev (`revs=`), `None`
+    /// for a plain / HEAD-only build or a never-built repo. Drives the
+    /// rev-set-aware skip gate and the `update`-preserves-rev-set path.
+    pub fn last_built_revs(&self, name: &str) -> Option<RevsRequest> {
+        self.load_inventory()
+            .get(name)
+            .and_then(|e| e.last_built_revs.clone())
     }
 
     fn delete(&self, name: &str) -> Result<String> {
@@ -970,8 +1015,18 @@ impl Workspace {
             // `activate`; `activate` itself consults the gate using the
             // force flag plus the SHA comparison.
             let _ = update; // explicit: update is implicit in local mode
+                            // A local `repo_management` call is always a refresh of the
+                            // bound root, so when no explicit `revs` are passed re-apply
+                            // the stored rev-set (if the last build was multi-rev) — a
+                            // bare refresh must not silently collapse a rev-set graph to
+                            // HEAD-only. Re-`set_root_dir` (which passes `revs` verbatim)
+                            // is the way to reset back to a plain single-rev build.
+            let effective = match revs {
+                Some(r) => Some(r.clone()),
+                None => self.last_built_revs(&active),
+            };
             return self
-                .activate(&active, force_rebuild, revs)
+                .activate(&active, force_rebuild, effective.as_ref())
                 .unwrap_or_else(|e| format!("rebuild failed: {e}"));
         }
 
@@ -995,9 +1050,20 @@ impl Workspace {
             let Some(active) = self.active_repo_name() else {
                 return prefix + "No active repository. Call repo_management('org/repo') first.";
             };
+            // `update=True` refreshes the active repo. When no explicit
+            // `revs` are passed, re-apply the stored rev-set (if the last
+            // build was multi-rev) so a bare `update` after HEAD moves
+            // re-resolves and rebuilds the SAME rev-set rather than
+            // collapsing it to a single-rev HEAD build. An explicit `revs`
+            // argument overrides; a plain re-activation (name path, not
+            // `update`) still resets to plain.
+            let effective = match revs {
+                Some(r) => Some(r.clone()),
+                None => self.last_built_revs(&active),
+            };
             return prefix
                 + &self
-                    .activate(&active, force_rebuild, revs)
+                    .activate(&active, force_rebuild, effective.as_ref())
                     .unwrap_or_else(|e| format!("update failed: {e}"));
         }
 
@@ -1453,7 +1519,7 @@ mod tests {
         // Seed an inventory entry directly (clone_or_update needs git).
         ws.bump_access("acme/widgets", "cloned");
         assert_eq!(ws.last_built_sha("acme/widgets"), None);
-        ws.record_built_sha("acme/widgets", "abc1234deadbeef");
+        ws.record_built("acme/widgets", "abc1234deadbeef", None);
         assert_eq!(
             ws.last_built_sha("acme/widgets").as_deref(),
             Some("abc1234deadbeef")
@@ -1499,19 +1565,19 @@ mod tests {
         // Build a workspace pointing at a tempdir with a fake repo dir,
         // then simulate consecutive activates. We can't drive clone_or_update
         // without git, so test the gating directly by tracking the SHA
-        // record-then-re-record case via Workspace::record_built_sha +
+        // record-then-re-record case via Workspace::record_built +
         // last_built_sha — the same predicate `activate` uses.
         let ws = Workspace::open(dir.path().to_path_buf(), 7, Some(hook)).unwrap();
         // Seed inventory entry + initial sha record.
         ws.bump_access("acme/widgets", "cloned");
-        ws.record_built_sha("acme/widgets", "sha_one");
+        ws.record_built("acme/widgets", "sha_one", None);
         assert_eq!(
             ws.last_built_sha("acme/widgets").as_deref(),
             Some("sha_one")
         );
         // Repeated record with the same value is idempotent (gating
         // logic uses last_built_sha as the source of truth).
-        ws.record_built_sha("acme/widgets", "sha_one");
+        ws.record_built("acme/widgets", "sha_one", None);
         assert_eq!(
             ws.last_built_sha("acme/widgets").as_deref(),
             Some("sha_one")
@@ -2196,5 +2262,189 @@ mod tests {
             !out.contains("revs:"),
             "must not report a rev-set when only the plain hook ran; got: {out}"
         );
+    }
+
+    // ---- rev-set-aware skip gate + stored-request persistence -------
+
+    /// Build a local workspace over a git repo with tags, wired with both
+    /// a plain and a revs hook, each incrementing a shared counter.
+    /// Returns (workspace, tempdir-guard, root, plain_calls, revs_calls).
+    #[allow(clippy::type_complexity)]
+    fn ws_with_both_hooks(
+        tags: &[&str],
+    ) -> Option<(
+        Workspace,
+        tempfile::TempDir,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (d, root) = git_repo_with_tags(tags)?;
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let revs_calls = Arc::new(AtomicUsize::new(0));
+        let pc = plain_calls.clone();
+        let plain: PostActivateHook = Arc::new(move |_p, _n| {
+            pc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let rc = revs_calls.clone();
+        let revs_hook: PostActivateRevsHook = Arc::new(move |_p, _n, _r| {
+            rc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let ws = Workspace::open_local(root.clone(), Some(plain))
+            .unwrap()
+            .with_post_activate_revs(revs_hook);
+        Some((ws, d, root, plain_calls, revs_calls))
+    }
+
+    #[test]
+    fn plain_activation_after_revs_build_rebuilds_plain() {
+        use std::sync::atomic::Ordering;
+        let Some((ws, _d, root, plain_calls, revs_calls)) =
+            ws_with_both_hooks(&["v1.0.0", "v2.0.0"])
+        else {
+            return;
+        };
+        // Multi-rev build first.
+        let _ = ws.set_root_dir(&root, Some(&RevsRequest::Count(2)));
+        assert_eq!(revs_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 0);
+        // A plain re-bind at the SAME (unchanged) root must NOT cheap-skip
+        // just because HEAD matches — the last build was multi-rev. It
+        // rebuilds plain, and the message claims no rev-set.
+        let out = ws.set_root_dir(&root, None);
+        assert_eq!(
+            plain_calls.load(Ordering::SeqCst),
+            1,
+            "plain re-activation after a revs build must fire the plain hook"
+        );
+        assert!(
+            !out.contains("build skipped"),
+            "must not skip a plain re-activation after a revs build; got: {out}"
+        );
+        assert!(
+            !out.contains("revs:"),
+            "plain rebuild must not claim revs; got: {out}"
+        );
+        // The stored request is cleared, so a further plain re-bind now
+        // cheap-skips (proves the reset took).
+        let out = ws.set_root_dir(&root, None);
+        assert_eq!(
+            plain_calls.load(Ordering::SeqCst),
+            1,
+            "second plain re-bind skips"
+        );
+        assert!(
+            out.contains("build skipped"),
+            "expected skip suffix; got: {out}"
+        );
+    }
+
+    #[test]
+    fn update_after_revs_build_reapplies_stored_revs() {
+        use std::sync::atomic::Ordering;
+        let Some((ws, _d, root, plain_calls, revs_calls)) =
+            ws_with_both_hooks(&["v1.0.0", "v2.0.0"])
+        else {
+            return;
+        };
+        // Multi-rev build first.
+        let _ = ws.set_root_dir(&root, Some(&RevsRequest::Count(2)));
+        assert_eq!(revs_calls.load(Ordering::SeqCst), 1);
+        // A bare `update` (no revs) must re-apply the stored rev-set —
+        // re-firing the revs hook, not collapsing to a plain HEAD build.
+        let out = ws.repo_management(None, false, true, false, None);
+        assert_eq!(
+            revs_calls.load(Ordering::SeqCst),
+            2,
+            "bare update must re-apply the stored rev-set"
+        );
+        assert_eq!(
+            plain_calls.load(Ordering::SeqCst),
+            0,
+            "bare update after a revs build must not fall to the plain hook"
+        );
+        assert!(
+            out.contains("revs:"),
+            "re-applied update should list the revs; got: {out}"
+        );
+    }
+
+    #[test]
+    fn revs_activation_after_plain_build_always_rebuilds() {
+        use std::sync::atomic::Ordering;
+        let Some((ws, _d, root, plain_calls, revs_calls)) =
+            ws_with_both_hooks(&["v1.0.0", "v2.0.0"])
+        else {
+            return;
+        };
+        // Plain build first.
+        let _ = ws.set_root_dir(&root, None);
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(revs_calls.load(Ordering::SeqCst), 0);
+        // A revs request at the unchanged HEAD still always fires the revs
+        // hook (revs requests are never skipped by the SHA gate).
+        let _ = ws.set_root_dir(&root, Some(&RevsRequest::Count(2)));
+        assert_eq!(
+            revs_calls.load(Ordering::SeqCst),
+            1,
+            "a revs request must always rebuild, even at an unchanged HEAD"
+        );
+    }
+
+    #[test]
+    fn last_built_revs_round_trips_and_clears_on_plain_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        ws.bump_access("acme/widgets", "cloned");
+        assert_eq!(ws.last_built_revs("acme/widgets"), None);
+        // Record a multi-rev build.
+        ws.record_built("acme/widgets", "sha1", Some(&RevsRequest::Count(3)));
+        assert_eq!(
+            ws.last_built_revs("acme/widgets"),
+            Some(RevsRequest::Count(3))
+        );
+        // Survives a reopen (persisted to inventory.json).
+        let ws2 = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        assert_eq!(
+            ws2.last_built_revs("acme/widgets"),
+            Some(RevsRequest::Count(3))
+        );
+        // A subsequent plain build clears the stored request.
+        ws2.record_built("acme/widgets", "sha2", None);
+        assert_eq!(ws2.last_built_revs("acme/widgets"), None);
+        // A List request round-trips too.
+        ws2.record_built(
+            "acme/widgets",
+            "sha3",
+            Some(&RevsRequest::List(vec!["v1".into(), "v2".into()])),
+        );
+        assert_eq!(
+            ws2.last_built_revs("acme/widgets"),
+            Some(RevsRequest::List(vec!["v1".into(), "v2".into()]))
+        );
+    }
+
+    #[test]
+    fn inventory_loads_legacy_entries_without_revs_field() {
+        // An entry carrying last_built_sha but no last_built_revs (an
+        // inventory written before the field existed) loads cleanly with
+        // the request defaulting to None.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+            "old/repo": {
+                "cloned_at": "2024-01-01T00:00:00",
+                "last_accessed": "2024-01-01T00:00:00",
+                "access_count": 5,
+                "stale": false,
+                "last_built_sha": "deadbeef"
+            }
+        }"#;
+        std::fs::write(dir.path().join("inventory.json"), legacy).unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        assert_eq!(ws.last_built_sha("old/repo").as_deref(), Some("deadbeef"));
+        assert_eq!(ws.last_built_revs("old/repo"), None);
     }
 }
