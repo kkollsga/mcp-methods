@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — multi-revision activation hardening
+
+Three defects in the 0.3.49 multi-revision workspace activation
+(`revs=`), all surfaced by live testing against a multi-family repo
+(apache/arrow: `apache-arrow-*`, `go/v*`, `r-*`, and a rolling
+`r-universe-release` pointer).
+
+- **`revs=N` now picks the dominant release family and skips
+  prereleases.** Resolution was `git tag --sort=-v:refname | head -n`,
+  which grabbed whichever tag family sorted highest — on arrow that was
+  the R-package family *including* a non-version rolling pointer, so
+  `revs=3` loaded a union of ~2-year-apart trees instead of the last
+  three releases. Tags are now classified into
+  `(prefix, version, is_prerelease)`, grouped by prefix; the family with
+  the most stable (non-prerelease) tags wins, and its newest `N` stable
+  tags (version-sorted, oldest→newest) are taken before `HEAD`.
+  Prerelease markers (rc, alpha, beta, dev, pre, preview) and
+  non-version tags (e.g. `r-universe-release`) are excluded. Fallbacks
+  keep degenerate repos working (prerelease-only family → its
+  prereleases; no version-like tags → the prior raw top-`n`).
+
+- **The build skip-gate and `update` path are now rev-set-aware.** A
+  bare `update=True` after a multi-rev build no longer collapses the
+  graph to HEAD-only — it re-applies (re-resolves) the stored rev-set;
+  and a plain re-activation after a multi-rev build no longer wrongly
+  cheap-skips while the live product is still the rev-set union. The
+  last-built request is persisted per repo in an additive inventory
+  field (older `inventory.json` files load unchanged).
+
+- **Resolved revs are deduplicated** order-preserving (first occurrence
+  wins), so `revs=["HEAD","HEAD"]` no longer hands duplicate revspecs to
+  the hook. Dedup is on the label, not the commit — distinct labels that
+  resolve to the same commit are intentionally kept.
+
 ## 0.3.49 — 2026-07-09
 
 ### Added — history-capable github-workspace clones
