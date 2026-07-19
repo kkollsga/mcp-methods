@@ -6,14 +6,24 @@ GitHub Actions does the heavy lifting. A release is just **a version
 bump merged to `main`** — the workflows build and publish to both
 crates.io and PyPI automatically.
 
-The trigger: any push to `main` that touches
-`crates/mcp-methods/Cargo.toml`. `publish_crates.yml` and
+The trigger: any push to `main` that touches the **root `Cargo.toml`**
+(the single-source `[workspace.package].version`; both workflows are
+scoped to `paths: ['Cargo.toml']`). `publish_crates.yml` and
 `build_wheels.yml` each re-read the version, skip if it's already live
 on the registry (`should_publish` check), and otherwise publish after
 CI passes (`ci-gate`). Publishes are **immutable** — a version, once on
 crates.io/PyPI, can never be overwritten or unpublished. There is no
 branch guard on the workflows, so the bump must only land on the ref
 you intend to release from.
+
+**Failed-CI retry gap**: because the publish triggers are
+path-scoped to `Cargo.toml`, a version-bump push that fails CI and is
+then fixed by a commit touching only `.rs`/`.py` files re-runs CI but
+*not* publish — the version silently stays unpublished. Both workflows
+support `workflow_dispatch`; fire them manually from the Actions tab
+(or `gh workflow run publish_crates.yml` / `build_wheels.yml`) after
+the fix goes green. The `should_publish` check makes a manual dispatch
+safe to run at any time — it no-ops if the version is already live.
 
 ### Steps
 
