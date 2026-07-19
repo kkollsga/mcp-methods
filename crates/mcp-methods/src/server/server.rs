@@ -866,7 +866,7 @@ impl McpServer {
                                     Ok(a) => a,
                                     Err(e) => {
                                         return Ok(rmcp::model::CallToolResult::success(vec![
-                                            rmcp::model::Content::text(format!(
+                                            rmcp::model::ContentBlock::text(format!(
                                                 "invalid arguments: {e}"
                                             )),
                                         ]));
@@ -893,7 +893,7 @@ impl McpServer {
                             None => body,
                         };
                         Ok(rmcp::model::CallToolResult::success(vec![
-                            rmcp::model::Content::text(body),
+                            rmcp::model::ContentBlock::text(body),
                         ]))
                     })
                 },
@@ -950,7 +950,7 @@ impl McpServer {
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
         let body = args.message.unwrap_or_else(|| "pong".to_string());
         let body = self.finish("ping", &args_json, body);
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(description = "Read a file from the configured source root(s). Pass \
@@ -967,7 +967,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let roots = self.current_source_roots();
         if roots.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Cannot read source: no active source root. Configure source_root in your manifest \
                  or activate one (e.g. via repo_management in workspace mode).",
             )]));
@@ -984,7 +984,7 @@ impl McpServer {
         };
         let body = source::read_source(&args.file_path, &roots, &opts);
         let body = self.finish("read_source", &args_json, body);
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -1000,7 +1000,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let roots = self.current_source_roots();
         if roots.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Cannot grep: no active source root. Configure source_root in your manifest \
                  or activate one (e.g. via repo_management in workspace mode).",
             )]));
@@ -1014,7 +1014,7 @@ impl McpServer {
         };
         let body = source::grep(&roots, &args.pattern, &opts);
         let body = self.finish("grep", &args_json, body);
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -1030,7 +1030,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let roots = self.current_source_roots();
         if roots.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Cannot list source: no active source root. Configure source_root in your \
                  manifest or activate one (e.g. via repo_management in workspace mode).",
             )]));
@@ -1039,7 +1039,7 @@ impl McpServer {
         let target = match resolve_dir_under_roots(&args.path, &roots) {
             Some(p) => p,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Error: path '{}' resolves outside the configured source roots.",
                     args.path
                 ))]));
@@ -1053,7 +1053,7 @@ impl McpServer {
         };
         let body = source::list_source(&target, &primary, &opts);
         let body = self.finish("list_source", &args_json, body);
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -1088,7 +1088,7 @@ impl McpServer {
             None => "repo_management requires --workspace mode.".to_string(),
         };
         let body = self.finish("repo_management", &args_json, body);
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 }
 
@@ -1207,7 +1207,7 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
             let body = body.clone();
             Box::pin(async move {
                 Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    PromptMessageRole::Assistant,
+                    Role::Assistant,
                     body,
                 )]))
             })

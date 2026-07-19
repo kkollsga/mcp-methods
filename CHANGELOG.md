@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 — 2026-07-19
+
+### Changed — rmcp 2.2 (breaking: rmcp types in our public API)
+
+The rmcp dependency moves `^1.6` → `^2.2` in both `mcp-methods` and
+`mcp-server`, at kglite's request: they consume `McpServer`,
+`SourceRootsProvider`, and dynamic `ToolRoute` registration directly,
+so rmcp types flow through our public API — a consumer cannot select
+rmcp 2.x independently without splitting the MCP type graph. That
+same fact makes this a semver-minor cut (0.4.0, not a patch): any
+downstream crate naming those types must move its own rmcp req in
+lockstep.
+
+rmcp 2.x aligns the model types with the MCP 2025-11-25 spec. The
+migration surface in our code was small: `Content::text(…)` →
+`ContentBlock::text(…)` (the `Annotated`/`RawContent` split collapsed
+into one `ContentBlock` union) and `PromptMessageRole` → `Role`. Wire
+behavior is unchanged — text content still serializes as
+`{"type":"text","text":…}`, and the server still negotiates older
+client protocol versions (verified by a live stdio
+initialize/tools-list/tools-call handshake). All public capabilities
+kglite relies on are preserved: manifest loading, `McpServer`,
+`SourceRootsProvider`, skill/source tools, and dynamic `ToolRoute`
+registration. The `mcp-server` → `mcp-methods` dep pin bumps `0.3` →
+`0.4` per the minor-release rule.
+
 ## 0.3.50 — 2026-07-10
 
 ### Fixed — multi-revision activation hardening

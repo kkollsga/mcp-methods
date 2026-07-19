@@ -13,9 +13,9 @@ resolver = "2"
 [workspace.package]
 # Single source of truth for the release version. All crates inherit via
 # `version.workspace = true`; a release is one edit here. The mcp-server →
-# mcp-methods dep pin is a minor-level req (`0.3`) so patch bumps never
+# mcp-methods dep pin is a minor-level req (`0.4`) so patch bumps never
 # touch it.
-version = "0.3.50"
+version = "0.4.0"
 edition = "2021"
 authors = ["Kristian Kollsgard"]
 license = "MIT"
