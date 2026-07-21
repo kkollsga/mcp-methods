@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.1 — 2026-07-21
+
+### Fixed — request-coherent workspace activation
+
+Concurrent `set_root_dir` calls could cross their identities: one response
+named root A while its separately generated graph summary — and the live
+downstream product — belonged to root B. The framework published source
+identity before building, invoked plain/revision/summary callbacks without a
+request identity, and let a slow older completion overwrite newer intent.
+Path and repo name alone could not distinguish same-root plain and
+multi-revision overlaps downstream.
+
+Workspace activation now has an additive request-scoped prepare/commit API:
+`ActivationTransactionHook` receives an `ActivationRequest` carrying a
+monotonic `ActivationId`, canonical path/name, and `ActivationBuild`
+(`Plain`, resolved `Revisions`, or `Reuse`), then returns a
+`PreparedActivation`. Expensive preparation stays off-lock; the prepared
+closure installs its product and generates the summary for that exact request
+only if its generation is still current. Stale preparations are dropped with
+an explicit superseded response. Active source path/name, in-process built
+identity/revisions, inventory receipt, and downstream publication commit under
+the same generation boundary; a current failure leaves the prior source and
+product active.
+
+The existing callback trio remains source-compatible and is serialized
+through summary generation, closing its cross-request response race while
+consumers migrate to the transaction hook for deferred atomic installation.
+Inventory read/modify/write cycles are serialized as well, preventing nearby
+activation completions from losing each other's per-repo receipts. Barrier-led
+regressions cover slow A / fast B, coherent per-request summaries, latest
+ownership, same-root plain/revision overlap, current and stale failures, and
+legacy callback serialization. This unblocks KGLite's generation-aware generic
+workspace-graph lifecycle migration.
+
 ## 0.4.0 — 2026-07-19
 
 ### Changed — rmcp 2.2 (breaking: rmcp types in our public API)

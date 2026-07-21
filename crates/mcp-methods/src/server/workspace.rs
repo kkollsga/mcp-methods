@@ -17,18 +17,20 @@
 //! tool can swap the root at runtime. Closes the `code_review_mcp_server`
 //! use case from the kglite wishlist.
 //!
-//! Both modes fire the same [`PostActivateHook`] so downstream binaries
-//! (kglite-mcp-server) layer their build step on top with one
-//! registration point, and both honour the same `last_built_sha`
-//! gating to skip pointless rebuilds.
+//! Both modes share one activation state machine. Existing consumers may use
+//! the serialized [`PostActivateHook`] callback family; concurrency-aware
+//! consumers use [`ActivationTransactionHook`] to prepare off-lock and publish
+//! only while their request generation is current. Both honour the same
+//! `last_built_sha` gating to skip pointless rebuilds.
 
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
@@ -59,8 +61,10 @@ fn validate_repo_name(name: &str) -> Result<()> {
 }
 
 /// Hook fired after a successful clone or update. Receives the absolute
-/// path to the cloned repo and the org/repo name. Errors are logged but
-/// don't abort the activation — the repo is still registered as active.
+/// path to the cloned repo and the org/repo name. Legacy callback activations
+/// are serialized through summary generation. Errors abort publication of the
+/// framework's new active source state; use [`ActivationTransactionHook`] when
+/// downstream product installation must also be deferred until commit.
 pub type PostActivateHook = Arc<dyn Fn(&Path, &str) -> Result<()> + Send + Sync>;
 
 /// Optional hook that returns a short agent-facing summary appended to
@@ -90,6 +94,113 @@ pub type ActivationSummaryHook = Arc<dyn Fn(&Path, &str) -> Option<String> + Sen
 /// plain hook runs instead (a single-rev / HEAD build) and the resolved
 /// list is not reported in the activation message.
 pub type PostActivateRevsHook = Arc<dyn Fn(&Path, &str, &[String]) -> Result<()> + Send + Sync>;
+
+/// Monotonically increasing identity for one workspace activation request.
+///
+/// Identities are allocated before an activation mutates active source state.
+/// A higher identity is therefore newer intent; a prepared activation may
+/// commit only while its identity is still the latest requested one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActivationId(u64);
+
+impl ActivationId {
+    /// The process-local monotonically increasing integer value.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ActivationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Work required for a request-scoped activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationBuild {
+    /// Build the root at its current working-tree / HEAD state.
+    Plain,
+    /// Build the already-resolved revisions in oldest-to-newest order.
+    Revisions(Vec<String>),
+    /// Reuse the product already live for this root; only refresh its summary.
+    Reuse,
+}
+
+/// Immutable input to an [`ActivationTransactionHook`].
+///
+/// The hook may perform expensive preparation before returning. It must not
+/// publish the prepared product itself; publication belongs in the
+/// [`PreparedActivation`] closure so the framework can discard stale work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationRequest {
+    id: ActivationId,
+    path: PathBuf,
+    name: String,
+    build: ActivationBuild,
+}
+
+impl ActivationRequest {
+    pub fn id(&self) -> ActivationId {
+        self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn build(&self) -> &ActivationBuild {
+        &self.build
+    }
+}
+
+/// Prepared downstream activation that has not yet been published.
+///
+/// The closure should atomically install the prepared product and return the
+/// summary describing that exact product. The framework runs it only when the
+/// request is still current, under the same generation boundary used to
+/// publish active source and built identity. Dropping this value must be safe:
+/// stale requests are superseded by dropping their prepared activation. The
+/// closure runs while workspace activation state is write-locked, so it must
+/// not call back into [`Workspace`] accessors; keep it to the downstream slot
+/// swap and request-scoped summary generation.
+pub struct PreparedActivation {
+    commit: Box<dyn FnOnce() -> Result<Option<String>> + Send + 'static>,
+}
+
+impl PreparedActivation {
+    pub fn new<F>(commit: F) -> Self
+    where
+        F: FnOnce() -> Result<Option<String>> + Send + 'static,
+    {
+        Self {
+            commit: Box::new(commit),
+        }
+    }
+
+    /// A prepared activation with no publication side effect.
+    pub fn summary(summary: Option<String>) -> Self {
+        Self::new(move || Ok(summary))
+    }
+
+    fn commit(self) -> Result<Option<String>> {
+        (self.commit)()
+    }
+}
+
+/// Request-scoped activation transaction.
+///
+/// Preparation runs concurrently and off-lock. The returned
+/// [`PreparedActivation`] is committed only if this request remains the latest
+/// intent; otherwise it is dropped and the caller receives a superseded
+/// outcome. This single callback replaces the legacy plain/revisions/summary
+/// trio for consumers that need coherent concurrent activation.
+pub type ActivationTransactionHook =
+    Arc<dyn Fn(&ActivationRequest) -> Result<PreparedActivation> + Send + Sync>;
 
 /// A revisions request carried by the activation tools. `Count(n)`
 /// resolves to the newest `n` **stable release** tags of the repo's
@@ -162,6 +273,14 @@ struct WorkspaceInner {
     workspace_dir: PathBuf,
     stale_after_days: u32,
     state: RwLock<WorkspaceState>,
+    /// Serializes inventory read-modify-write cycles across concurrent
+    /// activation preparations so per-repo SHA/revision receipts are not
+    /// lost when two requests finish close together.
+    inventory: Mutex<()>,
+    /// Serializes the legacy callback trio, whose signatures cannot carry a
+    /// request id or defer publication. Transaction-hook activations do not
+    /// take this lock: they prepare concurrently and commit by generation.
+    legacy_activation: Mutex<()>,
     post_activate: Option<PostActivateHook>,
     /// Optional summary hook (see [`ActivationSummaryHook`]). Set via
     /// [`Workspace::with_activation_summary`], `None` by default.
@@ -171,29 +290,33 @@ struct WorkspaceInner {
     /// in place of `post_activate` only when the activation carried a
     /// revs request AND this hook is set.
     post_activate_revs: Option<PostActivateRevsHook>,
+    /// Request-scoped prepare/commit contract. When configured it replaces
+    /// the legacy callback trio for activation work and summary generation.
+    activation_transaction: Option<ActivationTransactionHook>,
 }
 
 #[derive(Debug, Default)]
 struct WorkspaceState {
     active_repo_name: Option<String>,
     active_repo_path: Option<PathBuf>,
-    /// The name whose post-activate hook **most recently ran to
-    /// completion in this process** — i.e. the root whose product is
-    /// currently live. Deliberately NOT persisted: `last_built_sha`
-    /// records that the git repo is at the built SHA (a cross-process
-    /// fact), but the hook's *product* — the consumer's in-memory graph
-    /// — lives only for the process lifetime. On a fresh process this is
-    /// `None`, so the first activate re-fires the hook to rehydrate even
-    /// when the persisted SHA already matches HEAD.
-    ///
-    /// Crucially this is a **single** name, not a set of every name ever
-    /// hydrated. Many consumers keep a *single* active-graph slot that
-    /// each activate overwrites, so "hook fired for X at some point" does
-    /// NOT imply "X's product is still live". Only re-binding the
-    /// currently-active root is safe to skip; an A→B→A swap must rebuild
-    /// A because B overwrote the slot. Tracking one name makes the skip
-    /// gate correct for single-slot and per-name consumers alike.
-    active_built_name: Option<String>,
+    /// Last identity allocated under this state lock. Allocation and
+    /// publication both use the lock, so an older completion can never
+    /// overwrite a newer request's intent.
+    last_activation_id: u64,
+    latest_requested: Option<ActivationId>,
+    /// The product currently live in this process. Deliberately not
+    /// persisted: a new process must rehydrate its downstream product even
+    /// when inventory says the source SHA was built previously.
+    active_build: Option<ActiveBuildState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveBuildState {
+    activation_id: ActivationId,
+    name: String,
+    path: PathBuf,
+    head_sha: String,
+    resolved_revs: Option<Vec<String>>,
 }
 
 impl Workspace {
@@ -219,9 +342,12 @@ impl Workspace {
                 workspace_dir,
                 stale_after_days,
                 state: RwLock::new(WorkspaceState::default()),
+                inventory: Mutex::new(()),
+                legacy_activation: Mutex::new(()),
                 post_activate,
                 activation_summary: None,
                 post_activate_revs: None,
+                activation_transaction: None,
             }),
         };
         ws.reconcile_inventory()?;
@@ -263,9 +389,12 @@ impl Workspace {
                 workspace_dir: canon_root,
                 stale_after_days: u32::MAX, // sweeping is github-only
                 state: RwLock::new(state),
+                inventory: Mutex::new(()),
+                legacy_activation: Mutex::new(()),
                 post_activate,
                 activation_summary: None,
                 post_activate_revs: None,
+                activation_transaction: None,
             }),
         })
     }
@@ -297,6 +426,23 @@ impl Workspace {
             Some(inner) => inner.post_activate_revs = Some(hook),
             None => tracing::warn!(
                 "with_post_activate_revs called after the workspace was cloned; revs hook not attached"
+            ),
+        }
+        self
+    }
+
+    /// Attach the request-scoped activation prepare/commit contract.
+    ///
+    /// When set, this hook owns plain builds, revision-set builds, cheap-skip
+    /// summaries, and atomic product publication. It replaces the legacy
+    /// `post_activate`, `post_activate_revs`, and `activation_summary`
+    /// callbacks for activation calls. Configure it before cloning the
+    /// workspace into [`crate::server::ServerOptions`].
+    pub fn with_activation_transaction(mut self, hook: ActivationTransactionHook) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.activation_transaction = Some(hook),
+            None => tracing::warn!(
+                "with_activation_transaction called after the workspace was cloned; transaction not attached"
             ),
         }
         self
@@ -354,7 +500,7 @@ impl Workspace {
     // Inventory management
     // ------------------------------------------------------------------
 
-    fn load_inventory(&self) -> BTreeMap<String, InventoryEntry> {
+    fn load_inventory_unlocked(&self) -> BTreeMap<String, InventoryEntry> {
         let path = self.inventory_path();
         let Ok(text) = fs::read_to_string(&path) else {
             return BTreeMap::new();
@@ -362,15 +508,21 @@ impl Workspace {
         serde_json::from_str(&text).unwrap_or_default()
     }
 
-    fn save_inventory(&self, inv: &BTreeMap<String, InventoryEntry>) -> Result<()> {
+    fn save_inventory_unlocked(&self, inv: &BTreeMap<String, InventoryEntry>) -> Result<()> {
         let path = self.inventory_path();
         let body = serde_json::to_string_pretty(inv).context("failed to serialise inventory")?;
         fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
+    fn load_inventory(&self) -> BTreeMap<String, InventoryEntry> {
+        let _guard = self.inner.inventory.lock().unwrap();
+        self.load_inventory_unlocked()
+    }
+
     fn reconcile_inventory(&self) -> Result<()> {
-        let mut inv = self.load_inventory();
+        let _guard = self.inner.inventory.lock().unwrap();
+        let mut inv = self.load_inventory_unlocked();
         let mut on_disk: Vec<String> = Vec::new();
         if self.repos_dir().is_dir() {
             for org_entry in fs::read_dir(self.repos_dir())? {
@@ -417,12 +569,13 @@ impl Workspace {
                 entry.stale = true;
             }
         }
-        self.save_inventory(&inv)?;
+        self.save_inventory_unlocked(&inv)?;
         Ok(())
     }
 
     fn bump_access(&self, name: &str, action: &str) {
-        let mut inv = self.load_inventory();
+        let _guard = self.inner.inventory.lock().unwrap();
+        let mut inv = self.load_inventory_unlocked();
         let now = now_iso();
         let entry = inv
             .entry(name.to_string())
@@ -440,14 +593,15 @@ impl Workspace {
         if action == "cloned" || entry.cloned_at.is_empty() {
             entry.cloned_at = now;
         }
-        let _ = self.save_inventory(&inv);
+        let _ = self.save_inventory_unlocked(&inv);
     }
 
     fn mark_stale(&self, name: &str) {
-        let mut inv = self.load_inventory();
+        let _guard = self.inner.inventory.lock().unwrap();
+        let mut inv = self.load_inventory_unlocked();
         if let Some(entry) = inv.get_mut(name) {
             entry.stale = true;
-            let _ = self.save_inventory(&inv);
+            let _ = self.save_inventory_unlocked(&inv);
         }
     }
 
@@ -456,10 +610,11 @@ impl Workspace {
         if matches!(self.inner.kind, WorkspaceKind::Local) {
             return Vec::new();
         }
-        let mut inv = self.load_inventory();
+        let active = self.active_repo_name();
+        let _guard = self.inner.inventory.lock().unwrap();
+        let mut inv = self.load_inventory_unlocked();
         let cutoff = SystemTime::now()
             - std::time::Duration::from_secs(self.inner.stale_after_days as u64 * 86_400);
-        let active = self.active_repo_name();
         let mut swept: Vec<String> = Vec::new();
         for (rname, entry) in inv.iter_mut() {
             if entry.stale {
@@ -484,7 +639,7 @@ impl Workspace {
             swept.push(rname.clone());
         }
         if !swept.is_empty() {
-            let _ = self.save_inventory(&inv);
+            let _ = self.save_inventory_unlocked(&inv);
             self.prune_empty_org_dirs();
         }
         swept
@@ -521,24 +676,20 @@ impl Workspace {
     /// Local-mode short-circuits: there's nothing to clone or fetch.
     /// The "SHA" is a cheap content fingerprint (recursive walk of file
     /// mtimes + sizes) so the auto-rebuild gate still works.
-    fn clone_or_update(&self, name: &str) -> Result<(String, PathBuf, String)> {
+    fn clone_or_update(
+        &self,
+        name: &str,
+        requested_local_root: Option<&Path>,
+    ) -> Result<(String, PathBuf, String)> {
         if matches!(self.inner.kind, WorkspaceKind::Local) {
-            // Local mode tracks the *currently bound* root, not the
-            // immutable configured `workspace_dir`. `set_root_dir` writes
-            // the target to `active_repo_path` before calling `activate`;
-            // this read picks that up so the fingerprint and the
-            // post-activate hook fire against the new root, and so the
-            // subsequent `active_repo_path` write in `activate` doesn't
-            // clobber the just-set target back to `workspace_dir`. Falls
-            // back to `workspace_dir` only if state is unset, which
-            // shouldn't happen after `open_local` seeds it.
-            let root = self
-                .inner
-                .state
-                .read()
-                .unwrap()
-                .active_repo_path
-                .clone()
+            // `set_root_dir` passes its canonical target explicitly. This
+            // avoids publishing the requested path before its build commits,
+            // and prevents a concurrent activation from changing the path
+            // fingerprinted by this request. Refresh calls snapshot the
+            // currently committed root and pass it through the same argument.
+            let root = requested_local_root
+                .map(Path::to_path_buf)
+                .or_else(|| self.active_repo_path())
                 .unwrap_or_else(|| self.inner.workspace_dir.clone());
             let prev_sha = self.last_built_sha(name);
             let fingerprint = fingerprint_dir(&root);
@@ -701,7 +852,7 @@ impl Workspace {
         Ok(dedup_labels(resolved))
     }
 
-    /// Activate a repo: clone if needed, fast-forward, fire post-activate hook.
+    /// Activate a repo: prepare source, build, and publish if still current.
     ///
     /// Auto-rebuild gating: if `force_rebuild` is false AND no `revs` were
     /// requested AND the repo is already at the HEAD it was last built at
@@ -716,31 +867,62 @@ impl Workspace {
     /// the resolved revspecs; otherwise the plain hook runs (single-rev
     /// build) and the resolved list is not reported.
     ///
+    /// Each request receives an identity before active source state mutates.
+    /// A transaction hook prepares off-lock and returns the commit closure
+    /// that installs its product and generates its summary. If newer intent
+    /// arrives first, the closure is dropped and the response reports
+    /// supersession. On commit, source identity, in-process built identity,
+    /// and inventory receipt publish under one generation boundary.
+    ///
     /// On successful hook completion the new HEAD SHA is persisted to
-    /// `inventory.json[name].last_built_sha`. If the hook fails the SHA
-    /// is NOT recorded, so the next `update=True` re-attempts the build.
+    /// `inventory.json[name].last_built_sha`. If the hook fails the SHA and
+    /// active source state are not changed, so the next request retries.
     fn activate(
         &self,
         name: &str,
         force_rebuild: bool,
         revs: Option<&RevsRequest>,
+        requested_local_root: Option<&Path>,
     ) -> Result<String> {
+        // Legacy callbacks publish their downstream product inside the hook,
+        // so they cannot safely overlap. Keep that API coherent by
+        // serializing the complete request before allocating its identity.
+        // Transaction hooks prepare concurrently and therefore skip this
+        // lock; their stale work is discarded at the generation gate below.
+        let _legacy_guard = self
+            .inner
+            .activation_transaction
+            .is_none()
+            .then(|| self.inner.legacy_activation.lock().unwrap());
+        let activation_id = {
+            let mut state = self.inner.state.write().unwrap();
+            state.last_activation_id += 1;
+            let id = ActivationId(state.last_activation_id);
+            state.latest_requested = Some(id);
+            id
+        };
         let prev_built_sha = self.last_built_sha(name);
         let prev_built_revs = self.last_built_revs(name);
-        let (action, repo_path, head_sha) = self.clone_or_update(name)?;
+        let (action, repo_path, head_sha) = self
+            .clone_or_update(name, requested_local_root)
+            .with_context(|| {
+                format!("activation request {activation_id} source preparation failed")
+            })?;
         // Resolve any requested revs before mutating active state, so a
         // bad request (no tags / unknown rev) returns a clean error with
         // the repo cloned-but-not-activated rather than half-bound.
         let resolved_revs = match revs {
-            Some(req) => Some(self.resolve_revs(&repo_path, req)?),
+            Some(req) => Some(self.resolve_revs(&repo_path, req).with_context(|| {
+                format!("activation request {activation_id} revision resolution failed")
+            })?),
             None => None,
         };
         self.bump_access(name, &action);
         let is_active_built = {
-            let mut state = self.inner.state.write().unwrap();
-            state.active_repo_name = Some(name.to_string());
-            state.active_repo_path = Some(repo_path.clone());
-            state.active_built_name.as_deref() == Some(name)
+            let state = self.inner.state.read().unwrap();
+            state.active_build.as_ref().is_some_and(|built| {
+                built.name == name && built.path == repo_path && built.resolved_revs.is_none()
+            })
         };
 
         // The skip gate must be satisfied on BOTH axes: the git repo is
@@ -753,7 +935,7 @@ impl Workspace {
         // checks the *active* built name, not any name ever built, so an
         // A→B→A swap correctly rebuilds A: after activate(B) the live
         // slot holds B, so re-binding A must not skip (see the
-        // `active_built_name` field doc).
+        // `active_build` field doc).
         // Skip-gate / revs interaction: a revs-requested activation ALWAYS
         // fires the hook — the SHA-skip gate only applies to the plain
         // (no-revs) path (`resolved_revs.is_none()`). Rationale: the gate
@@ -776,64 +958,113 @@ impl Workspace {
             && action == "current"
             && prev_built_sha.as_deref() == Some(head_sha.as_str())
             && is_active_built;
-        let mut hook_skipped = false;
-        // Tracks whether the revs-aware hook actually ran (revs requested
-        // AND that hook set) — only then do we report the resolved list.
-        let mut revs_hook_ran = false;
-        let hook_ok = if already_built {
-            hook_skipped = true;
-            true
-        } else if let (Some(resolved), Some(revs_hook)) =
-            (resolved_revs.as_ref(), &self.inner.post_activate_revs)
-        {
-            revs_hook_ran = true;
-            match revs_hook(&repo_path, name, resolved) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("post-activate revs hook for {name} failed: {e}");
-                    false
-                }
-            }
-        } else if let Some(hook) = &self.inner.post_activate {
-            // No revs requested, or revs requested with no revs-hook set:
-            // fall back to the plain single-rev (HEAD) build.
-            match hook(&repo_path, name) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("post-activate hook for {name} failed: {e}");
-                    false
-                }
-            }
+        let uses_transaction = self.inner.activation_transaction.is_some();
+        let revision_build = !already_built
+            && resolved_revs.is_some()
+            && (uses_transaction || self.inner.post_activate_revs.is_some());
+        let build = if already_built {
+            ActivationBuild::Reuse
+        } else if revision_build {
+            ActivationBuild::Revisions(resolved_revs.clone().unwrap_or_default())
         } else {
-            // No hook configured — record the SHA so future calls can
-            // see "no work to do" without consulting an empty store.
-            true
+            ActivationBuild::Plain
         };
-        if hook_ok {
-            // Record the request that actually built: `Some` only when the
-            // revs hook ran (a plain-hook fallback loads HEAD only, and a
-            // cheap-skip / no-hook path built nothing new), so a plain
-            // build clears any previously-stored request.
-            let built_revs = if revs_hook_ran { revs } else { None };
-            self.record_built(name, &head_sha, built_revs);
-        }
-        // Mark this name the currently-active built root only when the
-        // hook actually ran this process (not on the cheap-skip path,
-        // where it is already the active built name). A no-op "no hook
-        // configured" activation also counts: there is no per-process
-        // product to lose, so a future same-root skip is safe. This
-        // *overwrites* any prior name — modelling that each activate
-        // replaces the live product — so the next swap back rebuilds.
-        if hook_ok && !hook_skipped {
-            self.inner.state.write().unwrap().active_built_name = Some(name.to_string());
-        }
+        let request = ActivationRequest {
+            id: activation_id,
+            path: repo_path.clone(),
+            name: name.to_string(),
+            build,
+        };
+
+        let prepared = if let Some(hook) = &self.inner.activation_transaction {
+            hook(&request)
+        } else {
+            // Compatibility path. The complete request is serialized by
+            // `_legacy_guard`, making the old build-then-summary sequence
+            // coherent even though those callbacks cannot carry an id.
+            let hook_result = match request.build() {
+                ActivationBuild::Reuse => Ok(()),
+                ActivationBuild::Revisions(resolved) => self
+                    .inner
+                    .post_activate_revs
+                    .as_ref()
+                    .map_or(Ok(()), |hook| hook(&repo_path, name, resolved)),
+                ActivationBuild::Plain => self
+                    .inner
+                    .post_activate
+                    .as_ref()
+                    .map_or(Ok(()), |hook| hook(&repo_path, name)),
+            };
+            hook_result.map(|()| {
+                let summary = self
+                    .inner
+                    .activation_summary
+                    .as_ref()
+                    .and_then(|hook| hook(&repo_path, name));
+                PreparedActivation::summary(summary)
+            })
+        };
+
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let latest = self.inner.state.read().unwrap().latest_requested;
+                if latest != Some(activation_id) {
+                    return Ok(format!(
+                        "Activation request {activation_id} for '{name}' was superseded by request {} before its failed build could publish.",
+                        latest.map_or_else(|| "unknown".to_string(), |id| id.to_string())
+                    ));
+                }
+                return Err(anyhow!(
+                    "activation request {activation_id} for '{name}' failed during preparation: {error}"
+                ));
+            }
+        };
+
+        // Generation commit point. While this write lock is held, no newer
+        // identity can be allocated. The downstream product, its request-
+        // scoped summary, source binding, and built identity therefore become
+        // visible as one ordered transaction.
+        let summary = {
+            let mut state = self.inner.state.write().unwrap();
+            if state.latest_requested != Some(activation_id) {
+                let superseding = state.latest_requested;
+                drop(state);
+                drop(prepared);
+                return Ok(format!(
+                    "Activation request {activation_id} for '{name}' was superseded by request {} before publication; its prepared build was discarded.",
+                    superseding.map_or_else(|| "unknown".to_string(), |id| id.to_string())
+                ));
+            }
+            let summary = prepared.commit().with_context(|| {
+                format!("activation request {activation_id} for '{name}' failed during commit")
+            })?;
+            if !matches!(request.build(), ActivationBuild::Reuse) {
+                let built_revs = revision_build.then_some(revs).flatten();
+                self.record_built(name, &head_sha, built_revs);
+            }
+            state.active_repo_name = Some(name.to_string());
+            state.active_repo_path = Some(repo_path.clone());
+            state.active_build = Some(ActiveBuildState {
+                activation_id,
+                name: name.to_string(),
+                path: repo_path.clone(),
+                head_sha: head_sha.clone(),
+                resolved_revs: match request.build() {
+                    ActivationBuild::Revisions(resolved) => Some(resolved.clone()),
+                    ActivationBuild::Plain | ActivationBuild::Reuse => None,
+                },
+            });
+            summary
+        };
+
         let verb = match action.as_str() {
             "cloned" => "Cloned",
             "updated" => "Updated",
             "current" => "Activated (already up to date)",
             other => other,
         };
-        let suffix = if hook_skipped {
+        let suffix = if already_built {
             " [build skipped: HEAD matches last-built SHA]"
         } else {
             ""
@@ -843,24 +1074,9 @@ impl Workspace {
         // exactly what got loaded. Only when the revs-hook actually ran
         // (revs requested AND hook set AND it succeeded) — a fallback to
         // the plain hook loads HEAD only, so claiming a rev-set would lie.
-        if revs_hook_ran && hook_ok {
-            if let Some(resolved) = &resolved_revs {
-                base.push_str(&format!("\nrevs: {}", resolved.join(", ")));
-            }
+        if let ActivationBuild::Revisions(resolved) = request.build() {
+            base.push_str(&format!("\nrevs: {}", resolved.join(", ")));
         }
-        // Append the consumer's opening-steer mini-map, if configured.
-        // Fired on any successful activation (fresh build or cheap-skip —
-        // in both cases the in-memory product is live this process); the
-        // hook recomputes the summary from that live state. Skipped only
-        // when the build hook itself failed.
-        let summary = if hook_ok {
-            self.inner
-                .activation_summary
-                .as_ref()
-                .and_then(|h| h(&repo_path, name))
-        } else {
-            None
-        };
         Ok(match summary {
             Some(s) if !s.is_empty() => format!("{base}\n\n{s}"),
             _ => base,
@@ -873,11 +1089,12 @@ impl Workspace {
     /// which *clears* any previously-stored request). Called only on hook
     /// success — a failed build records nothing, so the next `update` retries.
     fn record_built(&self, name: &str, sha: &str, revs: Option<&RevsRequest>) {
-        let mut inv = self.load_inventory();
+        let _guard = self.inner.inventory.lock().unwrap();
+        let mut inv = self.load_inventory_unlocked();
         if let Some(entry) = inv.get_mut(name) {
             entry.last_built_sha = Some(sha.to_string());
             entry.last_built_revs = revs.cloned();
-            let _ = self.save_inventory(&inv);
+            let _ = self.save_inventory_unlocked(&inv);
         }
     }
 
@@ -921,6 +1138,7 @@ impl Workspace {
         if state.active_repo_name.as_deref() == Some(name) {
             state.active_repo_name = None;
             state.active_repo_path = None;
+            state.active_build = None;
             return Ok(format!(
                 "Deleted {}. Active repo cleared.",
                 deleted.join(", ")
@@ -1033,8 +1251,14 @@ impl Workspace {
                 Some(r) => Some(r.clone()),
                 None => self.last_built_revs(&active),
             };
+            let active_root = self.active_repo_path();
             return self
-                .activate(&active, force_rebuild, effective.as_ref())
+                .activate(
+                    &active,
+                    force_rebuild,
+                    effective.as_ref(),
+                    active_root.as_deref(),
+                )
                 .unwrap_or_else(|e| format!("rebuild failed: {e}"));
         }
 
@@ -1071,7 +1295,7 @@ impl Workspace {
             };
             return prefix
                 + &self
-                    .activate(&active, force_rebuild, effective.as_ref())
+                    .activate(&active, force_rebuild, effective.as_ref(), None)
                     .unwrap_or_else(|e| format!("update failed: {e}"));
         }
 
@@ -1089,7 +1313,7 @@ impl Workspace {
         }
         prefix
             + &self
-                .activate(name, force_rebuild, revs)
+                .activate(name, force_rebuild, revs, None)
                 .unwrap_or_else(|e| format!("activate failed: {e}"))
     }
 
@@ -1114,15 +1338,10 @@ impl Workspace {
             Err(e) => return format!("canonicalize failed: {e}"),
         };
         let synthetic = synthesize_local_name(&canon);
-        {
-            let mut state = self.inner.state.write().unwrap();
-            state.active_repo_name = Some(synthetic.clone());
-            state.active_repo_path = Some(canon.clone());
-        }
         // Note: the WorkspaceInner.workspace_dir field is the path the
         // inventory is stored under. We keep the *original* one (from
         // open_local) so the inventory survives across root swaps.
-        self.activate(&synthetic, false, revs)
+        self.activate(&synthetic, false, revs, Some(&canon))
             .unwrap_or_else(|e| format!("set_root_dir failed: {e}"))
     }
 }
@@ -1943,6 +2162,330 @@ mod tests {
             out.contains("build skipped"),
             "expected skip suffix, got: {out}"
         );
+    }
+
+    #[test]
+    fn transaction_slow_a_fast_b_discards_stale_build_and_keeps_responses_coherent() {
+        use std::sync::Barrier;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Installed {
+            id: ActivationId,
+            path: PathBuf,
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("slow-a");
+        let b = root.path().join("fast-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"a").unwrap();
+        std::fs::write(b.join("b.txt"), b"b").unwrap();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+
+        let a_entered = Arc::new(Barrier::new(2));
+        let release_a = Arc::new(Barrier::new(2));
+        let installed: Arc<Mutex<Option<Installed>>> = Arc::new(Mutex::new(None));
+        let hook: ActivationTransactionHook = {
+            let a = a.clone();
+            let a_entered = a_entered.clone();
+            let release_a = release_a.clone();
+            let installed = installed.clone();
+            Arc::new(move |request| {
+                if request.path() == a {
+                    a_entered.wait();
+                    release_a.wait();
+                }
+                let product = Installed {
+                    id: request.id(),
+                    path: request.path().to_path_buf(),
+                };
+                let installed = installed.clone();
+                Ok(PreparedActivation::new(move || {
+                    *installed.lock().unwrap() = Some(product.clone());
+                    Ok(Some(format!(
+                        "product {} for {}",
+                        product.id,
+                        product.path.display()
+                    )))
+                }))
+            })
+        };
+        let ws = Workspace::open_local(a.clone(), None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let slow_ws = ws.clone();
+        let slow_a = a.clone();
+        let slow = std::thread::spawn(move || slow_ws.set_root_dir(&slow_a, None));
+        a_entered.wait();
+
+        let fast_ws = ws.clone();
+        let fast_b = b.clone();
+        let fast = std::thread::spawn(move || fast_ws.set_root_dir(&fast_b, None));
+        let fast_out = fast.join().unwrap();
+        release_a.wait();
+        let slow_out = slow.join().unwrap();
+
+        assert!(
+            fast_out.contains(&b.display().to_string())
+                && fast_out.contains("product 2")
+                && !fast_out.contains(&a.display().to_string()),
+            "fast request response must describe only its own committed product: {fast_out}"
+        );
+        assert!(
+            slow_out.contains("request 1")
+                && slow_out.contains("superseded by request 2")
+                && !slow_out.contains("product 1"),
+            "stale request must report supersession, not a false activation: {slow_out}"
+        );
+        assert_eq!(ws.active_repo_path(), Some(b.clone()));
+        assert_eq!(installed.lock().unwrap().as_ref().unwrap().path, b);
+        assert_eq!(
+            ws.inner
+                .state
+                .read()
+                .unwrap()
+                .active_build
+                .as_ref()
+                .unwrap()
+                .activation_id,
+            ActivationId(2),
+            "latest request must own the final framework state"
+        );
+    }
+
+    #[test]
+    fn legacy_callbacks_are_serialized_through_build_and_summary() {
+        use std::sync::Barrier;
+
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("slow-a");
+        let b = root.path().join("queued-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+        let a_entered = Arc::new(Barrier::new(2));
+        let release_a = Arc::new(Barrier::new(2));
+        let installed: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let hook: PostActivateHook = {
+            let a = a.clone();
+            let a_entered = a_entered.clone();
+            let release_a = release_a.clone();
+            let installed = installed.clone();
+            Arc::new(move |path, _name| {
+                if path == a {
+                    a_entered.wait();
+                    release_a.wait();
+                }
+                *installed.lock().unwrap() = Some(path.to_path_buf());
+                Ok(())
+            })
+        };
+        let summary: ActivationSummaryHook = {
+            let installed = installed.clone();
+            Arc::new(move |_path, _name| {
+                installed
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|path| format!("legacy product {}", path.display()))
+            })
+        };
+        let ws = Workspace::open_local(a.clone(), Some(hook))
+            .unwrap()
+            .with_activation_summary(summary);
+
+        let a_ws = ws.clone();
+        let a_root = a.clone();
+        let a_thread = std::thread::spawn(move || a_ws.set_root_dir(&a_root, None));
+        a_entered.wait();
+        let b_ws = ws.clone();
+        let b_root = b.clone();
+        let b_thread = std::thread::spawn(move || b_ws.set_root_dir(&b_root, None));
+        release_a.wait();
+        let a_out = a_thread.join().unwrap();
+        let b_out = b_thread.join().unwrap();
+
+        assert!(
+            a_out.contains(&format!("legacy product {}", a.display()))
+                && !a_out.contains(&format!("legacy product {}", b.display())),
+            "legacy A response crossed activation products: {a_out}"
+        );
+        assert!(
+            b_out.contains(&format!("legacy product {}", b.display()))
+                && !b_out.contains(&format!("legacy product {}", a.display())),
+            "legacy B response crossed activation products: {b_out}"
+        );
+        assert_eq!(ws.active_repo_path(), Some(b.clone()));
+        assert_eq!(*installed.lock().unwrap(), Some(b));
+    }
+
+    #[test]
+    fn transaction_same_root_plain_vs_revisions_is_generation_ordered() {
+        use std::sync::Barrier;
+
+        let Some((_dir, root)) = git_repo_with_tags(&["v1.0.0", "v2.0.0"]) else {
+            return;
+        };
+        let root = root.canonicalize().unwrap();
+        let plain_entered = Arc::new(Barrier::new(2));
+        let release_plain = Arc::new(Barrier::new(2));
+        let installed: Arc<Mutex<Option<(ActivationId, ActivationBuild)>>> =
+            Arc::new(Mutex::new(None));
+        let hook: ActivationTransactionHook = {
+            let plain_entered = plain_entered.clone();
+            let release_plain = release_plain.clone();
+            let installed = installed.clone();
+            Arc::new(move |request| {
+                if matches!(request.build(), ActivationBuild::Plain) {
+                    plain_entered.wait();
+                    release_plain.wait();
+                }
+                let id = request.id();
+                let build = request.build().clone();
+                let installed = installed.clone();
+                Ok(PreparedActivation::new(move || {
+                    *installed.lock().unwrap() = Some((id, build.clone()));
+                    Ok(Some(format!("installed request {id}: {build:?}")))
+                }))
+            })
+        };
+        let ws = Workspace::open_local(root.clone(), None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let plain_ws = ws.clone();
+        let plain_root = root.clone();
+        let plain = std::thread::spawn(move || plain_ws.set_root_dir(&plain_root, None));
+        plain_entered.wait();
+
+        let revs_ws = ws.clone();
+        let revs_root = root.clone();
+        let revs = std::thread::spawn(move || {
+            revs_ws.set_root_dir(&revs_root, Some(&RevsRequest::Count(2)))
+        });
+        let revs_out = revs.join().unwrap();
+        release_plain.wait();
+        let plain_out = plain.join().unwrap();
+
+        assert!(revs_out.contains("revs: v1.0.0, v2.0.0, HEAD"));
+        assert!(revs_out.contains("installed request 2: Revisions"));
+        assert!(plain_out.contains("superseded by request 2"));
+        let state = ws.inner.state.read().unwrap();
+        assert_eq!(state.active_repo_path.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            state
+                .active_build
+                .as_ref()
+                .and_then(|built| built.resolved_revs.clone()),
+            Some(vec!["v1.0.0".into(), "v2.0.0".into(), "HEAD".into()])
+        );
+        assert!(matches!(
+            installed.lock().unwrap().as_ref(),
+            Some((ActivationId(2), ActivationBuild::Revisions(_)))
+        ));
+    }
+
+    #[test]
+    fn transaction_current_failure_preserves_committed_source_and_product() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Installed(ActivationId, PathBuf);
+
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let broken = root.path().join("broken");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(good.join("good.txt"), b"good").unwrap();
+        std::fs::write(broken.join("broken.txt"), b"broken").unwrap();
+        let good = good.canonicalize().unwrap();
+        let broken = broken.canonicalize().unwrap();
+
+        let installed: Arc<Mutex<Option<Installed>>> = Arc::new(Mutex::new(None));
+        let hook: ActivationTransactionHook = {
+            let broken = broken.clone();
+            let installed = installed.clone();
+            Arc::new(move |request| {
+                if request.path() == broken {
+                    anyhow::bail!("builder rejected broken root");
+                }
+                let product = Installed(request.id(), request.path().to_path_buf());
+                let installed = installed.clone();
+                Ok(PreparedActivation::new(move || {
+                    *installed.lock().unwrap() = Some(product.clone());
+                    Ok(Some(format!("installed request {}", product.0)))
+                }))
+            })
+        };
+        let ws = Workspace::open_local(good.clone(), None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let good_out = ws.set_root_dir(&good, None);
+        assert!(good_out.contains("installed request 1"));
+        let broken_out = ws.set_root_dir(&broken, None);
+        assert!(
+            broken_out.contains("request 2")
+                && broken_out.contains("failed during preparation")
+                && broken_out.contains("builder rejected broken root"),
+            "failure must be explicit and request-scoped: {broken_out}"
+        );
+        assert_eq!(ws.active_repo_path(), Some(good.clone()));
+        assert_eq!(installed.lock().unwrap().as_ref().unwrap().1, good);
+    }
+
+    #[test]
+    fn transaction_stale_failure_reports_superseded_not_current_failure() {
+        use std::sync::Barrier;
+
+        let root = tempfile::tempdir().unwrap();
+        let slow = root.path().join("slow-failure");
+        let fast = root.path().join("fast-success");
+        std::fs::create_dir_all(&slow).unwrap();
+        std::fs::create_dir_all(&fast).unwrap();
+        let slow = slow.canonicalize().unwrap();
+        let fast = fast.canonicalize().unwrap();
+        let slow_entered = Arc::new(Barrier::new(2));
+        let release_slow = Arc::new(Barrier::new(2));
+        let hook: ActivationTransactionHook = {
+            let slow = slow.clone();
+            let slow_entered = slow_entered.clone();
+            let release_slow = release_slow.clone();
+            Arc::new(move |request| {
+                if request.path() == slow {
+                    slow_entered.wait();
+                    release_slow.wait();
+                    anyhow::bail!("late preparation failure");
+                }
+                Ok(PreparedActivation::summary(Some(format!(
+                    "committed request {}",
+                    request.id()
+                ))))
+            })
+        };
+        let ws = Workspace::open_local(slow.clone(), None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let slow_ws = ws.clone();
+        let slow_root = slow.clone();
+        let slow_thread = std::thread::spawn(move || slow_ws.set_root_dir(&slow_root, None));
+        slow_entered.wait();
+        let fast_out = ws.set_root_dir(&fast, None);
+        release_slow.wait();
+        let slow_out = slow_thread.join().unwrap();
+
+        assert!(fast_out.contains("committed request 2"));
+        assert!(
+            slow_out.contains("superseded by request 2")
+                && slow_out.contains("failed build")
+                && !slow_out.contains("set_root_dir failed"),
+            "a stale failure is a superseded outcome: {slow_out}"
+        );
+        assert_eq!(ws.active_repo_path(), Some(fast));
     }
 
     // ------------------------------------------------------------------
