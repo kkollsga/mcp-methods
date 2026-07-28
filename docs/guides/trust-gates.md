@@ -62,14 +62,8 @@ This is why the contract is documented in CHANGELOG entries (every new gate ship
 
 ```python
 # In the consumer's manifest loader
-if (
-    manifest.embedder is not None
-    and not manifest.trust.allow_embedder
-):
-    raise ManifestError(
-        "embedder requires "
-        "trust.allow_embedder: true"
-    )
+if manifest.embedder is not None and not manifest.trust.allow_embedder:
+    raise ManifestError("embedder requires trust.allow_embedder: true")
 ```
 
 One check per hook, fail-loud, before `serve()`.

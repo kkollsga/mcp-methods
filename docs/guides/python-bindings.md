@@ -24,29 +24,24 @@ from mcp_methods import (
     # File + directory navigation
     list_dir,
     read_file,
-
     # ripgrep-backed search
-    ripgrep,           # Claude Code Grep-compatible interface
-    ripgrep_files,     # full interface, multi-dir
-    ripgrep_lines,     # search text lines
+    ripgrep,  # Claude Code Grep-compatible interface
+    ripgrep_files,  # full interface, multi-dir
+    ripgrep_lines,  # search text lines
     ripgrep_json_fields,
-
     # GitHub
     github_discussions,
     git_api,
     has_git_token,
     extract_github_refs,
-
     # Git
     detect_git_repo,
     validate_repo,
-
     # Text processing
     html_to_text,
     compact_discussion,
     compact_text,
     collapse_code_blocks,
-
     # Caching
     ElementCache,
 )
@@ -83,7 +78,7 @@ registry = SkillRegistry.from_manifest("./my_mcp.yaml")
 # registry.skill_names() → ['cypher_query', 'grep', 'read_source', ...]
 # registry.get("grep").body → "<full markdown body>"
 
-register_skills_as_prompts(app, registry)   # wires every skill as a @app.prompt
+register_skills_as_prompts(app, registry)  # wires every skill as a @app.prompt
 ```
 
 `SkillRegistry.from_manifest(path, include_bundled=True)` — pass `include_bundled=False` to skip framework defaults (useful in tests or when a downstream binary supplies its own bundled layer). `SkillRegistry.find_sibling(graph_path)` returns the `<stem>_mcp.yaml` next to a graph/data file, matching the convention `mcp-server` uses for auto-detection.

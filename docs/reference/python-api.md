@@ -13,10 +13,12 @@ from mcp_methods import list_dir
 
 tree = list_dir("/project/src", depth=2, glob="*.py", relative_to="/project")
 
+
 # With annotation callback (e.g. line count from a knowledge graph)
 def get_loc(rel_path):
     node = graph.get_file(rel_path)
     return f"({node.loc} loc)" if node else None
+
 
 tree = list_dir("/project/src", depth=2, annotate=get_loc)
 # src/
@@ -119,15 +121,15 @@ Resolved skill set built from a YAML manifest, applying the three-layer composit
 ```python
 from mcp_methods import SkillRegistry
 
-reg = SkillRegistry.from_manifest("./my_mcp.yaml")            # include_bundled=True by default
+reg = SkillRegistry.from_manifest("./my_mcp.yaml")  # include_bundled=True by default
 reg = SkillRegistry.from_manifest("./my_mcp.yaml", include_bundled=False)
-reg = SkillRegistry.find_sibling("./data/legal.kdb")          # returns the path to legal_mcp.yaml
+reg = SkillRegistry.find_sibling("./data/legal.kdb")  # returns the path to legal_mcp.yaml
 
-reg.skill_names()       # → ['cypher_query', 'grep', 'read_source', ...]
-reg.get("grep")         # → Skill | None
-reg.skills()            # → list[Skill], sorted
-len(reg)                # → int
-"grep" in reg           # → bool
+reg.skill_names()  # → ['cypher_query', 'grep', 'read_source', ...]
+reg.get("grep")  # → Skill | None
+reg.skills()  # → list[Skill], sorted
+len(reg)  # → int
+"grep" in reg  # → bool
 ```
 
 ### `render_skill_template(name, description) -> str`

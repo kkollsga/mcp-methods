@@ -65,14 +65,8 @@ if manifest.embedder.is_some()
 
 ```python
 # Python example (kglite's pattern)
-if (
-    manifest.embedder is not None
-    and not manifest.trust.allow_embedder
-):
-    raise ManifestError(
-        "embedder requires "
-        "trust.allow_embedder: true"
-    )
+if manifest.embedder is not None and not manifest.trust.allow_embedder:
+    raise ManifestError("embedder requires trust.allow_embedder: true")
 ```
 
 One check per gate, fail-loud at boot, before any hook is instantiated.
