@@ -81,15 +81,15 @@ so the bump must land only on the ref you mean to release from.
      a scope change), push `fix(…)` / `ci(…)` without re-asking until
      green. Stop after ~3 iterations or any release-shape change.
 **Verify the artifact SET, not just the version.** A version check answers
-"did something publish", never "did everything publish". Cross-compiled
-legs are often `continue-on-error`, and an `upload-artifact` step without
-`if-no-files-found: error` uploads an *empty* artifact from a green build —
-so with `skip-existing: true` a partial wheel set ships and nothing says so.
-Compare the artifact count and platform tags against the previous release.
-Conversely, an empty version read out of `Cargo.toml` (`grep … | cut`
-reports cut's status, always 0) yields a green run that publishes *nothing*
-— a silent non-release. Assert the extracted version is well-formed before
-it drives any publish decision.
+"did something publish", never "did everything publish". Cross-compiled legs
+are often `continue-on-error`, and an `upload-artifact` step without
+`if-no-files-found: error` uploads an *empty* artifact from a green build — so
+with `skip-existing: true` a partial set ships and nothing says so. Compare the
+artifact count and platform tags against the previous release. Conversely, an
+empty version read out of `Cargo.toml` (`grep … | cut` reports cut's status,
+always 0) yields a green run that publishes *nothing* — a silent non-release.
+Assert the extracted version is well-formed before it drives any publish
+decision.
 
 8. **Verify published** — poll both registries; 200 = live:
    - crates.io (needs an explicit User-Agent, else 403 that looks like a
