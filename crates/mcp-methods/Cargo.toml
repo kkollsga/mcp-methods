@@ -53,7 +53,13 @@ ureq = { version = "2", features = ["json"] }
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
-ignore = "0.4"
+# 0.4.15, not "0.4": grep/walker.rs and list_dir.rs call
+# WalkBuilder::filter_entry and ::sort_by_file_path. Bisected against the
+# individual releases -- 0.4.14 has neither filter_entry nor (below 0.4.10)
+# sort_by_file_path; 0.4.15 has both. A bare "0.4" let a consumer resolving
+# to declared minimums pick 0.4.3 and fail to compile this crate, which is
+# what kglite's minimal-versions CI job hit.
+ignore = "0.4.15"
 # Glob-pattern matching for `workspace.applies_to`. Already a
 # transitive dep via `ignore`; making it direct so the manifest
 # parser can validate patterns at boot.

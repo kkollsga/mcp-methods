@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.2 — 2026-07-28
+
+### Fixed — declared dependency floors
+
+- **`ignore` was declared as `"0.4"` while the code needs 0.4.15.**
+  `grep/walker.rs` and `list_dir.rs` call `WalkBuilder::filter_entry` and
+  `::sort_by_file_path`; bisected against the individual releases, 0.4.14 has
+  neither and 0.4.15 has both. The understatement was structurally invisible
+  here — our lockfile already held a working version and a fresh resolve picks
+  the newest 0.4.x — but a consumer resolving to declared minimums got
+  `no method named filter_entry`. Found by kglite's `minimal-versions` CI job,
+  which resolves direct dependencies down to their declared floors and builds
+  the result; this was the one crate still failing it.
+- **The sdist carried no LICENSE file.** `pyproject.toml` declared
+  `license = {text = "MIT"}`, which records the licence name but never
+  includes the file. Wheels were unaffected (maturin adds
+  `dist-info/licenses/LICENSE` regardless) and no sdist has been published, so
+  there is no live exposure — but a locally built sdist shipped without a
+  licence. Verified by building both ways: 0 entries without `license-files`,
+  exactly 1 with it.
+
 ## 0.4.1 — 2026-07-21
 
 ### Fixed — request-coherent workspace activation
