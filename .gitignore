@@ -1,5 +1,10 @@
 # Rust
-target/
+#
+# `/target` (anchored, no trailing slash) rather than `target/`: since
+# 2026-07-29 the build dir is a SYMLINK to /Users/Shared/cargo-targets/mcp-methods
+# on the internal disk, and a `dir/` pattern does not match a symlink — it
+# showed up as untracked. Nested per-example targets are listed separately below.
+/target
 Cargo.lock
 
 # Python
@@ -32,8 +37,27 @@ venv/
 # OS
 .DS_Store
 
-# Inbox
+# Inbox — local coordination mail with kglite / mcp-servers. See the
+# "Mail interface" section in CLAUDE.md for the schema and counterparts.
 inbox/
+
+# Local dev working folder — the backlog index (todos.md) and its plans/
+# detail docs. Never committed: it carries in-flight intent and sibling-project
+# paths, and this repo is public. See dev-docs/README.md for the layout AND for
+# the record of which estate conventions this repo adopts vs. declines.
+#
+# NOT the same thing as the tracked, public `dev-documentation/` folder, which
+# holds durable design write-ups meant to be read by consumers of the crate.
+/dev-docs/
+
+# Workstation-local agent skills. These name sibling projects and local
+# filesystem paths, so new ones stay out of this public repo.
+#
+# `.claude/skills/release/SKILL.md` is ALREADY TRACKED and stays tracked —
+# .gitignore has no effect on tracked files. Whether the estate should track
+# skills at all is an open maintainer decision (see dev-docs/README.md); this
+# entry deliberately changes nothing that is already published.
+/.claude/
 
 # Bundled mcp-server binary (built by `make bundle-bin` or the wheel CI step)
 python/mcp_methods/_bin/
