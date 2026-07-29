@@ -6,6 +6,30 @@ GitHub Actions does the heavy lifting. A release is just **a version
 bump merged to `main`** — the workflows build and publish to both
 crates.io and PyPI automatically.
 
+**Release authorization**: never release without a specific,
+in-the-moment approval from the owner for *that* release. A standing
+instruction, an earlier approval in the same session, an approved plan
+that mentions releasing, and the `/release` invocation itself are none
+of them that approval — before the push that fires the publish, state
+the exact version about to go out and get an explicit yes for it.
+(Publishes are immutable; there is no undo. Here the push *is* the
+publish: the workflows trigger on the root `Cargo.toml` path with no
+branch guard, so there is no PR or branch-CI interlock between the two
+the way there is in kglite.)
+
+Everything *before* that push — the bump, the CHANGELOG, the commit,
+the gate — is authorized by invoking `/release`. One prompt, at the one
+irreversible moment. The consequence is deliberate: a release cannot
+complete unattended.
+
+**Version-bump policy**: always bump as a **patch** unless the release
+command itself specified a minor or major. This holds even for changes
+that look semver-breaking — do not unilaterally decide a change
+warrants a minor, and do not stop to ask: the default is already the
+owner's standing call, so a prompt only spends attention re-confirming
+it. Note the semver-relevant change in the CHANGELOG entry instead,
+where it reaches the people it affects.
+
 The trigger: any push to `main` that touches the **root `Cargo.toml`**
 (the single-source `[workspace.package].version`; both workflows are
 scoped to `paths: ['Cargo.toml']`). `publish_crates.yml` and

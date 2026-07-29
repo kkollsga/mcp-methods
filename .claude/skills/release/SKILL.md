@@ -63,15 +63,26 @@ so the bump must land only on the ref you mean to release from.
    version bump + CHANGELOG finalization + the code change go in **one**
    commit. Use `--no-verify` — the ruff pre-commit hook can't run in this
    sandbox; CI is the real gate.
-6. **Push — invoking `/release` is the authorization.** Running this skill
-   authorizes the single `main` push it produces (the publish-triggering
-   one) — no separate in-the-moment prompt. Authorization is scoped to
-   this one release run (the push + its CI fix-and-push loop) and lapses
-   once published or the user pivots. All pre-push safeguards still apply:
-   Rust gate green, surgical staging, on `main`, fast-forward clean. Push:
-   `git push origin main`. (Because the workflows trigger on the root
-   `Cargo.toml` path and there's no branch guard, this is the point of no
-   return — the bump is now heading to an immutable publish.)
+6. **Push — this one takes its own confirmation.** Invoking `/release`
+   authorized everything up to here: the bump, the CHANGELOG, the commit,
+   the gate. It does **not** authorize this push, because in this repo the
+   push *is* the publish — the workflows trigger on the root `Cargo.toml`
+   path with no branch guard, so unlike kglite there is no PR and no
+   branch-CI interlock standing between the two. This is the point of no
+   return and the bump is heading to an immutable publish.
+
+   So: state the exact version about to go out, plus anything the run
+   turned up that the owner did not know when they typed `/release`, and
+   wait for an explicit yes to *that* version. The `/release` invocation,
+   a plan approval, an earlier "go ahead" and a checklist item are none of
+   them this confirmation. Once given, it covers this run's push and its
+   CI fix-and-push loop, and lapses on publish or a pivot.
+
+   All pre-push safeguards still apply: Rust gate green, surgical staging,
+   on `main`, fast-forward clean. Push: `git push origin main`.
+
+   **A release cannot complete unattended.** In a background session the
+   run stops at the staged release commit and waits. That is intended.
 7. **Poll CI until green.** Three workflows fire: **CI** (`ci.yml`),
    **Publish to crates.io** (`publish_crates.yml`), **Build & Publish
    Wheels** (`build_wheels.yml`). Poll the GitHub Checks API directly

@@ -59,6 +59,12 @@ inbox/
 # entry deliberately changes nothing that is already published.
 /.claude/
 
+# Same reason, same rule: the Codex mirror also names sibling projects and
+# local filesystem paths (read-inbox/SKILL.md carries absolute /Volumes/…
+# paths today). It was neither tracked nor ignored, so a stray `git add -A`
+# would have published them to this public repo.
+/.agents/
+
 # Bundled mcp-server binary (built by `make bundle-bin` or the wheel CI step)
 python/mcp_methods/_bin/
 examples/downstream_binary/target/
