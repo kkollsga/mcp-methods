@@ -6,21 +6,22 @@ GitHub Actions does the heavy lifting. A release is just **a version
 bump merged to `main`** — the workflows build and publish to both
 crates.io and PyPI automatically.
 
-**Release authorization**: never release without a specific,
-in-the-moment approval from the owner for *that* release. A standing
-instruction, an earlier approval in the same session, an approved plan
-that mentions releasing, and the `/release` invocation itself are none
-of them that approval — before the push that fires the publish, state
-the exact version about to go out and get an explicit yes for it.
-(Publishes are immutable; there is no undo. Here the push *is* the
-publish: the workflows trigger on the root `Cargo.toml` path with no
-branch guard, so there is no PR or branch-CI interlock between the two
-the way there is in kglite.)
+**Release authorization**: invoking `/release` authorizes the whole run,
+including the push that fires the publish. No separate prompt. The run
+still *reports* immediately before pushing — the exact version, plus
+anything it learned that the owner did not know at invocation — but
+that is a report, not a gate.
 
-Everything *before* that push — the bump, the CHANGELOG, the commit,
-the gate — is authorized by invoking `/release`. One prompt, at the one
-irreversible moment. The consequence is deliberate: a release cannot
-complete unattended.
+This was briefly a blocking confirmation and was reverted 2026-07-31.
+Blocking fired *after* the irreversible decision was already made, so it
+added nothing to the choice, and it broke unattended releases: a kglite
+release sat at a staged commit while the owner was away. Note the
+sharper geometry here — the push IS the publish, since the workflows
+trigger on the root `Cargo.toml` path with no branch guard and there is
+no PR or branch-CI interlock the way kglite has one. That argues for
+strong *checks* before the push, not for a prompt at it.
+
+Publishes are immutable; there is no undo.
 
 **Version-bump policy**: always bump as a **patch** unless the release
 command itself specified a minor or major. This holds even for changes
