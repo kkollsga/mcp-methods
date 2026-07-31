@@ -401,6 +401,17 @@ mod tests {
             file_uri_to_path("file://localhost/a%2Fb").unwrap(),
             PathBuf::from("/a/b")
         );
+        // Encoded `?` and `#` are path characters, not delimiters: they are
+        // decoded only after the query and fragment have been split off, so
+        // they cannot truncate the path.
+        assert_eq!(
+            file_uri_to_path("file:///a%3Fb/src").unwrap(),
+            PathBuf::from("/a?b/src")
+        );
+        assert_eq!(
+            file_uri_to_path("file:///a%23b/src").unwrap(),
+            PathBuf::from("/a#b/src")
+        );
         assert_eq!(
             file_uri_to_path("file:///caf%C3%A9/src").unwrap(),
             PathBuf::from("/café/src")
