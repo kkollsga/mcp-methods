@@ -34,6 +34,7 @@ pub mod bundled_skills_index;
 pub mod cli;
 pub mod env;
 pub mod manifest;
+pub mod roots;
 pub mod runtime;
 // `server` inside the `server` feature module — the inner module is
 // the rmcp `ServerHandler` impl. Rename would churn every downstream
@@ -68,5 +69,5 @@ pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};
 pub use workspace::{
     ActivationBuild, ActivationId, ActivationRequest, ActivationSummaryHook,
     ActivationTransactionHook, PostActivateHook, PostActivateRevsHook, PreparedActivation,
-    RevsRequest, Workspace,
+    RevsRequest, RootOwnership, Workspace,
 };

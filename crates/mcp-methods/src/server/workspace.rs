@@ -30,7 +30,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
@@ -262,6 +262,27 @@ struct InventoryEntry {
 // runtime share one enum — the values mean the same thing.
 pub use crate::server::manifest::WorkspaceKind;
 
+/// Who chose the currently active root.
+///
+/// The flag exists so a root proposed by an *external party* (an MCP
+/// client advertising `roots`, see [`Workspace::adopt_client_root`])
+/// can never silently displace one the operator chose. It is a
+/// precedence marker, not an access-control mechanism — containment is
+/// [`Workspace::with_sandbox_root`]'s job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootOwnership {
+    /// No root is bound and nobody has claimed one. Only an unanchored
+    /// local boot ([`Workspace::open_local_unanchored`]) starts here.
+    Unowned,
+    /// The active root came from a client-advertised MCP root. A later
+    /// `roots/list_changed` may replace it.
+    Adopted,
+    /// The active root came from the operator — manifest `workspace.root`,
+    /// a CLI flag, or an explicit `set_root_dir` call. **Permanent**: no
+    /// client advertisement ever overrides it.
+    Operator,
+}
+
 /// Workspace runtime state. Shared across MCP request clones via Arc.
 #[derive(Clone)]
 pub struct Workspace {
@@ -302,6 +323,22 @@ struct WorkspaceInner {
     /// target whose canonical path is not inside this directory is rejected
     /// before any state is touched.
     sandbox_root: Option<PathBuf>,
+    /// Who owns the active root (see [`RootOwnership`]). `Operator` for
+    /// every workspace opened with a configured root; `Unowned` only
+    /// after [`Workspace::open_local_unanchored`].
+    root_ownership: Mutex<RootOwnership>,
+    /// Local mode, unanchored boot only: the directory that ends up
+    /// holding `.mcp-workspace/`, chosen at the *first* activation and
+    /// then fixed forever (the anchored constructors decide it up front
+    /// and leave this unset). Fixed-forever mirrors the anchored rule
+    /// that `workspace_dir` survives root swaps so the inventory does
+    /// too — see the note in [`Workspace::set_root_dir`].
+    deferred_anchor: OnceLock<PathBuf>,
+    /// Opt-in (`workspace.adopt_client_roots`): may this server adopt a
+    /// root advertised by the MCP client as a *fallback* when the
+    /// operator configured none? `false` by default, and the only thing
+    /// that makes the `roots/list` round-trip happen at all.
+    adopt_client_roots: bool,
 }
 
 #[derive(Debug, Default)]
@@ -358,6 +395,9 @@ impl Workspace {
                 post_activate_revs: None,
                 activation_transaction: None,
                 sandbox_root: None,
+                root_ownership: Mutex::new(RootOwnership::Operator),
+                deferred_anchor: OnceLock::new(),
+                adopt_client_roots: false,
             }),
         };
         ws.reconcile_inventory()?;
@@ -406,8 +446,101 @@ impl Workspace {
                 post_activate_revs: None,
                 activation_transaction: None,
                 sandbox_root: None,
+                // A configured root is the operator's choice, so it is
+                // `Operator` from the first instant — that is exactly what
+                // makes client-root adoption fallback-only.
+                root_ownership: Mutex::new(RootOwnership::Operator),
+                deferred_anchor: OnceLock::new(),
+                adopt_client_roots: false,
             }),
         })
+    }
+
+    /// Open a local-directory workspace with **no active root**.
+    ///
+    /// The unanchored sibling of [`open_local`](Self::open_local), for the
+    /// case where the root is expected to arrive later from an MCP client
+    /// (`workspace.adopt_client_roots`, see
+    /// [`adopt_client_root`](Self::adopt_client_root)). Nothing is bound,
+    /// nothing is created on disk, and no hook fires: until something
+    /// activates, [`active_repo_path`](Self::active_repo_path) is `None`
+    /// and the source tools behave exactly as they do with no root — which
+    /// is the designed outcome when no root ever arrives.
+    ///
+    /// The inventory directory is deliberately *not* created here: with no
+    /// root there is nowhere to put it. The first activation picks the
+    /// directory (`<root>/.mcp-workspace/`) and it is fixed from then on,
+    /// mirroring the anchored mode's rule that the inventory survives
+    /// later root swaps.
+    ///
+    /// [`root_ownership`](Self::root_ownership) starts at
+    /// [`RootOwnership::Unowned`] — the only constructor that does.
+    pub fn open_local_unanchored(post_activate: Option<PostActivateHook>) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(WorkspaceInner {
+                kind: WorkspaceKind::Local,
+                // Sentinel: no directory is known yet. `inventory_dir()`
+                // treats an empty base as "unanchored" and skips inventory
+                // I/O entirely until `deferred_anchor` is set.
+                workspace_dir: PathBuf::new(),
+                stale_after_days: u32::MAX, // sweeping is github-only
+                state: RwLock::new(WorkspaceState::default()),
+                inventory: Mutex::new(()),
+                legacy_activation: Mutex::new(()),
+                post_activate,
+                activation_summary: None,
+                post_activate_revs: None,
+                activation_transaction: None,
+                sandbox_root: None,
+                root_ownership: Mutex::new(RootOwnership::Unowned),
+                deferred_anchor: OnceLock::new(),
+                adopt_client_roots: false,
+            }),
+        })
+    }
+
+    /// Allow this workspace to adopt a client-advertised MCP root as a
+    /// fallback when the operator configured none (manifest key
+    /// `workspace.adopt_client_roots`).
+    ///
+    /// Off by default. With it off no `roots/list` request is ever issued,
+    /// which is what keeps clients that do not advertise roots — and
+    /// deployments that never opt in — bit-for-bit unaffected.
+    ///
+    /// Setting it on a workspace that already has a root is harmless and
+    /// intentional: ownership is already [`RootOwnership::Operator`], so
+    /// adoption is refused. Call before the workspace is cloned into
+    /// [`crate::server::ServerOptions`], like the other builders.
+    ///
+    /// <div class="warning">
+    ///
+    /// MCP `roots` is **deprecated** as of protocol revision `2026-07-28`
+    /// ([SEP-2577]) and is eligible for removal in the first revision
+    /// released on or after 2027-07-28. New deployments should prefer the
+    /// spec's own migration path — pass directories via tool parameters,
+    /// resource URIs, or server configuration (`workspace.root`).
+    ///
+    /// [SEP-2577]: https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577
+    ///
+    /// </div>
+    pub fn with_adopt_client_roots(mut self) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.adopt_client_roots = true,
+            None => tracing::warn!(
+                "with_adopt_client_roots called after the workspace was cloned; client roots will not be adopted"
+            ),
+        }
+        self
+    }
+
+    /// Is client-root adoption enabled (`workspace.adopt_client_roots`)?
+    pub fn adopts_client_roots(&self) -> bool {
+        self.inner.adopt_client_roots
+    }
+
+    /// Who chose the active root — see [`RootOwnership`].
+    pub fn root_ownership(&self) -> RootOwnership {
+        *self.inner.root_ownership.lock().unwrap()
     }
 
     /// Bound runtime root swaps to a containment boundary (local mode).
@@ -519,23 +652,35 @@ impl Workspace {
         self.inner.kind
     }
 
+    /// The directory this workspace keeps its bookkeeping under.
+    ///
+    /// After an unanchored local boot ([`open_local_unanchored`](Self::open_local_unanchored))
+    /// this is the empty path until the first activation anchors it; every
+    /// other constructor knows it up front.
     pub fn workspace_dir(&self) -> &Path {
-        &self.inner.workspace_dir
+        match self.inner.deferred_anchor.get() {
+            Some(anchored) => anchored.as_path(),
+            None => &self.inner.workspace_dir,
+        }
     }
 
     pub fn repos_dir(&self) -> PathBuf {
-        self.inner.workspace_dir.join("repos")
+        self.workspace_dir().join("repos")
     }
 
-    fn inventory_path(&self) -> PathBuf {
-        match self.inner.kind {
-            WorkspaceKind::Github => self.inner.workspace_dir.join("inventory.json"),
-            WorkspaceKind::Local => self
-                .inner
-                .workspace_dir
-                .join(".mcp-workspace")
-                .join("inventory.json"),
-        }
+    /// Base directory for inventory bookkeeping, or `None` while an
+    /// unanchored local workspace has yet to activate anything.
+    fn inventory_base(&self) -> Option<&Path> {
+        let base = self.workspace_dir();
+        (!base.as_os_str().is_empty()).then_some(base)
+    }
+
+    fn inventory_path(&self) -> Option<PathBuf> {
+        let base = self.inventory_base()?;
+        Some(match self.inner.kind {
+            WorkspaceKind::Github => base.join("inventory.json"),
+            WorkspaceKind::Local => base.join(".mcp-workspace").join("inventory.json"),
+        })
     }
 
     /// Active repo's full org/repo name, or None if nothing is active.
@@ -568,7 +713,9 @@ impl Workspace {
     // ------------------------------------------------------------------
 
     fn load_inventory_unlocked(&self) -> BTreeMap<String, InventoryEntry> {
-        let path = self.inventory_path();
+        let Some(path) = self.inventory_path() else {
+            return BTreeMap::new();
+        };
         let Ok(text) = fs::read_to_string(&path) else {
             return BTreeMap::new();
         };
@@ -576,7 +723,11 @@ impl Workspace {
     }
 
     fn save_inventory_unlocked(&self, inv: &BTreeMap<String, InventoryEntry>) -> Result<()> {
-        let path = self.inventory_path();
+        // No anchor yet (unanchored local boot) means nowhere to write.
+        // Bookkeeping is best-effort in that window, by construction.
+        let Some(path) = self.inventory_path() else {
+            return Ok(());
+        };
         let body = serde_json::to_string_pretty(inv).context("failed to serialise inventory")?;
         fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
@@ -754,10 +905,33 @@ impl Workspace {
             // and prevents a concurrent activation from changing the path
             // fingerprinted by this request. Refresh calls snapshot the
             // currently committed root and pass it through the same argument.
-            let root = requested_local_root
+            let root = match requested_local_root
                 .map(Path::to_path_buf)
                 .or_else(|| self.active_repo_path())
-                .unwrap_or_else(|| self.inner.workspace_dir.clone());
+            {
+                Some(root) => root,
+                None => match self.inventory_base() {
+                    Some(base) => base.to_path_buf(),
+                    // Unanchored boot with nothing adopted yet: there is no
+                    // root to refresh. Erroring keeps `repo_management`
+                    // honest instead of fingerprinting the empty path.
+                    None => anyhow::bail!(
+                        "no active root: this workspace booted unanchored \
+                         (workspace.adopt_client_roots) and no client root has been adopted"
+                    ),
+                },
+            };
+            // First activation after an unanchored boot picks the directory
+            // that owns `.mcp-workspace/` from here on. Created eagerly so
+            // the very first `bump_access` has somewhere to write, exactly
+            // as `open_local` does at boot.
+            if self.inventory_base().is_none() {
+                let inv_dir = root.join(".mcp-workspace");
+                fs::create_dir_all(&inv_dir).with_context(|| {
+                    format!("failed to create local-workspace dir {}", inv_dir.display())
+                })?;
+                let _ = self.inner.deferred_anchor.set(root.clone());
+            }
             let prev_sha = self.last_built_sha(name);
             let fingerprint = fingerprint_dir(&root);
             let action = match prev_sha {
@@ -1391,18 +1565,79 @@ impl Workspace {
     /// must be a git repo) and fire the revs-aware hook — see
     /// [`activate`](Self::activate) / [`RevsRequest`].
     pub fn set_root_dir(&self, new_root: &Path, revs: Option<&RevsRequest>) -> String {
+        match self.swap_root(new_root, revs, "set_root_dir") {
+            Ok(msg) => {
+                // Operator intent is permanent: from here on no
+                // client-advertised root may displace this one, including
+                // via `roots/list_changed`.
+                *self.inner.root_ownership.lock().unwrap() = RootOwnership::Operator;
+                msg
+            }
+            Err(msg) => msg,
+        }
+    }
+
+    /// Adopt a root proposed by the MCP client (`roots/list`).
+    ///
+    /// Routes through **the same** validation and containment path as
+    /// [`set_root_dir`](Self::set_root_dir) — one code path, so a
+    /// `workspace.sandbox_root` boundary applies identically to an
+    /// operator swap and to a path proposed by an external party. The MCP
+    /// spec is explicit that roots are "informational guidance rather than
+    /// an access-control mechanism", so the boundary, not the client, is
+    /// what bounds this.
+    ///
+    /// Refuses (without touching any state) when ownership is already
+    /// [`RootOwnership::Operator`] — an operator-chosen root always wins.
+    /// On success ownership becomes [`RootOwnership::Adopted`], leaving a
+    /// later `roots/list_changed` free to replace it.
+    ///
+    /// `Err` is a human-readable reason for the log; adoption failure is
+    /// never fatal to the server.
+    pub fn adopt_client_root(&self, new_root: &Path) -> Result<String, String> {
+        // Held across the swap: an operator `set_root_dir` racing this
+        // adoption then either loses the race outright (it blocks here and
+        // flips to `Operator` afterwards, which is what it wanted) or has
+        // already flipped, and we bail below. Either way the operator's
+        // choice is the one that survives.
+        let mut ownership = self.inner.root_ownership.lock().unwrap();
+        if *ownership == RootOwnership::Operator {
+            return Err(
+                "the active root was chosen by the operator; client roots are fallback-only"
+                    .to_string(),
+            );
+        }
+        let msg = self.swap_root(new_root, None, "adopt_client_root")?;
+        *ownership = RootOwnership::Adopted;
+        Ok(msg)
+    }
+
+    /// The shared root-swap path: local-mode check, existence check,
+    /// canonicalize, **containment**, activate. Both the operator entry
+    /// point ([`set_root_dir`](Self::set_root_dir)) and the client-root
+    /// entry point ([`adopt_client_root`](Self::adopt_client_root)) go
+    /// through here, so neither can grow its own boundary semantics.
+    ///
+    /// `Err` carries the same message the tool would have returned; the
+    /// caller decides whether that is a tool result or a log line.
+    fn swap_root(
+        &self,
+        new_root: &Path,
+        revs: Option<&RevsRequest>,
+        who: &str,
+    ) -> Result<String, String> {
         if !matches!(self.inner.kind, WorkspaceKind::Local) {
-            return "set_root_dir is only valid in local-workspace mode.".to_string();
+            return Err("set_root_dir is only valid in local-workspace mode.".to_string());
         }
         if !new_root.is_dir() {
-            return format!(
+            return Err(format!(
                 "Path does not exist or is not a directory: {}",
                 new_root.display()
-            );
+            ));
         }
         let canon = match new_root.canonicalize() {
             Ok(p) => p,
-            Err(e) => return format!("canonicalize failed: {e}"),
+            Err(e) => return Err(format!("canonicalize failed: {e}")),
         };
         // Containment (opt-in, see `with_sandbox_root`). Tested on the
         // *canonical* path — never the raw argument — so `..` traversals and
@@ -1410,20 +1645,21 @@ impl Workspace {
         // `activate`, so a rejected swap leaves the active root untouched.
         if let Some(sandbox) = self.inner.sandbox_root.as_ref() {
             if !canon.starts_with(sandbox) {
-                return format!(
-                    "set_root_dir: {} escapes workspace.sandbox_root ({}). \
+                return Err(format!(
+                    "{who}: {} escapes workspace.sandbox_root ({}). \
                      The active root is unchanged.",
                     canon.display(),
                     sandbox.display()
-                );
+                ));
             }
         }
         let synthetic = synthesize_local_name(&canon);
         // Note: the WorkspaceInner.workspace_dir field is the path the
         // inventory is stored under. We keep the *original* one (from
-        // open_local) so the inventory survives across root swaps.
+        // open_local, or the first activation after an unanchored boot) so
+        // the inventory survives across root swaps.
         self.activate(&synthetic, false, revs, Some(&canon))
-            .unwrap_or_else(|e| format!("set_root_dir failed: {e}"))
+            .map_err(|e| format!("{who} failed: {e}"))
     }
 }
 
@@ -2240,6 +2476,185 @@ mod tests {
             .unwrap()
             .with_sandbox_root(&missing)
             .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Unanchored boot + client-root adoption (`workspace.adopt_client_roots`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn unanchored_boot_binds_nothing_and_creates_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let ws = Workspace::open_local_unanchored(None).unwrap();
+        assert!(ws.active_repo_path().is_none());
+        assert!(ws.active_repo_name().is_none());
+        assert_eq!(ws.root_ownership(), RootOwnership::Unowned);
+        assert!(!ws.adopts_client_roots(), "the knob is opt-in");
+        assert!(
+            !base.join(".mcp-workspace").exists(),
+            "an unanchored boot must not create an inventory dir anywhere"
+        );
+    }
+
+    #[test]
+    fn open_local_is_operator_owned_from_the_start() {
+        let td = tempfile::tempdir().unwrap();
+        let ws = Workspace::open_local(td.path().to_path_buf(), None).unwrap();
+        assert_eq!(
+            ws.root_ownership(),
+            RootOwnership::Operator,
+            "a configured root is the operator's, which is what makes adoption fallback-only"
+        );
+    }
+
+    #[test]
+    fn adopt_client_root_activates_and_defers_the_inventory_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ws = Workspace::open_local_unanchored(None).unwrap();
+
+        ws.adopt_client_root(&project).unwrap();
+
+        assert_eq!(ws.active_repo_path().as_deref(), Some(project.as_path()));
+        assert_eq!(ws.root_ownership(), RootOwnership::Adopted);
+        assert!(
+            project.join(".mcp-workspace").is_dir(),
+            "the first activation must create the deferred inventory dir"
+        );
+        assert_eq!(ws.workspace_dir(), project.as_path());
+    }
+
+    #[test]
+    fn the_inventory_home_is_fixed_at_the_first_adoption() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let ws = Workspace::open_local_unanchored(None).unwrap();
+        ws.adopt_client_root(&first).unwrap();
+        ws.set_root_dir(&second, None);
+
+        assert_eq!(ws.active_repo_path().as_deref(), Some(second.as_path()));
+        assert_eq!(
+            ws.workspace_dir(),
+            first.as_path(),
+            "the inventory must survive later root swaps, exactly as it does after open_local"
+        );
+        assert!(!second.join(".mcp-workspace").exists());
+    }
+
+    #[test]
+    fn adoption_is_refused_once_the_operator_owns_the_root() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let configured = base.join("configured");
+        let advertised = base.join("advertised");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&advertised).unwrap();
+
+        let ws = Workspace::open_local(configured.clone(), None).unwrap();
+        let err = ws.adopt_client_root(&advertised).unwrap_err();
+        assert!(err.contains("operator"), "unexpected reason: {err}");
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(configured.as_path()),
+            "a refused adoption must not touch the active root"
+        );
+    }
+
+    #[test]
+    fn set_root_dir_claims_ownership_permanently() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let adopted = base.join("adopted");
+        let operator = base.join("operator");
+        let later = base.join("later");
+        for d in [&adopted, &operator, &later] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ws = Workspace::open_local_unanchored(None).unwrap();
+        ws.adopt_client_root(&adopted).unwrap();
+        assert_eq!(ws.root_ownership(), RootOwnership::Adopted);
+
+        ws.set_root_dir(&operator, None);
+        assert_eq!(ws.root_ownership(), RootOwnership::Operator);
+
+        // Which is exactly what a later `roots/list_changed` runs into.
+        assert!(ws.adopt_client_root(&later).is_err());
+        assert_eq!(ws.active_repo_path().as_deref(), Some(operator.as_path()));
+    }
+
+    #[test]
+    fn a_failed_set_root_dir_does_not_claim_ownership() {
+        let (_td, sandbox, inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        let msg = ws.set_root_dir(&outside, None);
+        assert!(msg.contains("sandbox_root"), "unexpected message: {msg}");
+        assert_eq!(
+            ws.root_ownership(),
+            RootOwnership::Unowned,
+            "a rejected swap must not lock out adoption"
+        );
+        // ... so a valid client root can still be adopted afterwards.
+        ws.adopt_client_root(&inside).unwrap();
+        assert_eq!(ws.root_ownership(), RootOwnership::Adopted);
+    }
+
+    #[test]
+    fn adoption_goes_through_the_same_containment_check_as_set_root_dir() {
+        let (_td, sandbox, inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+
+        let err = ws.adopt_client_root(&outside).unwrap_err();
+        assert!(
+            err.contains("sandbox_root") && err.contains(&sandbox.display().to_string()),
+            "the rejection must name the boundary it violated: {err}"
+        );
+        assert!(
+            ws.active_repo_path().is_none(),
+            "a rejected adoption must leave the server unanchored"
+        );
+        assert_eq!(ws.root_ownership(), RootOwnership::Unowned);
+
+        ws.adopt_client_root(&inside).unwrap();
+        assert_eq!(ws.active_repo_path().as_deref(), Some(inside.as_path()));
+    }
+
+    #[test]
+    fn adoption_rejects_a_dotdot_escape_from_the_sandbox() {
+        let (_td, sandbox, inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        // Lexically inside, actually outside — only the canonicalized form
+        // catches it.
+        let traversal = inside.join("..").join("..").join("outside");
+        assert!(ws.adopt_client_root(&traversal).is_err());
+        assert!(ws.active_repo_path().is_none());
+        let _ = outside;
+    }
+
+    #[test]
+    fn unanchored_refresh_before_adoption_is_a_clean_error() {
+        let ws = Workspace::open_local_unanchored(None).unwrap();
+        let out = ws.repo_management(None, false, true, false, None);
+        assert!(
+            out.contains("no active root") || out.contains("No active"),
+            "unexpected output: {out}"
+        );
+        assert!(ws.active_repo_path().is_none());
     }
 
     #[test]
