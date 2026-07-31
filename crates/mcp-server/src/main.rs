@@ -75,7 +75,17 @@ enum Mode {
         root: PathBuf,
         watch: bool,
         sandbox_root: Option<PathBuf>,
+        /// `workspace.adopt_client_roots`. Carried even here, where a root
+        /// is already configured: adoption is refused at runtime because
+        /// the operator owns the root, and honouring the key uniformly
+        /// beats two places that decide what it means.
+        adopt_client_roots: bool,
     },
+    /// Workspace mode (local flavour) that booted with **no root** —
+    /// `workspace.adopt_client_roots: true` and no `workspace.root`. Binds
+    /// nothing until an MCP client advertises a root (and stays bound to
+    /// nothing if none ever does).
+    LocalWorkspaceUnanchored { sandbox_root: Option<PathBuf> },
     /// Watch mode — auto-rebuild trigger on file changes.
     Watch { dir: PathBuf },
     /// Framework only — no source binding. Useful for testing the
@@ -219,28 +229,45 @@ fn pick_mode(cli: &Cli) -> Mode {
 /// canonicalized, so a path that does not exist is a boot error rather than
 /// a boundary that silently never matches. `sandbox_root` absent is the
 /// default and means unbounded `set_root_dir` swaps.
+///
+/// `root` is absent only when `workspace.adopt_client_roots` is set (the
+/// manifest loader enforces that), which yields
+/// [`Mode::LocalWorkspaceUnanchored`].
 fn local_workspace_mode(
     wcfg: &mcp_methods::server::WorkspaceConfig,
     yaml_path: &Path,
 ) -> Result<Mode> {
-    let raw_root = wcfg.root.as_ref().expect("validated by manifest loader");
     let base = yaml_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let root = base.join(raw_root).canonicalize().with_context(|| {
-        format!("workspace.root {raw_root:?} resolves to a path that does not exist")
-    })?;
     let sandbox_root = match wcfg.sandbox_root.as_ref() {
         Some(raw) => Some(base.join(raw).canonicalize().with_context(|| {
             format!("workspace.sandbox_root {raw:?} resolves to a path that does not exist")
         })?),
         None => None,
     };
+    let Some(raw_root) = wcfg.root.as_ref() else {
+        // No root: adoption-only boot (the loader already refused this
+        // shape without `adopt_client_roots`). The file watcher has
+        // nothing to watch, so asking for it is a config error rather
+        // than a silently-dead watcher.
+        if wcfg.watch {
+            anyhow::bail!(
+                "workspace.watch requires workspace.root — an adoption-only \
+                 workspace has nothing to watch at boot"
+            );
+        }
+        return Ok(Mode::LocalWorkspaceUnanchored { sandbox_root });
+    };
+    let root = base.join(raw_root).canonicalize().with_context(|| {
+        format!("workspace.root {raw_root:?} resolves to a path that does not exist")
+    })?;
     Ok(Mode::LocalWorkspace {
         root,
         watch: wcfg.watch,
         sandbox_root,
+        adopt_client_roots: wcfg.adopt_client_roots,
     })
 }
 
@@ -250,6 +277,7 @@ fn default_manifest_path(mode: &Mode) -> Option<PathBuf> {
         Mode::Workspace { dir } => find_workspace_manifest(dir),
         Mode::Watch { dir } => find_workspace_manifest(dir),
         Mode::LocalWorkspace { root, .. } => find_workspace_manifest(root),
+        Mode::LocalWorkspaceUnanchored { .. } => None,
         Mode::Bare => None,
     }
 }
@@ -278,6 +306,7 @@ fn fallback_name(mode: &Mode) -> &'static str {
         Mode::SourceRoot { .. } => "MCP Server (source-root)",
         Mode::Workspace { .. } => "MCP Server (workspace)",
         Mode::LocalWorkspace { .. } => "MCP Server (local-workspace)",
+        Mode::LocalWorkspaceUnanchored { .. } => "MCP Server (local-workspace)",
         Mode::Watch { .. } => "MCP Server (watch)",
         Mode::Bare => "MCP Server",
     }
@@ -297,12 +326,25 @@ fn print_boot_summary(
             root,
             watch,
             sandbox_root,
+            adopt_client_roots,
         } => format!(
-            "local-workspace [{}{}{}]",
+            "local-workspace [{}{}{}{}]",
             root.display(),
             if *watch { " +watch" } else { "" },
             match sandbox_root {
                 Some(b) => format!(" sandbox={}", b.display()),
+                None => String::new(),
+            },
+            if *adopt_client_roots {
+                " +adopt_client_roots"
+            } else {
+                ""
+            }
+        ),
+        Mode::LocalWorkspaceUnanchored { sandbox_root } => format!(
+            "local-workspace [unanchored, awaiting client root{}]",
+            match sandbox_root {
+                Some(b) => format!(", sandbox={}", b.display()),
                 None => String::new(),
             }
         ),
@@ -427,7 +469,11 @@ async fn main() -> Result<()> {
     let env_start_dir: PathBuf = match &mode {
         Mode::SourceRoot { dir } | Mode::Workspace { dir } | Mode::Watch { dir } => dir.clone(),
         Mode::LocalWorkspace { root, .. } => root.clone(),
-        Mode::Bare => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        // No root yet, so no better place to look for a `.env` than the
+        // process CWD — the same fallback bare mode uses.
+        Mode::LocalWorkspaceUnanchored { .. } | Mode::Bare => {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
     };
     let env_file_loaded = load_env_for_mode(manifest.as_ref(), &env_start_dir)?;
 
@@ -454,7 +500,10 @@ async fn main() -> Result<()> {
             options = options.with_workspace(ws);
         }
         Mode::LocalWorkspace {
-            root, sandbox_root, ..
+            root,
+            sandbox_root,
+            adopt_client_roots,
+            ..
         } => {
             let mut ws = workspace::Workspace::open_local(root.clone(), None)
                 .context("local-workspace initialisation failed")?;
@@ -463,6 +512,22 @@ async fn main() -> Result<()> {
                     .with_sandbox_root(boundary)
                     .context("workspace.sandbox_root rejected")?;
             }
+            if *adopt_client_roots {
+                ws = ws.with_adopt_client_roots();
+            }
+            options = options.with_workspace(ws);
+        }
+        Mode::LocalWorkspaceUnanchored { sandbox_root } => {
+            let mut ws = workspace::Workspace::open_local_unanchored(None)
+                .context("local-workspace initialisation failed")?;
+            if let Some(boundary) = sandbox_root {
+                ws = ws
+                    .with_sandbox_root(boundary)
+                    .context("workspace.sandbox_root rejected")?;
+            }
+            // Unanchored boot only happens because the key is set, so this
+            // is unconditional here.
+            ws = ws.with_adopt_client_roots();
             options = options.with_workspace(ws);
         }
         Mode::Bare => {
@@ -616,6 +681,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("sandbox_root"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn local_workspace_mode_without_a_root_is_unanchored() {
+        let (_td, yaml) = manifest_layout();
+        let base = yaml.parent().unwrap().to_path_buf();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: None,
+            sandbox_root: Some("./repos".to_string()),
+            adopt_client_roots: true,
+            ..Default::default()
+        };
+        match local_workspace_mode(&cfg, &yaml).unwrap() {
+            Mode::LocalWorkspaceUnanchored { sandbox_root } => assert_eq!(
+                sandbox_root,
+                Some(base.join("repos")),
+                "the boundary still resolves against the manifest dir"
+            ),
+            other => panic!("expected LocalWorkspaceUnanchored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_workspace_mode_carries_adopt_client_roots_alongside_a_root() {
+        let (_td, yaml) = manifest_layout();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: Some("./repos/active".to_string()),
+            adopt_client_roots: true,
+            ..Default::default()
+        };
+        match local_workspace_mode(&cfg, &yaml).unwrap() {
+            Mode::LocalWorkspace {
+                adopt_client_roots, ..
+            } => assert!(adopt_client_roots),
+            other => panic!("expected LocalWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unanchored_workspace_cannot_ask_for_the_watcher() {
+        let (_td, yaml) = manifest_layout();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: None,
+            watch: true,
+            adopt_client_roots: true,
+            ..Default::default()
+        };
+        let err = local_workspace_mode(&cfg, &yaml)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("workspace.watch requires workspace.root"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
