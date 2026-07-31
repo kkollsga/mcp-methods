@@ -28,3 +28,9 @@ rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Test-only. `publish = false` on this crate, so this has no release
+# surface at all; it builds the on-disk manifest layouts the
+# `local_workspace_mode` path resolution is asserted against.
+[dev-dependencies]
+tempfile = "3"

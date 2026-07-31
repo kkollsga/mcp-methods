@@ -212,6 +212,38 @@ fn pick_mode(cli: &Cli) -> Mode {
     }
 }
 
+/// Resolve a `workspace.kind: local` block into [`Mode::LocalWorkspace`].
+///
+/// Both `root` and `sandbox_root` resolve against the **manifest YAML's own
+/// directory** (a manifest is portable; the process CWD is not) and are
+/// canonicalized, so a path that does not exist is a boot error rather than
+/// a boundary that silently never matches. `sandbox_root` absent is the
+/// default and means unbounded `set_root_dir` swaps.
+fn local_workspace_mode(
+    wcfg: &mcp_methods::server::WorkspaceConfig,
+    yaml_path: &Path,
+) -> Result<Mode> {
+    let raw_root = wcfg.root.as_ref().expect("validated by manifest loader");
+    let base = yaml_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = base.join(raw_root).canonicalize().with_context(|| {
+        format!("workspace.root {raw_root:?} resolves to a path that does not exist")
+    })?;
+    let sandbox_root = match wcfg.sandbox_root.as_ref() {
+        Some(raw) => Some(base.join(raw).canonicalize().with_context(|| {
+            format!("workspace.sandbox_root {raw:?} resolves to a path that does not exist")
+        })?),
+        None => None,
+    };
+    Ok(Mode::LocalWorkspace {
+        root,
+        watch: wcfg.watch,
+        sandbox_root,
+    })
+}
+
 fn default_manifest_path(mode: &Mode) -> Option<PathBuf> {
     match mode {
         Mode::SourceRoot { .. } => None,
@@ -386,30 +418,7 @@ async fn main() -> Result<()> {
     if let Some(m) = manifest.as_ref() {
         if let Some(wcfg) = m.workspace.as_ref() {
             if wcfg.kind == mcp_methods::server::WorkspaceKind::Local {
-                let raw_root = wcfg.root.as_ref().expect("validated by manifest loader");
-                let base = m
-                    .yaml_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."));
-                let resolved = base.join(raw_root).canonicalize().with_context(|| {
-                    format!("workspace.root {raw_root:?} resolves to a path that does not exist")
-                })?;
-                // Resolved exactly like `root`: relative to the manifest's
-                // own directory. Absent = unbounded swaps (today's default).
-                let sandbox_root = match wcfg.sandbox_root.as_ref() {
-                    Some(raw) => Some(base.join(raw).canonicalize().with_context(|| {
-                        format!(
-                            "workspace.sandbox_root {raw:?} resolves to a path that does not exist"
-                        )
-                    })?),
-                    None => None,
-                };
-                mode = Mode::LocalWorkspace {
-                    root: resolved,
-                    watch: wcfg.watch,
-                    sandbox_root,
-                };
+                mode = local_workspace_mode(wcfg, &m.yaml_path)?;
             }
         }
     }
@@ -536,6 +545,77 @@ mod tests {
     fn no_flags_defaults_to_bare() {
         let mode = pick_mode(&cli(&[]));
         assert!(matches!(mode, Mode::Bare));
+    }
+
+    /// `<tmp>/manifest_mcp.yaml` beside `<tmp>/repos/active`. Everything is
+    /// canonicalized — on macOS a tempdir sits under the `/var` →
+    /// `/private/var` symlink, so an un-canonicalized expectation would
+    /// compare two different spellings of the same directory.
+    fn manifest_layout() -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("repos").join("active")).unwrap();
+        let yaml = base.join("workspace_mcp.yaml");
+        std::fs::write(&yaml, "workspace:\n  kind: local\n  root: ./repos/active\n").unwrap();
+        (td, yaml)
+    }
+
+    #[test]
+    fn local_workspace_mode_resolves_sandbox_root_against_the_manifest_dir() {
+        let (_td, yaml) = manifest_layout();
+        let base = yaml.parent().unwrap().to_path_buf();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: Some("./repos/active".to_string()),
+            sandbox_root: Some("./repos".to_string()),
+            ..Default::default()
+        };
+        match local_workspace_mode(&cfg, &yaml).unwrap() {
+            Mode::LocalWorkspace {
+                root, sandbox_root, ..
+            } => {
+                assert_eq!(root, base.join("repos").join("active"));
+                assert_eq!(
+                    sandbox_root,
+                    Some(base.join("repos")),
+                    "sandbox_root must resolve against the manifest dir, like root"
+                );
+            }
+            other => panic!("expected LocalWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_workspace_mode_without_sandbox_root_is_unbounded() {
+        let (_td, yaml) = manifest_layout();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: Some("./repos/active".to_string()),
+            ..Default::default()
+        };
+        match local_workspace_mode(&cfg, &yaml).unwrap() {
+            Mode::LocalWorkspace { sandbox_root, .. } => assert!(
+                sandbox_root.is_none(),
+                "no sandbox_root key must stay unbounded"
+            ),
+            other => panic!("expected LocalWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_workspace_mode_rejects_a_sandbox_root_that_does_not_exist() {
+        let (_td, yaml) = manifest_layout();
+        let cfg = mcp_methods::server::WorkspaceConfig {
+            kind: mcp_methods::server::WorkspaceKind::Local,
+            root: Some("./repos/active".to_string()),
+            sandbox_root: Some("./nope".to_string()),
+            ..Default::default()
+        };
+        let err = local_workspace_mode(&cfg, &yaml)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox_root"), "unexpected error: {err}");
     }
 
     #[test]
