@@ -85,6 +85,8 @@ workspace:
   kind: local                          # "github" | "local"
   root: ./repo                         # local mode only: the dir to bind
   watch: true                          # local mode only: enable filesystem watcher
+  sandbox_root: ./                     # local mode only, optional: outer bound
+                                       # for set_root_dir swaps (default: none)
 
 # Opaque passthrough — downstream-binary-specific config. The framework
 # validates only the top-level "extensions:" key and stores whatever is
@@ -154,7 +156,7 @@ Pointer to a `.env`-style file. If unset, the framework walks upward from the ma
 When set, this wins over the CLI `--workspace` flag.
 
 - `kind: github` — clone-and-track flow (same as `--workspace DIR`). `root:` and `watch:` are ignored.
-- `kind: local` — bind a fixed local directory. `root:` is required (path to bind). `watch: true` enables the filesystem watcher (calls the post-activate hook on changes).
+- `kind: local` — bind a fixed local directory. `root:` is required (path to bind). `watch: true` enables the filesystem watcher (calls the post-activate hook on changes). `sandbox_root:` (optional) bounds the runtime `set_root_dir` swap to a subtree — see [Watch & Workspace](watch-and-workspace.md#bounding-the-swap-sandbox_root). Omitted, swaps stay unbounded, which is the default.
 
 ### `extensions:`
 

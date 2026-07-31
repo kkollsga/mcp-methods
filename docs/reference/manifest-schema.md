@@ -70,8 +70,11 @@ The framework parses but doesn't instantiate. Downstream binaries load when `tru
 | `kind` | `"github"` \| `"local"` | Required |
 | `root` | string | Required for `kind: local`; ignored for `github` |
 | `watch` | bool | Optional, `local` mode only |
+| `sandbox_root` | string | Optional, `local` mode only — containment boundary for `set_root_dir` |
 
 The manifest `workspace:` block wins over CLI `--workspace` flag.
+
+`sandbox_root` resolves relative to the manifest YAML's directory, exactly like `root`. When set, the `set_root_dir` tool refuses any target whose *canonical* path is not inside it (so `..` traversals and symlinks out of the tree are rejected too), and the server refuses to boot if `root` itself lies outside the boundary. **Unset — the default — means unbounded**: `set_root_dir` accepts any directory on the filesystem, which is the historical behaviour.
 
 ## `skills:` polymorphic value
 

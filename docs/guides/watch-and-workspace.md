@@ -68,6 +68,31 @@ Concurrent reads from the source tools see the new path atomically once the RwLo
 
 **Note:** the [0.3.28 fix](../changelog.md) corrected a bug where `set_root_dir` was clobbering the just-set path back to the configured `workspace_dir`. If you're on a pre-0.3.28 pin, upgrade.
 
+### Bounding the swap: `sandbox_root`
+
+The swap above is **unbounded** — `set_root_dir` accepts any directory on the filesystem. That is the default and it does not change. When a deployment wants an outer boundary, declare one:
+
+```yaml
+workspace:
+  kind: local
+  root: ./repos/active        # the initial root
+  sandbox_root: ./repos       # the outer boundary swaps may never leave
+  watch: true
+```
+
+With `sandbox_root` set:
+
+```text
+agent → set_root_dir("./repos/other")   → activates (inside the boundary)
+agent → set_root_dir("/etc")            → "set_root_dir: /etc escapes
+                                           workspace.sandbox_root (…/repos).
+                                           The active root is unchanged."
+```
+
+The check runs on the **canonicalized** target, so `../` traversals and symlinks pointing out of the tree are rejected as well, and it runs *before* activation — a rejected swap leaves the active root and the post-activate hook untouched. A manifest whose `root` sits outside its own `sandbox_root` fails at boot rather than at the first swap.
+
+`sandbox_root` is `local` mode only (a `github` workspace declaring it is a manifest error) and resolves relative to the manifest YAML, exactly like `root`. Downstream binaries wire the same boundary with `Workspace::open_local(root, hook)?.with_sandbox_root(&boundary)?`.
+
 ### Filesystem watcher
 
 When `workspace.watch: true`, the framework spawns a `notify-debouncer-mini` watcher over `workspace.root`. The watcher debounces filesystem events for 250ms then fires the post-activate hook against the current active root.
