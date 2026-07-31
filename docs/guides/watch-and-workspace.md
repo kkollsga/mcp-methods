@@ -93,6 +93,33 @@ The check runs on the **canonicalized** target, so `../` traversals and symlinks
 
 `sandbox_root` is `local` mode only (a `github` workspace declaring it is a manifest error) and resolves relative to the manifest YAML, exactly like `root`. Downstream binaries wire the same boundary with `Workspace::open_local(root, hook)?.with_sandbox_root(&boundary)?`.
 
+### Adopting the client's root: `adopt_client_roots`
+
+> **Deprecated upstream.** The MCP `roots` feature is deprecated as of protocol revision `2026-07-28` ([SEP-2577](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577)): *"New implementations SHOULD NOT adopt it; existing implementations SHOULD migrate to passing directories or files via tool parameters, resource URIs, or server configuration."* The earliest revision that may remove it is the first one released on or after **2027-07-28**. This framework implements it because it is opt-in and because `rmcp` negotiates `2025-11-25`, where the mechanism is live — but a deployment turning it on should know the migration path is already published: pass the directory as a **tool parameter**, a **resource URI**, or **server configuration** (`workspace.root`).
+
+Many MCP hosts already tell the server which directory the user is working in, via the client-side `roots` capability. `adopt_client_roots` consumes that, so an operator does not have to hand-write a path the client already offered:
+
+```yaml
+workspace:
+  kind: local
+  adopt_client_roots: true    # no `root:` — it arrives from the client
+  sandbox_root: /srv/code     # strongly recommended (see below)
+```
+
+With no `root:` the server boots **unanchored**: nothing is bound, no `.mcp-workspace/` is created, and the source tools behave exactly as they do with no root configured. After the MCP handshake the server asks the client for its roots and binds the **first valid** one.
+
+What "valid" means, in order: the URI is a `file://` URI (per spec it must be) with an empty host or `localhost`; the path resolves and is a directory; and the canonical path is inside `sandbox_root`, if one is declared. Any root failing that is skipped with a warning and the next one is tried — a bad root is never fatal and never answered with a protocol error. If none survives, the server simply stays unanchored.
+
+Three properties are worth stating explicitly:
+
+- **It is fallback-only.** `workspace.root`, `--watch`, `--source-root`, `--workspace`, and any runtime `set_root_dir` call all take permanent ownership of the root. Adoption never overrides them, including on a later `roots/list_changed`. You can set `adopt_client_roots: true` *alongside* a `root:` — it will simply never fire.
+- **The client's root is a suggestion, not a boundary.** The spec is explicit that roots are "informational guidance rather than an access-control mechanism". `sandbox_root` is what actually bounds what the server will read, and adoption goes through the same containment check as `set_root_dir` — one code path, not two. Pair the two keys.
+- **Clients that do not advertise `roots` are untouched.** No `roots/list` request is put on the wire for them, and nothing is added to connect time for anybody: the exchange happens on a task the MCP runtime spawns after the handshake completes.
+
+The ordering caveat: **no revision of the MCP schema says anything about the order of the roots array**, so "first valid" is whatever order the client chose to send. For a deterministic root, configure `workspace.root`.
+
+`roots/list_changed` re-runs adoption while the root is still client-owned, and only for clients that advertised `roots.listChanged`. Downstream binaries wire the same behaviour with `Workspace::open_local_unanchored(hook)?.with_sandbox_root(&boundary)?.with_adopt_client_roots()`.
+
 ### Filesystem watcher
 
 When `workspace.watch: true`, the framework spawns a `notify-debouncer-mini` watcher over `workspace.root`. The watcher debounces filesystem events for 250ms then fires the post-activate hook against the current active root.
