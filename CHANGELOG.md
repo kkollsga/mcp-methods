@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 — 2026-07-31
 
 **Sequential behaviour is unchanged.** A deployment that sets neither new
 manifest key sees no difference in any single-threaded path — both features are
