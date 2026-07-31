@@ -30,7 +30,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
@@ -326,7 +326,33 @@ struct WorkspaceInner {
     /// Who owns the active root (see [`RootOwnership`]). `Operator` for
     /// every workspace opened with a configured root; `Unowned` only
     /// after [`Workspace::open_local_unanchored`].
+    ///
+    /// Every **writer** also holds [`root_swap`](Self::root_swap), so the
+    /// value is stable for as long as that guard is held. This lock exists
+    /// separately only so the cheap [`Workspace::root_ownership`] read
+    /// never queues behind a root swap's activation.
     root_ownership: Mutex<RootOwnership>,
+    /// Orders a client-root adoption against operator root swaps.
+    ///
+    /// **Read** = an operator swap ([`Workspace::set_root_dir`]);
+    /// **write** = an adoption ([`Workspace::adopt_client_root`]).
+    ///
+    /// Operator swaps deliberately still overlap *each other* — two
+    /// concurrent `set_root_dir` calls are made coherent by activation
+    /// generations (the newer request supersedes the older one), not by
+    /// exclusion. An adoption cannot use that mechanism, because its
+    /// precedence rule is not "newest wins" but "the operator always
+    /// wins", and that rule spans three steps: read the ownership flag,
+    /// swap, publish the flag. Holding the write side across all three
+    /// makes those steps atomic with respect to any operator swap.
+    ///
+    /// Without it the two entry points interleave as: adoption passes its
+    /// ownership check → the operator swaps to B → adoption's activation
+    /// commits A last → adoption publishes `Adopted` → the operator
+    /// publishes `Operator`. Final state: the *client's* root active,
+    /// flagged as the operator's, after the operator's tool call already
+    /// returned naming a different path.
+    root_swap: RwLock<()>,
     /// Local mode, unanchored boot only: the directory that ends up
     /// holding `.mcp-workspace/`, chosen at the *first* activation and
     /// then fixed forever (the anchored constructors decide it up front
@@ -396,6 +422,7 @@ impl Workspace {
                 activation_transaction: None,
                 sandbox_root: None,
                 root_ownership: Mutex::new(RootOwnership::Operator),
+                root_swap: RwLock::new(()),
                 deferred_anchor: OnceLock::new(),
                 adopt_client_roots: false,
             }),
@@ -450,6 +477,7 @@ impl Workspace {
                 // `Operator` from the first instant — that is exactly what
                 // makes client-root adoption fallback-only.
                 root_ownership: Mutex::new(RootOwnership::Operator),
+                root_swap: RwLock::new(()),
                 deferred_anchor: OnceLock::new(),
                 adopt_client_roots: false,
             }),
@@ -493,6 +521,7 @@ impl Workspace {
                 activation_transaction: None,
                 sandbox_root: None,
                 root_ownership: Mutex::new(RootOwnership::Unowned),
+                root_swap: RwLock::new(()),
                 deferred_anchor: OnceLock::new(),
                 adopt_client_roots: false,
             }),
@@ -539,8 +568,49 @@ impl Workspace {
     }
 
     /// Who chose the active root — see [`RootOwnership`].
+    ///
+    /// Never blocks on an in-flight activation: the flag has a lock of its
+    /// own, distinct from the swap ordering lock that a root swap holds
+    /// across its (arbitrarily long) build.
     pub fn root_ownership(&self) -> RootOwnership {
-        *self.inner.root_ownership.lock().unwrap()
+        *self.lock_ownership()
+    }
+
+    /// Lock the root-ownership flag, recovering from poisoning.
+    ///
+    /// The guarded value is one `Copy` enum written by a single
+    /// assignment, so a panic elsewhere under the guard cannot leave it
+    /// half-updated — there is nothing torn to protect against.
+    /// Recovering matters because these guards are now reachable from a
+    /// request handler and from the client-`roots` task: a panicking
+    /// post-activate hook must not turn every later root operation
+    /// (including the read-only `root_ownership()`) into a panic of its
+    /// own.
+    fn lock_ownership(&self) -> MutexGuard<'_, RootOwnership> {
+        self.inner
+            .root_ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Shared side of the swap ordering lock — taken by an operator swap.
+    /// See [`WorkspaceInner::root_swap`]. Poison-recovering for the same
+    /// reason as [`lock_ownership`](Self::lock_ownership); the guarded
+    /// value is `()`.
+    fn lock_operator_swap(&self) -> RwLockReadGuard<'_, ()> {
+        self.inner
+            .root_swap
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Exclusive side of the swap ordering lock — taken by a client-root
+    /// adoption for its whole check-swap-publish sequence.
+    fn lock_adoption(&self) -> RwLockWriteGuard<'_, ()> {
+        self.inner
+            .root_swap
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Bound runtime root swaps to a containment boundary (local mode).
@@ -1564,13 +1634,25 @@ impl Workspace {
     /// `revs` (optional): resolve revisions against the new root (which
     /// must be a git repo) and fire the revs-aware hook — see
     /// [`activate`](Self::activate) / [`RevsRequest`].
+    ///
+    /// Concurrency: two `set_root_dir` calls may overlap — the newer
+    /// activation supersedes the older one. A client-root adoption may not
+    /// overlap either of them: it is exclusive with every operator swap
+    /// for its whole check-swap-publish sequence, which is what makes
+    /// "the operator always wins" true rather than merely likely. Must
+    /// not be called from inside an activation hook (that has always been
+    /// true — the legacy hook path already serializes on its own lock).
     pub fn set_root_dir(&self, new_root: &Path, revs: Option<&RevsRequest>) -> String {
+        // Held across the swap *and* the ownership publication below, so
+        // an adoption cannot slip its own activation between them. Shared,
+        // so concurrent operator swaps keep overlapping as before.
+        let _swap = self.lock_operator_swap();
         match self.swap_root(new_root, revs, "set_root_dir") {
             Ok(msg) => {
                 // Operator intent is permanent: from here on no
                 // client-advertised root may displace this one, including
                 // via `roots/list_changed`.
-                *self.inner.root_ownership.lock().unwrap() = RootOwnership::Operator;
+                *self.lock_ownership() = RootOwnership::Operator;
                 msg
             }
             Err(msg) => msg,
@@ -1595,20 +1677,23 @@ impl Workspace {
     /// `Err` is a human-readable reason for the log; adoption failure is
     /// never fatal to the server.
     pub fn adopt_client_root(&self, new_root: &Path) -> Result<String, String> {
-        // Held across the swap: an operator `set_root_dir` racing this
-        // adoption then either loses the race outright (it blocks here and
-        // flips to `Operator` afterwards, which is what it wanted) or has
-        // already flipped, and we bail below. Either way the operator's
-        // choice is the one that survives.
-        let mut ownership = self.inner.root_ownership.lock().unwrap();
-        if *ownership == RootOwnership::Operator {
+        // Exclusive for the whole check → swap → publish sequence, which
+        // is what makes "the operator always wins" true rather than
+        // merely likely. A racing `set_root_dir` either has not started
+        // (it then waits here and ends up both active and `Operator`), or
+        // it completed first (it published `Operator` before releasing,
+        // so the check below refuses). What is *not* possible any more is
+        // the two overlapping: the operator swapping while this adoption
+        // is mid-activation, and this activation committing last.
+        let _swap = self.lock_adoption();
+        if *self.lock_ownership() == RootOwnership::Operator {
             return Err(
                 "the active root was chosen by the operator; client roots are fallback-only"
                     .to_string(),
             );
         }
         let msg = self.swap_root(new_root, None, "adopt_client_root")?;
-        *ownership = RootOwnership::Adopted;
+        *self.lock_ownership() = RootOwnership::Adopted;
         Ok(msg)
     }
 
@@ -1620,6 +1705,13 @@ impl Workspace {
     ///
     /// `Err` carries the same message the tool would have returned; the
     /// caller decides whether that is a tool result or a log line.
+    ///
+    /// Both callers hold [`root_swap`](WorkspaceInner::root_swap) across
+    /// this call — shared for an operator swap, exclusive for an adoption.
+    ///
+    /// `who` names the entry point and appears in every message this
+    /// returns, so a rejection logged by the adoption path never claims to
+    /// be about `set_root_dir`.
     fn swap_root(
         &self,
         new_root: &Path,
@@ -1627,7 +1719,7 @@ impl Workspace {
         who: &str,
     ) -> Result<String, String> {
         if !matches!(self.inner.kind, WorkspaceKind::Local) {
-            return Err("set_root_dir is only valid in local-workspace mode.".to_string());
+            return Err(format!("{who} is only valid in local-workspace mode."));
         }
         if !new_root.is_dir() {
             return Err(format!(
@@ -2655,6 +2747,193 @@ mod tests {
             "unexpected output: {out}"
         );
         assert!(ws.active_repo_path().is_none());
+    }
+
+    /// `swap_root`'s mode check names the entry point that called it, so a
+    /// rejection logged by the adoption path never claims to be about
+    /// `set_root_dir`. (Reachable only through `swap_root` itself: a
+    /// github workspace is `Operator`-owned, so `adopt_client_root`
+    /// refuses one step earlier.)
+    #[test]
+    fn a_non_local_swap_names_the_caller_that_attempted_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
+        let err = ws
+            .swap_root(dir.path(), None, "adopt_client_root")
+            .unwrap_err();
+        assert_eq!(
+            err, "adopt_client_root is only valid in local-workspace mode.",
+            "the message must name the caller: {err}"
+        );
+    }
+
+    /// A one-shot gate: a flag plus a condvar, so two threads can be
+    /// sequenced by *signal* rather than by sleeping.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+        }
+
+        /// Wait, but give up after `limit`. Used where the *point* of the
+        /// fix is that the awaited signal never comes.
+        fn wait_until(&self, limit: std::time::Duration) {
+            let open = self.open.lock().unwrap();
+            let _ = self
+                .cv
+                .wait_timeout_while(open, limit, |open| !*open)
+                .unwrap();
+        }
+    }
+
+    /// A client-root adoption may not interleave with an operator swap.
+    ///
+    /// The window this closes: adoption passes its ownership check, the
+    /// operator's `set_root_dir` swaps to its own root, adoption's
+    /// activation commits *last*, and the ownership publications land
+    /// `Adopted` then `Operator`. The result was the **client's** root
+    /// active while flagged as the operator's — after the operator's tool
+    /// call had already returned.
+    ///
+    /// Sequencing is by signal, not by sleep. The operator's activation is
+    /// held inside the transaction hook until the adoption's own hook
+    /// reports that it got past the ownership check and into preparation —
+    /// precisely the state the race needs, and the reason the failure is
+    /// deterministic without the fix. *With* the fix the adoption never
+    /// reaches that point (it waits on the swap ordering lock), so the
+    /// operator's wait falls through on its belt; the outcome is then the
+    /// same for every interleaving, which is the whole point.
+    #[test]
+    fn an_adoption_cannot_displace_a_concurrent_operator_swap() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let client_root = base.join("client");
+        let operator_root = base.join("operator");
+        std::fs::create_dir_all(&client_root).unwrap();
+        std::fs::create_dir_all(&operator_root).unwrap();
+
+        let operator_in_hook = Arc::new(Gate::default());
+        let adoption_in_hook = Arc::new(Gate::default());
+        let hook: ActivationTransactionHook = {
+            let client_root = client_root.clone();
+            let operator_in_hook = operator_in_hook.clone();
+            let adoption_in_hook = adoption_in_hook.clone();
+            Arc::new(move |request| {
+                if request.path() == client_root {
+                    adoption_in_hook.open();
+                } else {
+                    operator_in_hook.open();
+                    adoption_in_hook.wait_until(std::time::Duration::from_secs(2));
+                }
+                Ok(PreparedActivation::summary(None))
+            })
+        };
+        // Unanchored, so adoption is permitted at all.
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let operator = {
+            let ws = ws.clone();
+            let target = operator_root.clone();
+            std::thread::spawn(move || ws.set_root_dir(&target, None))
+        };
+        // The operator now holds an activation id and is mid-build.
+        operator_in_hook.wait();
+        let adoption = {
+            let ws = ws.clone();
+            let target = client_root.clone();
+            std::thread::spawn(move || ws.adopt_client_root(&target))
+        };
+
+        let operator_out = operator.join().unwrap();
+        let adoption_out = adoption.join().unwrap();
+
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(operator_root.as_path()),
+            "a client root displaced the operator's swap \
+             (operator said: {operator_out}; adoption said: {adoption_out:?})"
+        );
+        assert_eq!(
+            ws.root_ownership(),
+            RootOwnership::Operator,
+            "the surviving root must also be flagged as the operator's"
+        );
+        assert!(
+            adoption_out.is_err(),
+            "the adoption ran second and must have been refused: {adoption_out:?}"
+        );
+    }
+
+    /// The mirror image: an operator swap issued while an adoption is
+    /// already mid-activation still ends as the operator's root. The
+    /// adoption completes first (it holds the swap lock), the operator's
+    /// swap then lands on top of it — no ordering leaves the client's root
+    /// active.
+    #[test]
+    fn an_operator_swap_wins_when_an_adoption_is_already_mid_activation() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let client_root = base.join("client");
+        let operator_root = base.join("operator");
+        std::fs::create_dir_all(&client_root).unwrap();
+        std::fs::create_dir_all(&operator_root).unwrap();
+
+        let adoption_in_hook = Arc::new(Gate::default());
+        let release_adoption = Arc::new(Gate::default());
+        let hook: ActivationTransactionHook = {
+            let client_root = client_root.clone();
+            let adoption_in_hook = adoption_in_hook.clone();
+            let release_adoption = release_adoption.clone();
+            Arc::new(move |request| {
+                if request.path() == client_root {
+                    adoption_in_hook.open();
+                    release_adoption.wait();
+                }
+                Ok(PreparedActivation::summary(None))
+            })
+        };
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_activation_transaction(hook);
+
+        let adoption = {
+            let ws = ws.clone();
+            let target = client_root.clone();
+            std::thread::spawn(move || ws.adopt_client_root(&target))
+        };
+        adoption_in_hook.wait();
+        let operator = {
+            let ws = ws.clone();
+            let target = operator_root.clone();
+            std::thread::spawn(move || ws.set_root_dir(&target, None))
+        };
+        release_adoption.open();
+
+        let adoption_out = adoption.join().unwrap();
+        let operator_out = operator.join().unwrap();
+
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(operator_root.as_path()),
+            "the operator's swap must survive an in-flight adoption \
+             (adoption said: {adoption_out:?}; operator said: {operator_out})"
+        );
+        assert_eq!(ws.root_ownership(), RootOwnership::Operator);
     }
 
     #[test]
