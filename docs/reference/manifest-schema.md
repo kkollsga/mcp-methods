@@ -68,13 +68,16 @@ The framework parses but doesn't instantiate. Downstream binaries load when `tru
 | Key | Type | Notes |
 |---|---|---|
 | `kind` | `"github"` \| `"local"` | Required |
-| `root` | string | Required for `kind: local`; ignored for `github` |
-| `watch` | bool | Optional, `local` mode only |
+| `root` | string | Required for `kind: local` unless `adopt_client_roots` is set; ignored for `github` |
+| `watch` | bool | Optional, `local` mode only; requires `root` |
 | `sandbox_root` | string | Optional, `local` mode only — containment boundary for `set_root_dir` |
+| `adopt_client_roots` | bool | Optional, `local` mode only — adopt an MCP-client-advertised root when none is configured. Default `false` |
 
 The manifest `workspace:` block wins over CLI `--workspace` flag.
 
 `sandbox_root` resolves relative to the manifest YAML's directory, exactly like `root`. When set, the `set_root_dir` tool refuses any target whose *canonical* path is not inside it (so `..` traversals and symlinks out of the tree are rejected too), and the server refuses to boot if `root` itself lies outside the boundary. **Unset — the default — means unbounded**: `set_root_dir` accepts any directory on the filesystem, which is the historical behaviour.
+
+`adopt_client_roots` is the only key that relaxes the `root`-is-required rule, and it is fallback-only in every other respect — see [Adopting the client's root](../guides/watch-and-workspace.md#adopting-the-clients-root-adopt_client_roots). Note the upstream deprecation documented there before adopting it.
 
 ## `skills:` polymorphic value
 
