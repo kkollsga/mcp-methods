@@ -354,11 +354,12 @@ struct WorkspaceInner {
     /// returned naming a different path.
     root_swap: RwLock<()>,
     /// Local mode, unanchored boot only: the directory that ends up
-    /// holding `.mcp-workspace/`, chosen at the *first* activation and
-    /// then fixed forever (the anchored constructors decide it up front
-    /// and leave this unset). Fixed-forever mirrors the anchored rule
-    /// that `workspace_dir` survives root swaps so the inventory does
-    /// too — see the note in [`Workspace::set_root_dir`].
+    /// holding `.mcp-workspace/`, chosen at the first activation that
+    /// **commits** and then fixed forever (the anchored constructors
+    /// decide it up front and leave this unset). Fixed-forever mirrors
+    /// the anchored rule that `workspace_dir` survives root swaps so the
+    /// inventory does too — see the note in [`Workspace::set_root_dir`].
+    /// Set by [`Workspace::anchor_inventory`], never by a mere attempt.
     deferred_anchor: OnceLock<PathBuf>,
     /// Opt-in (`workspace.adopt_client_roots`): may this server adopt a
     /// root advertised by the MCP client as a *fallback* when the
@@ -496,10 +497,13 @@ impl Workspace {
     /// is the designed outcome when no root ever arrives.
     ///
     /// The inventory directory is deliberately *not* created here: with no
-    /// root there is nowhere to put it. The first activation picks the
-    /// directory (`<root>/.mcp-workspace/`) and it is fixed from then on,
-    /// mirroring the anchored mode's rule that the inventory survives
-    /// later root swaps.
+    /// root there is nowhere to put it. The first activation that
+    /// **commits** picks the directory (`<root>/.mcp-workspace/`) and it is
+    /// fixed from then on, mirroring the anchored mode's rule that the
+    /// inventory survives later root swaps. An activation that fails its
+    /// build picks nothing and creates nothing — a client-proposed root
+    /// that never activated must not end up owning the inventory, nor
+    /// gain a directory it did not have.
     ///
     /// [`root_ownership`](Self::root_ownership) starts at
     /// [`RootOwnership::Unowned`] — the only constructor that does.
@@ -975,33 +979,21 @@ impl Workspace {
             // and prevents a concurrent activation from changing the path
             // fingerprinted by this request. Refresh calls snapshot the
             // currently committed root and pass it through the same argument.
-            let root = match requested_local_root
+            //
+            // So every local caller supplies the root — `repo_management`
+            // having already refused with "No active local root." when
+            // there is none. The fallback below is an internal invariant,
+            // not a user-facing state, and deliberately does not describe
+            // one.
+            let root = requested_local_root
                 .map(Path::to_path_buf)
                 .or_else(|| self.active_repo_path())
-            {
-                Some(root) => root,
-                None => match self.inventory_base() {
-                    Some(base) => base.to_path_buf(),
-                    // Unanchored boot with nothing adopted yet: there is no
-                    // root to refresh. Erroring keeps `repo_management`
-                    // honest instead of fingerprinting the empty path.
-                    None => anyhow::bail!(
-                        "no active root: this workspace booted unanchored \
-                         (workspace.adopt_client_roots) and no client root has been adopted"
-                    ),
-                },
-            };
-            // First activation after an unanchored boot picks the directory
-            // that owns `.mcp-workspace/` from here on. Created eagerly so
-            // the very first `bump_access` has somewhere to write, exactly
-            // as `open_local` does at boot.
-            if self.inventory_base().is_none() {
-                let inv_dir = root.join(".mcp-workspace");
-                fs::create_dir_all(&inv_dir).with_context(|| {
-                    format!("failed to create local-workspace dir {}", inv_dir.display())
-                })?;
-                let _ = self.inner.deferred_anchor.set(root.clone());
-            }
+                .context("internal error: local activation without a root")?;
+            // NB: the inventory anchor is *not* chosen here. An unanchored
+            // boot picks the directory that owns `.mcp-workspace/` at the
+            // first activation that actually commits — see
+            // `anchor_inventory` — so a proposal that fails its build
+            // writes nothing inside the proposed root.
             let prev_sha = self.last_built_sha(name);
             let fingerprint = fingerprint_dir(&root);
             let action = match prev_sha {
@@ -1350,6 +1342,11 @@ impl Workspace {
             let summary = prepared.commit().with_context(|| {
                 format!("activation request {activation_id} for '{name}' failed during commit")
             })?;
+            // The build is live, so this activation is the one that gets to
+            // fix the inventory anchor (no-op unless this is the first
+            // commit after an unanchored boot). Must precede `record_built`,
+            // which needs somewhere to write its receipt.
+            self.anchor_inventory(&repo_path, name, &action);
             if !matches!(request.build(), ActivationBuild::Reuse) {
                 let built_revs = revision_build.then_some(revs).flatten();
                 self.record_built(name, &head_sha, built_revs);
@@ -1392,6 +1389,46 @@ impl Workspace {
             Some(s) if !s.is_empty() => format!("{base}\n\n{s}"),
             _ => base,
         })
+    }
+
+    /// Fix the inventory home on the first activation that **commits**.
+    ///
+    /// A no-op outside one window: a local workspace that booted
+    /// unanchored ([`open_local_unanchored`](Self::open_local_unanchored))
+    /// and has not committed an activation yet. Every anchored constructor
+    /// decides the directory up front.
+    ///
+    /// Deliberately driven from the commit block rather than from
+    /// `clone_or_update`. The root of an unanchored workspace arrives from
+    /// an *external* party (an MCP client's advertised root), so a
+    /// proposal that fails its build must leave nothing of itself behind:
+    /// no `.mcp-workspace/` created inside the client's directory, and no
+    /// permanently-fixed anchor pointing at a root that never activated.
+    ///
+    /// `bump_access` already ran for this activation, while there was
+    /// still nowhere to write; it is repeated here so the entry
+    /// `record_built` is about to update exists. Not a double count — the
+    /// earlier call's save was a no-op.
+    ///
+    /// A directory-creation failure is logged, not propagated: the
+    /// downstream product is published by the time this runs, and
+    /// bookkeeping in the unanchored window is best-effort by
+    /// construction (see [`save_inventory_unlocked`](Self::save_inventory_unlocked)).
+    /// The workspace stays unanchored and the next activation retries.
+    fn anchor_inventory(&self, root: &Path, name: &str, action: &str) {
+        if !matches!(self.inner.kind, WorkspaceKind::Local) || self.inventory_base().is_some() {
+            return;
+        }
+        let inv_dir = root.join(".mcp-workspace");
+        if let Err(e) = fs::create_dir_all(&inv_dir) {
+            tracing::warn!(
+                "failed to create local-workspace dir {}: {e}",
+                inv_dir.display()
+            );
+            return;
+        }
+        let _ = self.inner.deferred_anchor.set(root.to_path_buf());
+        self.bump_access(name, action);
     }
 
     /// Record the outcome of a successful build: the HEAD SHA plus the
@@ -2742,11 +2779,63 @@ mod tests {
     fn unanchored_refresh_before_adoption_is_a_clean_error() {
         let ws = Workspace::open_local_unanchored(None).unwrap();
         let out = ws.repo_management(None, false, true, false, None);
-        assert!(
-            out.contains("no active root") || out.contains("No active"),
-            "unexpected output: {out}"
-        );
+        // The exact message, not a family of them: `repo_management`
+        // refuses here, before `activate` is ever called, and asserting
+        // loosely would let a second (unreachable) error string pass for
+        // coverage it does not have.
+        assert_eq!(out, "No active local root.", "unexpected output: {out}");
         assert!(ws.active_repo_path().is_none());
+    }
+
+    /// A build that fails must leave nothing of itself in a root the
+    /// *client* proposed: no `.mcp-workspace/` created inside it, and no
+    /// permanently-fixed inventory anchor pointing at a root that never
+    /// activated.
+    #[test]
+    fn a_failed_first_adoption_writes_nothing_into_the_clients_root() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let rejected = base.join("rejected");
+        let good = base.join("good");
+        std::fs::create_dir_all(&rejected).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+
+        let hook: PostActivateHook = {
+            let rejected = rejected.clone();
+            Arc::new(move |path, _name| {
+                if path == rejected {
+                    anyhow::bail!("builder refused this root");
+                }
+                Ok(())
+            })
+        };
+        let ws = Workspace::open_local_unanchored(Some(hook)).unwrap();
+
+        assert!(
+            ws.adopt_client_root(&rejected).is_err(),
+            "the hook refused, so the adoption must fail"
+        );
+        assert!(
+            !rejected.join(".mcp-workspace").exists(),
+            "a failed adoption must not create a directory inside the client's root"
+        );
+        assert!(ws.active_repo_path().is_none(), "nothing activated");
+        assert_eq!(
+            ws.workspace_dir(),
+            Path::new(""),
+            "a failed attempt must not fix the inventory anchor"
+        );
+
+        // ... so the *next* root, the first one that actually commits, is
+        // the one that gets to own the inventory.
+        ws.adopt_client_root(&good).unwrap();
+        assert_eq!(ws.workspace_dir(), good.as_path());
+        assert!(good.join(".mcp-workspace").is_dir());
+        assert!(
+            good.join(".mcp-workspace").join("inventory.json").is_file(),
+            "the anchoring activation must still write its inventory receipt"
+        );
+        assert!(!rejected.join(".mcp-workspace").exists());
     }
 
     /// `swap_root`'s mode check names the entry point that called it, so a
