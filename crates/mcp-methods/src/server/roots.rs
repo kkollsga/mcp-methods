@@ -380,12 +380,30 @@ mod tests {
 
     #[test]
     fn non_file_scheme_rejected() {
-        for uri in ["https://example.com/repo", "git+ssh://host/repo", "/tmp/x"] {
+        for uri in [
+            "https://example.com/repo",
+            "git+ssh://host/repo",
+            "/tmp/x",
+            // These two are shaped exactly like an acceptable `file://`
+            // URI — empty authority, absolute path — so only the scheme
+            // check can reject them.
+            "http:///srv/code",
+            "data:/srv/code",
+        ] {
             assert!(
                 file_uri_to_path(uri).is_err(),
                 "{uri} should not convert to a path"
             );
         }
+    }
+
+    #[test]
+    fn an_encoded_separator_cannot_forge_a_local_authority() {
+        // `localhost%2Fevil` is one authority component naming a host we
+        // do not have, not `localhost` followed by a path. Decoding before
+        // the authority split would turn it into the latter.
+        let err = file_uri_to_path("file://localhost%2Fevil/path").unwrap_err();
+        assert!(err.contains("localhost%2Fevil"), "unexpected error: {err}");
     }
 
     #[test]
