@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+Both entries below are **additive** — no existing behaviour changes and no
+public signature was altered. A deployment that sets neither new manifest key
+gets byte-for-byte the previous behaviour. Named here rather than argued into
+a minor: the new public surface is `Workspace::with_sandbox_root`,
+`Workspace::adopt_client_root`, `Workspace::open_local_unanchored`, and the
+`RootOwnership` enum.
+
+### Added — `workspace.sandbox_root`, an opt-in boundary on root swaps
+
+- **`set_root_dir` accepted any directory on the filesystem.** It checked
+  local mode, checked `is_dir`, canonicalized, and activated. There was no
+  containment test — because no containment *concept* existed anywhere in the
+  framework. The read sandbox is derived from the active root (the
+  `source_roots` provider installed by `with_workspace`), so the `starts_with`
+  checks in the source tools were containment relative to wherever the server
+  currently pointed; they never constrained where it could be pointed. Setting
+  `workspace.sandbox_root` now bounds that: a swap whose canonicalized target
+  falls outside the boundary is refused, with an error naming the boundary.
+  Because the check runs on the *canonical* path, `..` traversals and symlinks
+  leading out of the tree are caught; because it returns before `activate`, a
+  refused swap leaves the active root untouched rather than half-swapped.
+- **A manifest that contradicts itself now dies at boot.** `workspace.root`
+  outside `workspace.sandbox_root` is a startup error, not a surprise at the
+  first swap.
+- **The default is unbounded and unchanged.** This was surfaced by kglite while
+  planning roots adoption, and it is worth being precise about what it was: not
+  a defect against this project's documentation, which describes `set_root_dir`
+  as an unbounded runtime swap and uses a sibling-directory swap as its worked
+  example. It is new machinery for consumers who need a boundary, not a
+  restored check. Consumers who swap roots freely today are unaffected.
+
+### Added — `workspace.adopt_client_roots`, MCP `roots` as a fallback root source
+
+- **The client already told us where the workspace is; nobody was listening.**
+  Hosts such as opencode advertise their workspace directory over the MCP
+  `roots` capability on every connection. With `workspace.adopt_client_roots`
+  set, the server issues `roots/list` after the handshake and — only when no
+  root is explicitly configured — adopts the first advertised root that
+  resolves to a real directory. Requested by kglite on behalf of codingest.
+- **Deprecated upstream; enable with that in view.** MCP `roots` is deprecated
+  as of protocol revision `2026-07-28` (SEP-2577): *"New implementations SHOULD
+  NOT adopt it; existing implementations SHOULD migrate to passing directories
+  or files via tool parameters, resource URIs, or server configuration."* The
+  earliest revision that may remove it is the first released on or after
+  2027-07-28. It ships here because it is opt-in, because `rmcp` negotiates a
+  revision where the mechanism is live, and because the requester asked for it
+  — but the migration path is already published and a new deployment should
+  prefer explicit configuration.
+- **Ordering is client-dependent, by omission in the spec.** `ListRootsResult`
+  is an unordered array in every published schema revision; no text makes the
+  first element primary. "First valid root" is a heuristic that matches what
+  real clients send. Set `workspace.root` explicitly if you need determinism.
+- **Adoption cannot escape containment.** Adoption and `set_root_dir` share one
+  internal swap path, and the `sandbox_root` check lives inside it — an
+  externally proposed root is bounded by exactly the same rule as an
+  agent-proposed one.
+- **Operator intent is permanent.** Once an explicit `set_root_dir` has chosen a
+  root, a later `roots/list_changed` never overrides it.
+- **Failure is inert by construction.** A client that errors the request,
+  answers late, sends a non-`file://` URI, names a foreign host, or points at a
+  nonexistent path leaves the server unanchored with a warning — never a crash,
+  never a retry loop. Clients that do not advertise `roots` are never sent the
+  request at all and pay nothing at connect time.
+
 ## 0.4.2 — 2026-07-28
 
 ### Fixed — declared dependency floors
