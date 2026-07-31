@@ -251,7 +251,9 @@ fn local_workspace_mode(
         // No root: adoption-only boot (the loader already refused this
         // shape without `adopt_client_roots`). The file watcher has
         // nothing to watch, so asking for it is a config error rather
-        // than a silently-dead watcher.
+        // than a silently-dead watcher. The manifest loader rejects this
+        // combination first — this is the belt for a `WorkspaceConfig`
+        // built programmatically rather than parsed.
         if wcfg.watch {
             anyhow::bail!(
                 "workspace.watch requires workspace.root — an adoption-only \
