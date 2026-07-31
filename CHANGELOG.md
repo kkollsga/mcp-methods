@@ -2,9 +2,18 @@
 
 ## Unreleased
 
-**Runtime behaviour is unchanged.** A deployment that sets neither new manifest
-key gets byte-for-byte what it got before — both features are opt-in by config
-presence.
+**Sequential behaviour is unchanged.** A deployment that sets neither new
+manifest key sees no difference in any single-threaded path — both features are
+opt-in by config presence.
+
+**Under concurrency there is one deliberate change, and it reaches everyone**,
+including deployments setting neither key: activations now declare whether they
+*bind* a root or merely *refresh* one, and a refresh can no longer supersede a
+bind. In plain github mode that means a `repo_management(update=true)` racing a
+`repo_management('org/repo')` now abandons its own rebuild rather than
+overwriting the bind, with a correspondingly different response string. See
+Fixed, below — it is the general form of a bug that was reachable in the new
+adoption path.
 
 **One source-level break, called out rather than hidden.** `WorkspaceConfig` is
 publicly re-exported and is not `#[non_exhaustive]`, and it gained two fields
@@ -77,6 +86,43 @@ module and its `file_uri_to_path`, and the two `WorkspaceConfig` fields above.
   nonexistent path leaves the server unanchored with a warning — never a crash,
   never a retry loop. Clients that do not advertise `roots` are never sent the
   request at all and pay nothing at connect time.
+
+### Fixed — an activation could publish a root nobody asked for
+
+These were found by adversarial review of the two features above, before
+release. Two were confirmed by execution, not inferred. Both broke the same
+invariant — *the root an operator explicitly chose is the one that stays
+active* — which the docs state without qualification.
+
+- **An adopted client root could displace an operator's `set_root_dir`.**
+  `set_root_dir` marked ownership `Operator` only *after* its swap finished,
+  while adoption held its own lock across the whole sequence. Interleaved, the
+  adoption's activation committed last and the operator's flag landed on the
+  *client's* root — after the operator's tool call had already returned success
+  naming a different path. Root swaps now take a shared lock and adoption an
+  exclusive one, so overlapping operator swaps still supersede each other as
+  before (that ordering is load-bearing and has its own tests) while an
+  adoption is exclusive with all of them from its ownership check through to
+  publication.
+- **A refresh could decide which root was active.** `repo_management(update=true)`
+  reached the activation path without that lock, so it won generation
+  supersession against an in-flight swap and re-committed the root it had read
+  earlier — the same wrong end state through a different entry point. A refresh
+  means "rebuild whatever is bound" and must never change *which* root is
+  bound; that is now enforced structurally. A refresh cannot supersede a bind,
+  and its commit is a compare-and-swap against the binding it read, checked
+  when its generation is allocated and again at commit, so it can only ever
+  rewrite the identical value. This is the part that also affects github mode.
+- **A failed first adoption left state inside the client's directory.** The
+  inventory directory was created, and the inventory anchor permanently fixed,
+  before the activation committed — so an adoption that passed containment and
+  then failed still wrote `.mcp-workspace/` into a client-proposed root and
+  pinned all later inventory there. Anchoring now happens only when an
+  activation commits.
+- **`watch: true` with no root is now refused by the manifest loader**, not
+  only by the `mcp-server` binary. The reference documentation already said
+  `watch` requires `root`; a library consumer loading a manifest directly was
+  getting a silently dead watcher instead of an error.
 
 ## 0.4.2 — 2026-07-28
 
