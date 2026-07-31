@@ -293,6 +293,15 @@ struct WorkspaceInner {
     /// Request-scoped prepare/commit contract. When configured it replaces
     /// the legacy callback trio for activation work and summary generation.
     activation_transaction: Option<ActivationTransactionHook>,
+    /// Optional outer containment boundary for runtime root swaps, stored
+    /// **canonicalized**. Set via [`Workspace::with_sandbox_root`] (manifest
+    /// key `workspace.sandbox_root`), `None` by default.
+    ///
+    /// `None` means unbounded — [`Workspace::set_root_dir`] accepts any
+    /// directory, which is the historical behaviour. When `Some`, a swap
+    /// target whose canonical path is not inside this directory is rejected
+    /// before any state is touched.
+    sandbox_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -348,6 +357,7 @@ impl Workspace {
                 activation_summary: None,
                 post_activate_revs: None,
                 activation_transaction: None,
+                sandbox_root: None,
             }),
         };
         ws.reconcile_inventory()?;
@@ -395,8 +405,65 @@ impl Workspace {
                 activation_summary: None,
                 post_activate_revs: None,
                 activation_transaction: None,
+                sandbox_root: None,
             }),
         })
+    }
+
+    /// Bound runtime root swaps to a containment boundary (local mode).
+    ///
+    /// With a boundary attached, [`set_root_dir`](Self::set_root_dir)
+    /// refuses any target whose *canonical* path is not inside `boundary`
+    /// — `..` traversals and symlinks out of the tree are therefore
+    /// rejected too, and the rejection happens before any state is
+    /// touched. Without it (the default) `set_root_dir` stays unbounded,
+    /// which is the historical behaviour.
+    ///
+    /// Call immediately after `open_local`, before the workspace is cloned
+    /// into [`crate::server::ServerOptions`] — like
+    /// [`with_activation_summary`](Self::with_activation_summary) it mutates
+    /// the still-unique inner `Arc`. Unlike the hook builders, a late call
+    /// is an **error** rather than a warning: a containment boundary that
+    /// silently failed to attach is worse than no boundary at all.
+    ///
+    /// Errors when the boundary does not exist, when the workspace is not
+    /// local-flavoured, or when the already-active root lies outside the
+    /// boundary — a config that contradicts itself must die at boot, not at
+    /// the first swap.
+    pub fn with_sandbox_root(mut self, boundary: &Path) -> Result<Self> {
+        if !matches!(self.inner.kind, WorkspaceKind::Local) {
+            anyhow::bail!(
+                "sandbox_root is only valid for local workspaces (this one is {})",
+                self.inner.kind.as_str()
+            );
+        }
+        if !boundary.is_dir() {
+            anyhow::bail!(
+                "sandbox_root does not exist or is not a directory: {}",
+                boundary.display()
+            );
+        }
+        let canon = boundary.canonicalize().with_context(|| {
+            format!("failed to canonicalize sandbox_root {}", boundary.display())
+        })?;
+        if let Some(active) = self.active_repo_path() {
+            if !active.starts_with(&canon) {
+                anyhow::bail!(
+                    "active root {} is outside sandbox_root {}: the configured root must lie inside the containment boundary",
+                    active.display(),
+                    canon.display()
+                );
+            }
+        }
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.sandbox_root = Some(canon),
+            None => anyhow::bail!(
+                "with_sandbox_root called after the workspace was cloned; \
+                 the containment boundary {} would not be enforced",
+                canon.display()
+            ),
+        }
+        Ok(self)
     }
 
     /// Attach an [`ActivationSummaryHook`]. Call immediately after
@@ -1337,6 +1404,20 @@ impl Workspace {
             Ok(p) => p,
             Err(e) => return format!("canonicalize failed: {e}"),
         };
+        // Containment (opt-in, see `with_sandbox_root`). Tested on the
+        // *canonical* path — never the raw argument — so `..` traversals and
+        // symlinks pointing out of the tree are caught. Returns before
+        // `activate`, so a rejected swap leaves the active root untouched.
+        if let Some(sandbox) = self.inner.sandbox_root.as_ref() {
+            if !canon.starts_with(sandbox) {
+                return format!(
+                    "set_root_dir: {} escapes workspace.sandbox_root ({}). \
+                     The active root is unchanged.",
+                    canon.display(),
+                    sandbox.display()
+                );
+            }
+        }
         let synthetic = synthesize_local_name(&canon);
         // Note: the WorkspaceInner.workspace_dir field is the path the
         // inventory is stored under. We keep the *original* one (from
@@ -1995,6 +2076,170 @@ mod tests {
             child.canonicalize().unwrap(),
             "post_activate hook saw the wrong root after set_root_dir"
         );
+    }
+
+    /// Containment-test layout: `<base>/sandbox/child` and a sibling
+    /// `<base>/outside`, with **every path canonicalized**. macOS tempdirs
+    /// live under the `/var` → `/private/var` symlink, so an
+    /// un-canonicalized boundary would make every `starts_with` assertion
+    /// (and every raw-vs-canonical mutation) vacuously true.
+    fn sandbox_layout() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let sandbox = base.join("sandbox");
+        let inside = sandbox.join("child");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        (td, sandbox, inside, outside)
+    }
+
+    #[test]
+    fn set_root_dir_outside_sandbox_root_rejected_and_active_root_unchanged() {
+        let (_td, sandbox, _inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local(sandbox.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        let before = ws.active_repo_path().unwrap();
+        assert_eq!(before, sandbox);
+
+        let out = ws.set_root_dir(&outside, None);
+        assert!(
+            out.contains("sandbox_root") && out.contains(&sandbox.display().to_string()),
+            "rejection must name the boundary it violated, got: {out}"
+        );
+        // The failure that matters is a partial activation, not the string.
+        assert_eq!(
+            ws.active_repo_path().unwrap(),
+            before,
+            "a rejected swap must leave the active root untouched"
+        );
+    }
+
+    #[test]
+    fn set_root_dir_inside_sandbox_root_activates() {
+        let (_td, sandbox, inside, _outside) = sandbox_layout();
+        let ws = Workspace::open_local(sandbox.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        let out = ws.set_root_dir(&inside, None);
+        assert_eq!(
+            ws.active_repo_path().unwrap(),
+            inside,
+            "a target inside the boundary must activate; set_root_dir said: {out}"
+        );
+    }
+
+    #[test]
+    fn set_root_dir_dotdot_traversal_out_of_sandbox_rejected() {
+        let (_td, sandbox, inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local(sandbox.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        // Lexically inside the boundary, actually outside it — only the
+        // canonicalized path reveals the escape.
+        let traversal = inside.join("..").join("..").join("outside");
+        assert!(
+            traversal.starts_with(&sandbox),
+            "test is meaningless unless the raw path looks contained"
+        );
+        let out = ws.set_root_dir(&traversal, None);
+        assert!(
+            out.contains("sandbox_root"),
+            "`..` escape must be rejected, got: {out}"
+        );
+        assert_eq!(ws.active_repo_path().unwrap(), sandbox);
+        assert_ne!(ws.active_repo_path().unwrap(), outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_root_dir_symlink_out_of_sandbox_rejected() {
+        let (_td, sandbox, _inside, outside) = sandbox_layout();
+        let link = sandbox.join("escape-hatch");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let ws = Workspace::open_local(sandbox.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .unwrap();
+        assert!(
+            link.starts_with(&sandbox),
+            "test is meaningless unless the raw path looks contained"
+        );
+        let out = ws.set_root_dir(&link, None);
+        assert!(
+            out.contains("sandbox_root"),
+            "symlink escape must be rejected, got: {out}"
+        );
+        assert_eq!(ws.active_repo_path().unwrap(), sandbox);
+    }
+
+    #[test]
+    fn no_sandbox_root_configured_keeps_swaps_unbounded() {
+        // The backwards-compatibility bar: without the opt-in key an
+        // arbitrary sibling directory still activates, exactly as before.
+        let (_td, sandbox, _inside, outside) = sandbox_layout();
+        let ws = Workspace::open_local(sandbox, None).unwrap();
+        let out = ws.set_root_dir(&outside, None);
+        assert_eq!(
+            ws.active_repo_path().unwrap(),
+            outside,
+            "unbounded default broken; set_root_dir said: {out}"
+        );
+    }
+
+    #[test]
+    fn with_sandbox_root_rejects_active_root_outside_the_boundary() {
+        // A manifest whose `root` sits outside its own `sandbox_root`
+        // contradicts itself — it must die at boot, not at the first swap.
+        let (_td, sandbox, _inside, outside) = sandbox_layout();
+        let err = Workspace::open_local(outside.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .map(|_| ())
+            .expect_err("root outside the boundary must not boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&sandbox.display().to_string())
+                && msg.contains(&outside.display().to_string()),
+            "boot error must name both the root and the boundary, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn with_sandbox_root_accepts_root_equal_to_the_boundary() {
+        let (_td, sandbox, inside, _outside) = sandbox_layout();
+        assert!(Workspace::open_local(sandbox.clone(), None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .is_ok());
+        // …and a root strictly inside it.
+        assert!(Workspace::open_local(inside, None)
+            .unwrap()
+            .with_sandbox_root(&sandbox)
+            .is_ok());
+    }
+
+    #[test]
+    fn with_sandbox_root_rejects_github_workspaces_and_missing_dirs() {
+        let (_td, sandbox, _inside, _outside) = sandbox_layout();
+        let gh = Workspace::open(sandbox.join("gh"), 7, None).unwrap();
+        assert!(
+            gh.with_sandbox_root(&sandbox)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for local"),
+            "sandbox_root on a github workspace must be a loud error"
+        );
+        let missing = sandbox.join("nope");
+        assert!(Workspace::open_local(sandbox, None)
+            .unwrap()
+            .with_sandbox_root(&missing)
+            .is_err());
     }
 
     #[test]

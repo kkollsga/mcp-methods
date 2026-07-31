@@ -45,7 +45,7 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "extensions",
     "skills",
 ];
-const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch", "applies_to"];
+const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch", "applies_to", "sandbox_root"];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
 const ALLOWED_TRUST_KEYS: &[&str] = &["allow_python_tools", "allow_embedder"];
 const ALLOWED_TOOL_KEYS: &[&str] = &[
@@ -246,6 +246,16 @@ pub struct WorkspaceConfig {
     /// Local-mode only: wire the framework's file watcher to `root`
     /// (debounced rebuild trigger via the post-activate hook).
     pub watch: bool,
+    /// Local-mode only: the outer containment boundary for runtime root
+    /// swaps. When set, `set_root_dir` refuses any target that does not
+    /// resolve inside this directory; `root` itself must be inside it or
+    /// the server refuses to boot. Relative paths resolve against the
+    /// YAML's parent dir, exactly like `root`.
+    ///
+    /// **Unset is the default and means unbounded** — `set_root_dir`
+    /// accepts any directory, which is the historical behaviour every
+    /// existing deployment relies on.
+    pub sandbox_root: Option<String>,
     /// Optional opt-in for the [`find_workspace_manifest`] parent-walk
     /// fallback. When set, this manifest is auto-discovered by
     /// ``mcp-server --workspace DIR`` (and similar callers) only when
@@ -853,6 +863,16 @@ fn build_workspace(
             ))
         }
     };
+    let sandbox_root = match map.get("sandbox_root") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            return Err(ManifestError::at(
+                yaml_path,
+                "workspace.sandbox_root must be a non-empty string",
+            ))
+        }
+    };
     let watch = match map.get("watch") {
         None | Some(serde_yaml::Value::Null) => false,
         Some(serde_yaml::Value::Bool(b)) => *b,
@@ -911,11 +931,18 @@ fn build_workspace(
             "workspace.watch is only valid with workspace.kind: local",
         ));
     }
+    if kind == WorkspaceKind::Github && sandbox_root.is_some() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.sandbox_root is only valid with workspace.kind: local",
+        ));
+    }
     Ok(Some(WorkspaceConfig {
         kind,
         root,
         watch,
         applies_to,
+        sandbox_root,
     }))
 }
 
@@ -1868,6 +1895,52 @@ mod tests {
         let f = write_tmp("workspace:\n  kind: github\n  watch: true\n");
         let err = load(f.path()).unwrap_err();
         assert!(err.message.contains("watch is only valid"));
+    }
+
+    #[test]
+    fn workspace_sandbox_root_parses_for_local() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n  sandbox_root: ./\n");
+        let m = load(f.path()).unwrap();
+        let w = m.workspace.unwrap();
+        assert_eq!(w.sandbox_root.as_deref(), Some("./"));
+    }
+
+    #[test]
+    fn workspace_sandbox_root_absent_by_default() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n");
+        let m = load(f.path()).unwrap();
+        assert!(m.workspace.unwrap().sandbox_root.is_none());
+    }
+
+    #[test]
+    fn workspace_sandbox_root_invalid_for_github() {
+        let f = write_tmp("workspace:\n  kind: github\n  sandbox_root: ./repos\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("sandbox_root is only valid"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn workspace_sandbox_root_must_be_a_non_empty_string() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n  sandbox_root: 7\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message
+                .contains("sandbox_root must be a non-empty string"),
+            "unexpected error: {}",
+            err.message
+        );
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n  sandbox_root: ''\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message
+                .contains("sandbox_root must be a non-empty string"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
