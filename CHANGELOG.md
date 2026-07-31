@@ -2,12 +2,24 @@
 
 ## Unreleased
 
-Both entries below are **additive** — no existing behaviour changes and no
-public signature was altered. A deployment that sets neither new manifest key
-gets byte-for-byte the previous behaviour. Named here rather than argued into
-a minor: the new public surface is `Workspace::with_sandbox_root`,
-`Workspace::adopt_client_root`, `Workspace::open_local_unanchored`, and the
-`RootOwnership` enum.
+**Runtime behaviour is unchanged.** A deployment that sets neither new manifest
+key gets byte-for-byte what it got before — both features are opt-in by config
+presence.
+
+**One source-level break, called out rather than hidden.** `WorkspaceConfig` is
+publicly re-exported and is not `#[non_exhaustive]`, and it gained two fields
+(`sandbox_root`, `adopt_client_roots`). Downstream code that builds it with a
+struct literal, or destructures it exhaustively, will not compile until it
+accounts for them; `..Default::default()` and field access are unaffected. The
+version still moves as a **patch** per this project's standing policy — this
+note is where the semver-relevant fact is recorded, so it reaches the people it
+affects.
+
+New public surface: `Workspace::with_sandbox_root`,
+`Workspace::with_adopt_client_roots`, `Workspace::adopt_client_root`,
+`Workspace::open_local_unanchored`, `Workspace::adopts_client_roots`,
+`Workspace::root_ownership`, the `RootOwnership` enum, the `server::roots`
+module and its `file_uri_to_path`, and the two `WorkspaceConfig` fields above.
 
 ### Added — `workspace.sandbox_root`, an opt-in boundary on root swaps
 
