@@ -529,24 +529,38 @@ async fn client_that_errors_the_request_leaves_the_server_functional() {
 
 /// The timeout belt. `Peer::list_roots` has no deadline of its own, so a
 /// client that accepts the request and never answers would otherwise pin
-/// the adoption task forever. Deliberately slow — it waits out the real
-/// 5-second belt to prove the arm fires.
+/// the adoption task for the life of the session.
+///
+/// The client here goes quiet for longer than the belt and *then* answers
+/// with a perfectly good root. The answer must be ignored: once the
+/// deadline passed, that attempt is over. Answering late — rather than not
+/// at all — is what makes the belt observable, since a missing timeout
+/// would happily adopt the late root.
+///
+/// Deliberately slow: it waits out the real deadline.
 #[tokio::test]
-async fn client_that_never_answers_times_out_and_the_server_stays_usable() {
+async fn a_late_answer_after_the_timeout_is_not_adopted() {
+    let (_td, base) = tempdir_with(&["project"]);
     let ws = Workspace::open_local_unanchored(None)
         .unwrap()
         .with_adopt_client_roots();
     let (mut client, _service) = boot(&ws);
     client.handshake(roots_capability()).await;
 
-    let _request = client.expect_request("roots/list").await;
-    // ... and we simply never answer it.
+    let request = client.expect_request("roots/list").await;
     tokio::time::sleep(Duration::from_millis(6_500)).await;
+    client
+        .respond(
+            &request,
+            json!({ "roots": [ { "uri": file_uri(&base.join("project")) } ] }),
+        )
+        .await;
     client.drain_quiet().await;
 
     assert!(
         ws.active_repo_path().is_none(),
-        "a silent client must leave the server unanchored"
+        "an answer that missed the deadline must not be adopted; got {:?}",
+        ws.active_repo_path()
     );
     assert_eq!(ws.root_ownership(), RootOwnership::Unowned);
     client.assert_still_serving().await;
