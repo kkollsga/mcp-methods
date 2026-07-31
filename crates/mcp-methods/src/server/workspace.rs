@@ -376,7 +376,22 @@ struct WorkspaceState {
     /// publication both use the lock, so an older completion can never
     /// overwrite a newer request's intent.
     last_activation_id: u64,
+    /// Newest request of **any** kind. A [`ActivationIntent::Refresh`]
+    /// must still match this to publish, so a newer refresh (or any
+    /// bind) discards an older refresh's stale rebuild.
     latest_requested: Option<ActivationId>,
+    /// Newest request that may *change* the active binding — every
+    /// [`ActivationIntent::Bind`], and deliberately **no** refresh.
+    ///
+    /// A bind is superseded only by a newer bind. Gating it on
+    /// `latest_requested` instead let a concurrent
+    /// `repo_management(update=true)` — which by definition wants the
+    /// binding left alone — discard an in-flight root swap merely by
+    /// holding a newer generation. In local mode that produced the
+    /// framework's one incoherent state: `set_root_dir` reported
+    /// supersession but still published [`RootOwnership::Operator`],
+    /// over a root the *client* had chosen.
+    latest_root_intent: Option<ActivationId>,
     /// The product currently live in this process. Deliberately not
     /// persisted: a new process must rehydrate its downstream product even
     /// when inventory says the source SHA was built previously.
@@ -390,6 +405,82 @@ struct ActiveBuildState {
     path: PathBuf,
     head_sha: String,
     resolved_revs: Option<Vec<String>>,
+}
+
+/// What an activation intends to do with the **active binding**
+/// (`active_repo_name` + `active_repo_path`).
+///
+/// The distinction exists because the two intents need opposite
+/// supersession rules. A bind is new intent about *which* root is
+/// active, so newest-wins is exactly right. A refresh
+/// (`repo_management(update=true)`) carries no opinion about that at
+/// all: it means "rebuild whatever is bound". Letting it take part in
+/// newest-wins gave it the power to cancel a root swap and re-commit the
+/// root the swap was replacing — a refresh silently *deciding* which
+/// root is active, which is the one thing it must never do.
+#[derive(Debug, Clone, Copy)]
+enum ActivationIntent<'a> {
+    /// Bind `name`; in local mode, to this canonical root. Participates
+    /// in generation supersession on both sides.
+    Bind(Option<&'a Path>),
+    /// Rebuild the binding named by `expected_root` (and by `activate`'s
+    /// `name`), which the caller read from live state before it called.
+    ///
+    /// That expectation is a compare-and-swap, checked twice under the
+    /// state write lock: once where the generation is allocated (so a
+    /// binding that already moved never even reaches the build hook —
+    /// the legacy hook publishes its product itself, so "abandon at
+    /// commit" would be too late for it) and once at the commit point (so
+    /// a binding that moves *during* the build cannot be reverted). A
+    /// refresh therefore only ever re-commits the binding it found.
+    Refresh { expected_root: Option<&'a Path> },
+}
+
+impl<'a> ActivationIntent<'a> {
+    /// The local root this request builds against, if any. For a refresh
+    /// that is the binding it expects to still find.
+    fn local_root(self) -> Option<&'a Path> {
+        match self {
+            Self::Bind(root) => root,
+            Self::Refresh { expected_root } => expected_root,
+        }
+    }
+
+    /// The root a refresh expects to still be bound, or `None` for a bind
+    /// (which is *allowed* to move the binding, so it checks nothing).
+    fn refresh_expectation(self) -> Option<Option<&'a Path>> {
+        match self {
+            Self::Bind(_) => None,
+            Self::Refresh { expected_root } => Some(expected_root),
+        }
+    }
+}
+
+impl WorkspaceState {
+    /// The request `id` must still equal to be entitled to publish — see
+    /// [`latest_root_intent`](Self::latest_root_intent).
+    fn current_intent(&self, intent: ActivationIntent<'_>) -> Option<ActivationId> {
+        match intent {
+            ActivationIntent::Bind(_) => self.latest_root_intent,
+            ActivationIntent::Refresh { .. } => self.latest_requested,
+        }
+    }
+
+    /// Is the active binding still the `(name, root)` a refresh expects?
+    /// Both halves are read under one lock, so they can never be compared
+    /// across a commit that changed them together.
+    fn binding_is(&self, name: &str, root: Option<&Path>) -> bool {
+        self.active_repo_name.as_deref() == Some(name) && self.active_repo_path.as_deref() == root
+    }
+
+    /// How to name the binding that displaced a refresh's expectation.
+    fn binding_description(&self) -> String {
+        match (&self.active_repo_path, &self.active_repo_name) {
+            (Some(path), _) => path.display().to_string(),
+            (None, Some(name)) => name.clone(),
+            (None, None) => "nothing".to_string(),
+        }
+    }
 }
 
 impl Workspace {
@@ -978,7 +1069,10 @@ impl Workspace {
             // avoids publishing the requested path before its build commits,
             // and prevents a concurrent activation from changing the path
             // fingerprinted by this request. Refresh calls snapshot the
-            // currently committed root and pass it through the same argument.
+            // currently committed root and pass it through the same
+            // argument — as an *expectation*, re-checked under the state
+            // lock at both ends of the build (see [`ActivationIntent`]), so
+            // a snapshot the binding has outrun never gets built.
             //
             // So every local caller supplies the root — `repo_management`
             // having already refused with "No active local root." when
@@ -1180,12 +1274,16 @@ impl Workspace {
     /// On successful hook completion the new HEAD SHA is persisted to
     /// `inventory.json[name].last_built_sha`. If the hook fails the SHA and
     /// active source state are not changed, so the next request retries.
+    ///
+    /// `intent` says whether this request may change the active binding —
+    /// see [`ActivationIntent`]. A refresh cannot: it neither supersedes a
+    /// bind nor publishes over one.
     fn activate(
         &self,
         name: &str,
         force_rebuild: bool,
         revs: Option<&RevsRequest>,
-        requested_local_root: Option<&Path>,
+        intent: ActivationIntent<'_>,
     ) -> Result<String> {
         // Legacy callbacks publish their downstream product inside the hook,
         // so they cannot safely overlap. Keep that API coherent by
@@ -1199,15 +1297,36 @@ impl Workspace {
             .then(|| self.inner.legacy_activation.lock().unwrap());
         let activation_id = {
             let mut state = self.inner.state.write().unwrap();
+            // First half of a refresh's compare-and-swap. The caller read
+            // the binding off live state; between that read and this lock
+            // a bind may have committed a different one (in the legacy
+            // path that gap spans a whole serialized activation, since
+            // `_legacy_guard` above is taken first). Returning here — with
+            // no identity allocated and nothing touched — keeps a refresh
+            // from rebuilding, or even *reading*, a root nobody asked for.
+            if let Some(expected_root) = intent.refresh_expectation() {
+                if !state.binding_is(name, expected_root) {
+                    let now = state.binding_description();
+                    return Ok(format!(
+                        "Refresh of '{name}' was abandoned before it started: the active root is now {now}. \
+                         Nothing was rebuilt — a refresh never changes which root is active."
+                    ));
+                }
+            }
             state.last_activation_id += 1;
             let id = ActivationId(state.last_activation_id);
             state.latest_requested = Some(id);
+            // A refresh deliberately does not claim the root intent: it
+            // must not be able to supersede an in-flight bind.
+            if intent.refresh_expectation().is_none() {
+                state.latest_root_intent = Some(id);
+            }
             id
         };
         let prev_built_sha = self.last_built_sha(name);
         let prev_built_revs = self.last_built_revs(name);
         let (action, repo_path, head_sha) = self
-            .clone_or_update(name, requested_local_root)
+            .clone_or_update(name, intent.local_root())
             .with_context(|| {
                 format!("activation request {activation_id} source preparation failed")
             })?;
@@ -1311,7 +1430,7 @@ impl Workspace {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                let latest = self.inner.state.read().unwrap().latest_requested;
+                let latest = self.inner.state.read().unwrap().current_intent(intent);
                 if latest != Some(activation_id) {
                     return Ok(format!(
                         "Activation request {activation_id} for '{name}' was superseded by request {} before its failed build could publish.",
@@ -1330,14 +1449,32 @@ impl Workspace {
         // visible as one ordered transaction.
         let summary = {
             let mut state = self.inner.state.write().unwrap();
-            if state.latest_requested != Some(activation_id) {
-                let superseding = state.latest_requested;
+            if state.current_intent(intent) != Some(activation_id) {
+                let superseding = state.current_intent(intent);
                 drop(state);
                 drop(prepared);
                 return Ok(format!(
                     "Activation request {activation_id} for '{name}' was superseded by request {} before publication; its prepared build was discarded.",
                     superseding.map_or_else(|| "unknown".to_string(), |id| id.to_string())
                 ));
+            }
+            // Second half of a refresh's compare-and-swap. Reaching here
+            // means no *newer* request exists — but a bind older than this
+            // refresh may still have committed while it built, and that
+            // bind is not superseded (it holds the root intent). Publishing
+            // now would revert the binding it just established, after its
+            // caller was told the swap succeeded.
+            if let Some(expected_root) = intent.refresh_expectation() {
+                if !state.binding_is(name, expected_root) {
+                    let now = state.binding_description();
+                    drop(state);
+                    drop(prepared);
+                    return Ok(format!(
+                        "Refresh request {activation_id} for '{name}' was abandoned: the active root moved to \
+                         {now} while it rebuilt, and a refresh never changes which root is active. \
+                         Its prepared build was discarded."
+                    ));
+                }
             }
             let summary = prepared.commit().with_context(|| {
                 format!("activation request {activation_id} for '{name}' failed during commit")
@@ -1579,9 +1716,15 @@ impl Workspace {
                         operator; remove it manually."
                     .to_string();
             }
-            let active = match self.active_repo_name() {
-                Some(n) => n,
-                None => return "No active local root.".to_string(),
+            // Name and root are read under one lock: they are published
+            // together at commit, so reading them separately could pair a
+            // name with the path of a *different* binding.
+            let (active, active_root) = {
+                let state = self.inner.state.read().unwrap();
+                match &state.active_repo_name {
+                    Some(n) => (n.clone(), state.active_repo_path.clone()),
+                    None => return "No active local root.".to_string(),
+                }
             };
             // `update`: re-fingerprint and rebuild if anything changed.
             // `force_rebuild`: rebuild even when the fingerprint matches.
@@ -1599,13 +1742,14 @@ impl Workspace {
                 Some(r) => Some(r.clone()),
                 None => self.last_built_revs(&active),
             };
-            let active_root = self.active_repo_path();
             return self
                 .activate(
                     &active,
                     force_rebuild,
                     effective.as_ref(),
-                    active_root.as_deref(),
+                    ActivationIntent::Refresh {
+                        expected_root: active_root.as_deref(),
+                    },
                 )
                 .unwrap_or_else(|e| format!("rebuild failed: {e}"));
         }
@@ -1627,8 +1771,17 @@ impl Workspace {
         }
 
         if update {
-            let Some(active) = self.active_repo_name() else {
-                return prefix + "No active repository. Call repo_management('org/repo') first.";
+            // One lock for both halves of the binding — see the local
+            // branch above.
+            let (active, active_root) = {
+                let state = self.inner.state.read().unwrap();
+                match &state.active_repo_name {
+                    Some(n) => (n.clone(), state.active_repo_path.clone()),
+                    None => {
+                        return prefix
+                            + "No active repository. Call repo_management('org/repo') first."
+                    }
+                }
             };
             // `update=True` refreshes the active repo. When no explicit
             // `revs` are passed, re-apply the stored rev-set (if the last
@@ -1643,7 +1796,18 @@ impl Workspace {
             };
             return prefix
                 + &self
-                    .activate(&active, force_rebuild, effective.as_ref(), None)
+                    .activate(
+                        &active,
+                        force_rebuild,
+                        effective.as_ref(),
+                        // Same invariant as the local branch: `update=True`
+                        // rebuilds the active repo, so it must never
+                        // discard — or publish over — a concurrent
+                        // `repo_management('org/repo')` that binds another.
+                        ActivationIntent::Refresh {
+                            expected_root: active_root.as_deref(),
+                        },
+                    )
                     .unwrap_or_else(|e| format!("update failed: {e}"));
         }
 
@@ -1661,7 +1825,7 @@ impl Workspace {
         }
         prefix
             + &self
-                .activate(name, force_rebuild, revs, None)
+                .activate(name, force_rebuild, revs, ActivationIntent::Bind(None))
                 .unwrap_or_else(|e| format!("activate failed: {e}"))
     }
 
@@ -1787,8 +1951,13 @@ impl Workspace {
         // inventory is stored under. We keep the *original* one (from
         // open_local, or the first activation after an unanchored boot) so
         // the inventory survives across root swaps.
-        self.activate(&synthetic, false, revs, Some(&canon))
-            .map_err(|e| format!("{who} failed: {e}"))
+        self.activate(
+            &synthetic,
+            false,
+            revs,
+            ActivationIntent::Bind(Some(&canon)),
+        )
+        .map_err(|e| format!("{who} failed: {e}"))
     }
 }
 
@@ -2905,6 +3074,13 @@ mod tests {
     /// reaches that point (it waits on the swap ordering lock), so the
     /// operator's wait falls through on its belt; the outcome is then the
     /// same for every interleaving, which is the whole point.
+    ///
+    /// The belt is therefore paid on every run, and it bounds only how
+    /// strictly this reproduces the *old* failure — never an assertion.
+    /// It covers a thread spawn plus a canonicalize and a fingerprint of
+    /// an empty directory, which is sub-millisecond work; 250ms leaves
+    /// two orders of magnitude of headroom on a loaded machine, and was
+    /// verified against the unfixed code.
     #[test]
     fn an_adoption_cannot_displace_a_concurrent_operator_swap() {
         let td = tempfile::tempdir().unwrap();
@@ -2925,7 +3101,7 @@ mod tests {
                     adoption_in_hook.open();
                 } else {
                     operator_in_hook.open();
-                    adoption_in_hook.wait_until(std::time::Duration::from_secs(2));
+                    adoption_in_hook.wait_until(std::time::Duration::from_millis(250));
                 }
                 Ok(PreparedActivation::summary(None))
             })
@@ -2965,6 +3141,216 @@ mod tests {
         assert!(
             adoption_out.is_err(),
             "the adoption ran second and must have been refused: {adoption_out:?}"
+        );
+    }
+
+    /// Stand up an unanchored local workspace with a client root already
+    /// adopted, plus a gated transaction hook. Returns the workspace, the
+    /// adopted (client) root, the root the operator will swap to, and the
+    /// gates for the operator's and the refresh's builds.
+    ///
+    /// The hook gates each root independently, so a test opens only the
+    /// gates its interleaving needs; a build whose gates are never touched
+    /// runs straight through.
+    #[allow(clippy::type_complexity)]
+    fn adopted_workspace_with_gated_builds(
+        base: &Path,
+    ) -> (
+        Workspace,
+        PathBuf,
+        PathBuf,
+        (Arc<Gate>, Arc<Gate>),
+        (Arc<Gate>, Arc<Gate>),
+    ) {
+        let client_root = base.join("client");
+        let operator_root = base.join("operator");
+        std::fs::create_dir_all(&client_root).unwrap();
+        std::fs::create_dir_all(&operator_root).unwrap();
+
+        let operator_gates = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+        let refresh_gates = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+        let hook: ActivationTransactionHook = {
+            let operator_root = operator_root.clone();
+            let (operator_in_hook, release_operator) = operator_gates.clone();
+            let (refresh_in_hook, release_refresh) = refresh_gates.clone();
+            let adopted = Arc::new(Mutex::new(false));
+            Arc::new(move |request| {
+                if request.path() == operator_root {
+                    operator_in_hook.open();
+                    release_operator.wait();
+                } else {
+                    // The client root is built twice: once by the adoption
+                    // that establishes it, once by the refresh under test.
+                    // Only the second build is gated.
+                    let mut adopted = adopted.lock().unwrap();
+                    if *adopted {
+                        refresh_in_hook.open();
+                        release_refresh.wait();
+                    }
+                    *adopted = true;
+                }
+                Ok(PreparedActivation::summary(None))
+            })
+        };
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_activation_transaction(hook);
+        ws.adopt_client_root(&client_root).unwrap();
+        assert_eq!(ws.root_ownership(), RootOwnership::Adopted);
+        (
+            ws,
+            client_root,
+            operator_root,
+            operator_gates,
+            refresh_gates,
+        )
+    }
+
+    /// A local `repo_management(update=true)` refresh must not cancel an
+    /// operator root swap that is still building.
+    ///
+    /// The window this closes: the refresh reaches `activate` without
+    /// touching the swap ordering lock (it is neither an operator swap nor
+    /// an adoption), so it used to allocate a *newer* generation and, by
+    /// re-committing the binding it found, supersede the operator's
+    /// in-flight swap. Final state: the client's adopted root active while
+    /// `root_ownership()` said `Operator` — the exact flag/root
+    /// disagreement the swap ordering lock was added to eliminate,
+    /// reachable by the same semi-trusted party through another entry
+    /// point.
+    ///
+    /// Sequenced by signal: the operator is held inside its build hook
+    /// until the refresh has run to completion, so the refresh's
+    /// generation is provably newer and its commit provably first.
+    #[test]
+    fn a_refresh_cannot_cancel_an_in_flight_operator_root_swap() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let (ws, client_root, operator_root, (operator_in_hook, release_operator), refresh_gates) =
+            adopted_workspace_with_gated_builds(&base);
+        // This test needs the refresh to run *through*, not to park: open
+        // its release gate up front so its build hook falls straight
+        // through. It does reach the hook even though the skip gate fires
+        // — a transaction hook is called for a `Reuse` request too, since
+        // it still has to produce that request's summary.
+        refresh_gates.1.open();
+
+        let operator = {
+            let ws = ws.clone();
+            let target = operator_root.clone();
+            std::thread::spawn(move || ws.set_root_dir(&target, None))
+        };
+        // The operator holds an activation id and is mid-build.
+        operator_in_hook.wait();
+        // A whole refresh — newer id, commits first — while it waits.
+        let refresh_out = ws.repo_management(None, false, true, false, None);
+        release_operator.open();
+        let operator_out = operator.join().unwrap();
+
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(operator_root.as_path()),
+            "a refresh of the adopted root cancelled the operator's swap \
+             (operator said: {operator_out}; refresh said: {refresh_out})"
+        );
+        assert_eq!(
+            ws.root_ownership(),
+            RootOwnership::Operator,
+            "the active root and the ownership flag must name the same party"
+        );
+        assert!(
+            !operator_out.contains("superseded"),
+            "a refresh must not supersede a root swap: {operator_out}"
+        );
+        assert!(
+            operator_out.contains(&operator_root.display().to_string()),
+            "the operator's swap must report the root it committed: {operator_out}"
+        );
+        // The refresh itself was legitimate at the time and is reported as
+        // such — it rebuilt what was then bound.
+        assert!(
+            refresh_out.contains(&client_root.display().to_string()),
+            "the refresh rebuilt the binding it found: {refresh_out}"
+        );
+    }
+
+    /// The narrower variant, and the worse one: the operator's swap
+    /// reports **full success** naming its root, and a refresh that
+    /// started earlier then silently reverts to the previous one.
+    ///
+    /// It is reachable because a refresh's target is read from live state
+    /// before its generation exists, so nothing about the generation gate
+    /// ties the root it commits to the root that is bound when it commits.
+    /// Here the refresh holds the newest generation *and* commits last —
+    /// the gate waves it through — and only the binding compare-and-swap
+    /// stops it.
+    ///
+    /// Both halves of the fix are load-bearing: without the root-intent
+    /// split the operator is superseded and never commits at all; without
+    /// the commit-time expectation check the refresh publishes the adopted
+    /// root over a swap whose caller was already told it succeeded.
+    #[test]
+    fn a_refresh_cannot_revert_a_root_swap_that_already_reported_success() {
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let (
+            ws,
+            client_root,
+            operator_root,
+            (operator_in_hook, release_operator),
+            (refresh_in_hook, release_refresh),
+        ) = adopted_workspace_with_gated_builds(&base);
+
+        let operator = {
+            let ws = ws.clone();
+            let target = operator_root.clone();
+            std::thread::spawn(move || ws.set_root_dir(&target, None))
+        };
+        operator_in_hook.wait();
+        // `force_rebuild` so the refresh really enters the build hook
+        // (the adopted root is already built, so it would otherwise skip)
+        // — that is where it is parked, holding the newest generation.
+        let refresh = {
+            let ws = ws.clone();
+            std::thread::spawn(move || ws.repo_management(None, false, true, true, None))
+        };
+        refresh_in_hook.wait();
+
+        release_operator.open();
+        let operator_out = operator.join().unwrap();
+        // Captured before the refresh is let go: this is the state the
+        // operator's caller was told about.
+        let reported_root = ws.active_repo_path();
+        release_refresh.open();
+        let refresh_out = refresh.join().unwrap();
+
+        assert_eq!(
+            reported_root.as_deref(),
+            Some(operator_root.as_path()),
+            "the operator's swap must commit even though a refresh holds a \
+             newer generation (operator said: {operator_out})"
+        );
+        assert!(
+            !operator_out.contains("superseded")
+                && operator_out.contains(&operator_root.display().to_string()),
+            "the operator's swap must report the root it committed: {operator_out}"
+        );
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(operator_root.as_path()),
+            "a refresh reverted a root swap that had already reported success \
+             (refresh said: {refresh_out})"
+        );
+        assert_eq!(
+            ws.root_ownership(),
+            RootOwnership::Operator,
+            "the active root and the ownership flag must name the same party"
+        );
+        assert!(
+            refresh_out.contains("abandoned")
+                && refresh_out.contains(&operator_root.display().to_string())
+                && !refresh_out.contains(&format!("at {}", client_root.display())),
+            "the refresh must say it was abandoned, and name what displaced it: {refresh_out}"
         );
     }
 
