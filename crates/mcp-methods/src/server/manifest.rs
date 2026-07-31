@@ -967,6 +967,20 @@ fn build_workspace(
             "workspace.kind: local requires workspace.root to be set",
         ));
     }
+    // `watch` needs something to watch, and `adopt_client_roots` is the
+    // only way to reach this shape (a rootless local manifest is refused
+    // above). Enforced *here*, in the loader every consumer goes through,
+    // because that is where the schema reference says the rule lives — a
+    // library consumer that builds its own workspace from a loaded
+    // manifest never reaches `mcp-server`'s mode resolution, and would
+    // otherwise get a silently dead watcher.
+    if kind == WorkspaceKind::Local && watch && root.is_none() {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.watch requires workspace.root — an adoption-only \
+             workspace has nothing to watch at boot",
+        ));
+    }
     if kind == WorkspaceKind::Github && watch {
         return Err(ManifestError::at(
             yaml_path,
@@ -2028,6 +2042,29 @@ mod tests {
         let w = load(f.path()).unwrap().workspace.unwrap();
         assert!(w.adopt_client_roots);
         assert_eq!(w.root.as_deref(), Some("./src"));
+    }
+
+    /// The documented rule ("`watch` requires `root`") is enforced by the
+    /// loader, not only by `mcp-server`'s mode resolution — a library
+    /// consumer that loads a manifest and builds its own workspace must
+    /// not end up with a watcher that silently watches nothing.
+    #[test]
+    fn workspace_watch_requires_a_root_even_with_adoption_enabled() {
+        let f = write_tmp("workspace:\n  kind: local\n  watch: true\n  adopt_client_roots: true\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message
+                .contains("workspace.watch requires workspace.root"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn workspace_watch_with_a_root_is_fine() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n  watch: true\n");
+        let w = load(f.path()).unwrap().workspace.unwrap();
+        assert!(w.watch && w.root.is_some());
     }
 
     #[test]
