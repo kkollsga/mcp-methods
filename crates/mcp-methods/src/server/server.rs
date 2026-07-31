@@ -1335,6 +1335,36 @@ impl ServerHandler for McpServer {
         info
     }
 
+    /// `notifications/initialized` — the one point at which a
+    /// client-advertised root can be adopted (see [`crate::server::roots`]).
+    ///
+    /// rmcp dispatches every peer notification on a task it spawns
+    /// (`spawn_service_task`, which is `tokio::spawn` unless rmcp's `local`
+    /// feature is enabled), and the response router lives in the same select
+    /// loop, so awaiting a server→client `roots/list` request here cannot
+    /// deadlock and cannot delay the client's session. **If rmcp's `local`
+    /// feature is ever enabled that becomes `spawn_local` and this reasoning
+    /// must be re-checked.**
+    ///
+    /// Everything about adoption is opt-in and guarded inside the `roots`
+    /// module: with no `workspace.adopt_client_roots` this returns after two
+    /// field reads, having sent nothing.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        // Same line rmcp's default handler emits — overriding the method
+        // must not cost an operator the log they have today.
+        tracing::info!("client initialized");
+        crate::server::roots::on_client_initialized(&self.options, &context.peer).await;
+    }
+
+    /// `notifications/roots/list_changed` — re-run adoption, unless the
+    /// operator has claimed the root in the meantime.
+    async fn on_roots_list_changed(
+        &self,
+        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) {
+        crate::server::roots::on_client_roots_changed(&self.options, &context.peer).await;
+    }
+
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,

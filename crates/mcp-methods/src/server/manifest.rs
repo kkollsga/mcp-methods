@@ -45,7 +45,14 @@ const ALLOWED_TOP_KEYS: &[&str] = &[
     "extensions",
     "skills",
 ];
-const ALLOWED_WORKSPACE_KEYS: &[&str] = &["kind", "root", "watch", "applies_to", "sandbox_root"];
+const ALLOWED_WORKSPACE_KEYS: &[&str] = &[
+    "kind",
+    "root",
+    "watch",
+    "applies_to",
+    "sandbox_root",
+    "adopt_client_roots",
+];
 const VALID_WORKSPACE_KIND: &[&str] = &["github", "local"];
 const ALLOWED_TRUST_KEYS: &[&str] = &["allow_python_tools", "allow_embedder"];
 const ALLOWED_TOOL_KEYS: &[&str] = &[
@@ -256,6 +263,27 @@ pub struct WorkspaceConfig {
     /// accepts any directory, which is the historical behaviour every
     /// existing deployment relies on.
     pub sandbox_root: Option<String>,
+    /// Local-mode only: adopt a root advertised by the MCP client
+    /// (`roots/list`) when the operator configured none.
+    ///
+    /// Off by default, and **fallback-only** even when on: `workspace.root`,
+    /// `--watch`, `--source-root` and `--workspace` all win, and an explicit
+    /// `set_root_dir` permanently ends adoption for the session. With it on,
+    /// `workspace.root` may be omitted — the server then boots unanchored and
+    /// binds nothing until a client offers a root (and stays unanchored if
+    /// none ever arrives). Without it, a missing `workspace.root` is the same
+    /// boot error it has always been.
+    ///
+    /// Pair it with [`sandbox_root`](Self::sandbox_root): the client's root is
+    /// a suggestion, the boundary is what actually contains it.
+    ///
+    /// **Deprecated upstream.** MCP `roots` is deprecated as of protocol
+    /// revision `2026-07-28` (SEP-2577) — "New implementations SHOULD NOT
+    /// adopt it" — and is eligible for removal in the first revision released
+    /// on or after 2027-07-28. The migration path named by the spec is to pass
+    /// directories via tool parameters, resource URIs, or server configuration
+    /// (`workspace.root`).
+    pub adopt_client_roots: bool,
     /// Optional opt-in for the [`find_workspace_manifest`] parent-walk
     /// fallback. When set, this manifest is auto-discovered by
     /// ``mcp-server --workspace DIR`` (and similar callers) only when
@@ -883,6 +911,16 @@ fn build_workspace(
             ))
         }
     };
+    let adopt_client_roots = match map.get("adopt_client_roots") {
+        None | Some(serde_yaml::Value::Null) => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                "workspace.adopt_client_roots must be a bool",
+            ))
+        }
+    };
     let applies_to =
         match map.get("applies_to") {
             None | Some(serde_yaml::Value::Null) => None,
@@ -919,7 +957,11 @@ fn build_workspace(
                 "workspace.applies_to must be a non-empty string (a pattern) or a list of patterns",
             )),
         };
-    if kind == WorkspaceKind::Local && root.is_none() {
+    // `adopt_client_roots` is the *only* thing that relaxes this: with it
+    // set, the root is expected to arrive from the client, so its absence
+    // is a deliberate configuration rather than a forgotten key. A plain
+    // manifest missing `root` still fails exactly as it always has.
+    if kind == WorkspaceKind::Local && root.is_none() && !adopt_client_roots {
         return Err(ManifestError::at(
             yaml_path,
             "workspace.kind: local requires workspace.root to be set",
@@ -937,12 +979,19 @@ fn build_workspace(
             "workspace.sandbox_root is only valid with workspace.kind: local",
         ));
     }
+    if kind == WorkspaceKind::Github && adopt_client_roots {
+        return Err(ManifestError::at(
+            yaml_path,
+            "workspace.adopt_client_roots is only valid with workspace.kind: local",
+        ));
+    }
     Ok(Some(WorkspaceConfig {
         kind,
         root,
         watch,
         applies_to,
         sandbox_root,
+        adopt_client_roots,
     }))
 }
 
@@ -1938,6 +1987,68 @@ mod tests {
         assert!(
             err.message
                 .contains("sandbox_root must be a non-empty string"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_absent_by_default() {
+        let f = write_tmp("workspace:\n  kind: local\n  root: ./src\n");
+        let m = load(f.path()).unwrap();
+        assert!(!m.workspace.unwrap().adopt_client_roots);
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_permits_omitting_root() {
+        let f = write_tmp("workspace:\n  kind: local\n  adopt_client_roots: true\n");
+        let m = load(f.path()).unwrap();
+        let w = m.workspace.unwrap();
+        assert!(w.adopt_client_roots);
+        assert!(
+            w.root.is_none(),
+            "the root is expected to arrive from the client"
+        );
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_false_still_requires_root() {
+        // The relaxation is tied to the knob being *on*, not merely
+        // present — a forgotten root must keep failing at boot.
+        let f = write_tmp("workspace:\n  kind: local\n  adopt_client_roots: false\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(err.message.contains("requires workspace.root"));
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_coexists_with_an_explicit_root() {
+        let f = write_tmp(
+            "workspace:\n  kind: local\n  root: ./src\n  sandbox_root: ./\n  adopt_client_roots: true\n",
+        );
+        let w = load(f.path()).unwrap().workspace.unwrap();
+        assert!(w.adopt_client_roots);
+        assert_eq!(w.root.as_deref(), Some("./src"));
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_invalid_for_github() {
+        let f = write_tmp("workspace:\n  kind: github\n  adopt_client_roots: true\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("adopt_client_roots is only valid"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn workspace_adopt_client_roots_must_be_a_bool() {
+        let f = write_tmp(
+            "workspace:\n  kind: local\n  root: ./src\n  adopt_client_roots: yes-please\n",
+        );
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("adopt_client_roots must be a bool"),
             "unexpected error: {}",
             err.message
         );
