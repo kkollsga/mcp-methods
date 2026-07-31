@@ -68,8 +68,14 @@ enum Mode {
     Workspace { dir: PathBuf },
     /// Workspace mode (local flavour) — bind a fixed local dir + fire
     /// post-activate hook on every change. Set via `workspace.kind: local`
-    /// in the manifest.
-    LocalWorkspace { root: PathBuf, watch: bool },
+    /// in the manifest. `sandbox_root` is the optional containment
+    /// boundary for runtime `set_root_dir` swaps (`None` = unbounded,
+    /// the default).
+    LocalWorkspace {
+        root: PathBuf,
+        watch: bool,
+        sandbox_root: Option<PathBuf>,
+    },
     /// Watch mode — auto-rebuild trigger on file changes.
     Watch { dir: PathBuf },
     /// Framework only — no source binding. Useful for testing the
@@ -255,10 +261,18 @@ fn print_boot_summary(
     let mode_label = match mode {
         Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
         Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
-        Mode::LocalWorkspace { root, watch } => format!(
-            "local-workspace [{}{}]",
+        Mode::LocalWorkspace {
+            root,
+            watch,
+            sandbox_root,
+        } => format!(
+            "local-workspace [{}{}{}]",
             root.display(),
-            if *watch { " +watch" } else { "" }
+            if *watch { " +watch" } else { "" },
+            match sandbox_root {
+                Some(b) => format!(" sandbox={}", b.display()),
+                None => String::new(),
+            }
         ),
         Mode::Watch { dir } => format!("watch [{}]", dir.display()),
         Mode::Bare => "bare framework".to_string(),
@@ -381,9 +395,20 @@ async fn main() -> Result<()> {
                 let resolved = base.join(raw_root).canonicalize().with_context(|| {
                     format!("workspace.root {raw_root:?} resolves to a path that does not exist")
                 })?;
+                // Resolved exactly like `root`: relative to the manifest's
+                // own directory. Absent = unbounded swaps (today's default).
+                let sandbox_root = match wcfg.sandbox_root.as_ref() {
+                    Some(raw) => Some(base.join(raw).canonicalize().with_context(|| {
+                        format!(
+                            "workspace.sandbox_root {raw:?} resolves to a path that does not exist"
+                        )
+                    })?),
+                    None => None,
+                };
                 mode = Mode::LocalWorkspace {
                     root: resolved,
                     watch: wcfg.watch,
+                    sandbox_root,
                 };
             }
         }
@@ -419,9 +444,16 @@ async fn main() -> Result<()> {
                 .context("workspace initialisation failed")?;
             options = options.with_workspace(ws);
         }
-        Mode::LocalWorkspace { root, .. } => {
-            let ws = workspace::Workspace::open_local(root.clone(), None)
+        Mode::LocalWorkspace {
+            root, sandbox_root, ..
+        } => {
+            let mut ws = workspace::Workspace::open_local(root.clone(), None)
                 .context("local-workspace initialisation failed")?;
+            if let Some(boundary) = sandbox_root {
+                ws = ws
+                    .with_sandbox_root(boundary)
+                    .context("workspace.sandbox_root rejected")?;
+            }
             options = options.with_workspace(ws);
         }
         Mode::Bare => {
@@ -468,7 +500,9 @@ async fn main() -> Result<()> {
 
     let _watch_handle = match &mode {
         Mode::Watch { dir } => maybe_watch(Some(dir), None)?,
-        Mode::LocalWorkspace { root, watch: true } => maybe_watch(Some(root), None)?,
+        Mode::LocalWorkspace {
+            root, watch: true, ..
+        } => maybe_watch(Some(root), None)?,
         _ => None,
     };
 
