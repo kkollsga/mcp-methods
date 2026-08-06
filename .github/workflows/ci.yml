@@ -23,6 +23,13 @@ jobs:
       - run: cargo build -p mcp-methods -p mcp-server
       - run: cargo test -p mcp-methods
       - run: cargo test -p mcp-server
+      # Compile the excluded example against this checkout. Its direct rmcp
+      # dependency makes it the regression test for the public type boundary
+      # that downstream binaries (notably kglite) consume.
+      - name: Check downstream binary against local framework
+        run: >-
+          cargo check --manifest-path examples/downstream_binary/Cargo.toml
+          --config 'patch.crates-io.mcp-methods.path="crates/mcp-methods"'
       # Verify the pure-Rust library has zero pyo3 in its dep tree.
       # If pyo3 ever leaks back in (e.g. via a transitive dep), this
       # fails fast.
@@ -34,6 +41,14 @@ jobs:
             exit 1
           fi
           echo "OK: no pyo3 in mcp-methods deps"
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check -p mcp-methods -p mcp-server --all-targets
 
   python-checks:
     name: Python checks

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.4 — 2026-08-06
+
+### Changed — rmcp 3.1.1 alignment (public source break)
+
+`mcp-methods` and the bundled `mcp-server` now use rmcp 3.1.1. KGLite's
+rmcp 3 upgrade could not be made independently: this framework deliberately
+exposes rmcp's `ToolRouter`, accepts dynamic `ToolRoute` values, and implements
+rmcp's serving traits, so Cargo resolving rmcp 2 and 3 side by side produced
+unrelated Rust types across that public boundary. Thirteen jobs in KGLite PR
+#105 failed on that split. Both direct dependencies now move in lockstep again.
+
+This is a source-level break for downstream crates using the low-level escape
+hatch. Their direct rmcp requirement must move to 3.1.1, and
+`ToolRoute::new_dyn` handlers that complete synchronously now return
+`Result<CallToolResponse, ErrorData>` rather than
+`Result<CallToolResult, ErrorData>`; wrap an ordinary completed result with
+`.into()`. Custom prompt handlers make the corresponding
+`GetPromptResult` → `GetPromptResponse` conversion. The high-level
+`McpServer::register_typed_tool` API is unchanged. Per the repository's
+standing release policy this ships as patch 0.4.4 despite the public source
+break.
+
+rmcp 3.1.1 declares Rust 1.88 as its minimum, so every published crate now
+states the same `rust-version` instead of leaving consumers to discover the
+effective floor during resolution. CI builds the workspace on 1.88 and also
+compiles the excluded downstream-binary example against the checkout; the
+latter exercises the direct-rmcp/public-framework boundary that previously
+failed only after KGLite upgraded. The example and Rust documentation no
+longer advertise the obsolete mcp-methods 0.3 / rmcp 1.6 pairing.
+
+The server continues to negotiate legacy MCP revisions, including the
+deprecated opt-in client-roots path. A session that negotiates the 2026-07-28
+revision now ignores a stale `roots` capability instead of emitting the
+`roots/list` method removed by that revision. A real stdio protocol test pins
+both halves of that contract: no removed roots request is sent, while a tool
+call still completes with the modern `resultType: "complete"` envelope.
+
 ## 0.4.3 — 2026-07-31
 
 **Sequential behaviour is unchanged.** A deployment that sets neither new

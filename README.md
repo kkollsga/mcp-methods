@@ -24,7 +24,7 @@ The wheel ships the `mcp-server` CLI on PATH alongside the library — `which mc
 
 ```toml
 [dependencies]
-mcp-methods = "0.3"
+mcp-methods = "0.4"
 ```
 
 ```rust
@@ -34,6 +34,7 @@ use mcp_methods::server::{McpServer, ServerOptions, Manifest}; // with default `
 ```
 
 Zero pyo3 in the dep tree. The `server` feature (default-on) adds the rmcp-backed framework; disable with `default-features = false` for the bare primitives.
+The 0.4 line requires Rust 1.88 or newer.
 
 For pre-release coordination — pinning against a specific commit while the framework is iterating quickly — depend on a git rev:
 

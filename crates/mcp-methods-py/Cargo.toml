@@ -2,6 +2,7 @@
 name = "mcp-methods-py"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "PyO3 bindings for mcp-methods — builds the Python wheel's cdylib"

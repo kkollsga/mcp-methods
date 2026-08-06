@@ -24,16 +24,17 @@ Or write from scratch:
 name = "my-mcp-server"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 [[bin]]
 name = "my-mcp-server"
 path = "src/main.rs"
 
 [dependencies]
-mcp-methods = { version = "0.3", features = ["server"] }
+mcp-methods = { version = "0.4", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rmcp = { version = "1.6", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

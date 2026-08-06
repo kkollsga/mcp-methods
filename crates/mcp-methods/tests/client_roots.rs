@@ -81,7 +81,7 @@ impl RawClient {
     ///
     /// `capabilities` is passed through verbatim so a test can advertise
     /// roots, advertise roots without `listChanged`, or advertise nothing.
-    async fn handshake(&mut self, capabilities: Value) {
+    async fn handshake_at(&mut self, protocol_version: &str, capabilities: Value) {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({
@@ -89,7 +89,7 @@ impl RawClient {
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": protocol_version,
                 "capabilities": capabilities,
                 "clientInfo": { "name": "raw-test-client", "version": "0.0.0" }
             }
@@ -103,6 +103,10 @@ impl RawClient {
         );
         self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
             .await;
+    }
+
+    async fn handshake(&mut self, capabilities: Value) {
+        self.handshake_at("2024-11-05", capabilities).await;
     }
 
     /// Wait for a server→client request with the given method, returning
@@ -152,6 +156,28 @@ impl RawClient {
             if frame["id"] == json!(id) {
                 assert!(frame.get("result").is_some(), "tools/list failed: {frame}");
                 return;
+            }
+        }
+    }
+
+    async fn call_tool(&mut self, name: &str) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": {} }
+        }))
+        .await;
+        loop {
+            let frame = self
+                .recv(SETTLE)
+                .await
+                .unwrap_or_else(|| panic!("server stopped answering tools/call for {name}"));
+            if frame["id"] == json!(id) {
+                assert!(frame.get("result").is_some(), "tools/call failed: {frame}");
+                return frame["result"].clone();
             }
         }
     }
@@ -215,6 +241,27 @@ fn boot(ws: &Workspace) -> (RawClient, tokio::task::JoinHandle<()>) {
 
 fn roots_capability() -> Value {
     json!({ "roots": { "listChanged": true } })
+}
+
+#[tokio::test]
+async fn modern_protocol_serves_tools_without_emitting_removed_roots_method() {
+    let (_td, base) = tempdir_with(&[]);
+    let ws = Workspace::open_local_unanchored(None)
+        .unwrap()
+        .with_sandbox_root(&base)
+        .unwrap()
+        .with_adopt_client_roots();
+    let (mut client, _server) = boot(&ws);
+
+    // Deliberately carry the legacy capability into the modern handshake.
+    // The negotiated protocol, not an obsolete capability field, decides
+    // whether the server may emit roots/list.
+    client.handshake_at("2026-07-28", roots_capability()).await;
+    client.drain_quiet().await;
+    client.assert_no_roots_list_sent();
+    client.assert_still_serving().await;
+    let result = client.call_tool("ping").await;
+    assert_eq!(result["resultType"], json!("complete"));
 }
 
 fn file_uri(path: &Path) -> String {

@@ -847,7 +847,7 @@ impl McpServer {
             .add_route(rmcp::handler::server::router::tool::ToolRoute::new_dyn(
                 attr,
                 move |ctx: rmcp::handler::server::tool::ToolCallContext<'_, McpServer>|
-                    -> DynFut<'_, Result<rmcp::model::CallToolResult, rmcp::ErrorData>> {
+                    -> DynFut<'_, Result<rmcp::model::CallToolResponse, rmcp::ErrorData>> {
                     let handler = handler.clone();
                     let arguments = ctx.arguments.clone();
                     let postprocess = postprocess.clone();
@@ -869,7 +869,8 @@ impl McpServer {
                                             rmcp::model::ContentBlock::text(format!(
                                                 "invalid arguments: {e}"
                                             )),
-                                        ]));
+                                        ])
+                                        .into());
                                     }
                                 }
                             }
@@ -894,7 +895,8 @@ impl McpServer {
                         };
                         Ok(rmcp::model::CallToolResult::success(vec![
                             rmcp::model::ContentBlock::text(body),
-                        ]))
+                        ])
+                        .into())
                     })
                 },
             ));
@@ -1206,10 +1208,10 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
         let route = PromptRoute::new_dyn(prompt, move |_ctx| {
             let body = body.clone();
             Box::pin(async move {
-                Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-                    Role::Assistant,
-                    body,
-                )]))
+                Ok(
+                    GetPromptResult::new(vec![PromptMessage::new_text(Role::Assistant, body)])
+                        .into(),
+                )
             })
         });
         server.prompt_router.add_route(route);
@@ -1371,9 +1373,8 @@ impl ServerHandler for McpServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
         Ok(ListPromptsResult {
-            meta: None,
-            next_cursor: None,
             prompts: self.prompt_router.list_all(),
+            ..Default::default()
         })
     }
 
@@ -1381,7 +1382,7 @@ impl ServerHandler for McpServer {
         &self,
         request: GetPromptRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
             self,
             request.name,

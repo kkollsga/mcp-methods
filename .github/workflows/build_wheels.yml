@@ -43,7 +43,7 @@ jobs:
       - uses: lewagon/wait-on-check-action@v1.5.0
         with:
           ref: ${{ github.sha }}
-          check-regexp: ^(Rust checks|Python checks|Tests)
+          check-regexp: ^(Rust checks|Rust 1.88 MSRV|Python checks|Tests)
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
 

@@ -52,7 +52,7 @@ jobs:
           ref: ${{ github.sha }}
           # Mirrors the wheel-build gate exactly so both publish flows
           # block on the same set of green checks.
-          check-regexp: ^(Rust checks|Python checks|Tests)
+          check-regexp: ^(Rust checks|Rust 1.88 MSRV|Python checks|Tests)
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
 
