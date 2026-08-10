@@ -34,19 +34,18 @@ from typing import Any
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tests.conftest import REPO_ROOT, workspace_binary
 
-# Prefer release build; fall back to debug; skip if neither is present.
-_RELEASE_BIN = REPO_ROOT / "target" / "release" / "mcp-server"
-_DEBUG_BIN = REPO_ROOT / "target" / "debug" / "mcp-server"
-BINARY = _RELEASE_BIN if _RELEASE_BIN.exists() else _DEBUG_BIN
-
-
-pytestmark = pytest.mark.skipif(
-    not BINARY.exists(),
-    reason=f"mcp-server binary not built (missing at {_RELEASE_BIN} or {_DEBUG_BIN}). "
-    f"Build with `cargo build -p mcp-server --release`.",
+# Newest-of-profile, never "prefer release" — a stale `target/release/
+# mcp-server` from `make bundle-bin` would otherwise shadow a fresh
+# `cargo build -p mcp-server` and this suite would test old code while
+# reporting green. See `tests/conftest.py::workspace_binary`.
+BINARY, _SKIP_REASON = workspace_binary(
+    "mcp-server", rebuild_cmd="cargo build -p mcp-server --release"
 )
+
+
+pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 
 def _discover_github_token() -> str | None:
