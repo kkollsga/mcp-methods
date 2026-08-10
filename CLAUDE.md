@@ -1,5 +1,10 @@
 # mcp-methods
 
+**Authority:** `CLAUDE.md` and `.claude/skills/` are the authority this repo's
+agent instructions are regenerated from; `AGENTS.md` and `.agents/skills/` are
+generated adapters. Edit the authority and regenerate in the same action —
+never edit an adapter.
+
 ## Releasing
 
 GitHub Actions does the heavy lifting. A release is just **a version
@@ -90,7 +95,7 @@ Three projects coordinate by dropping markdown files into each other's
 | Party | Their inbox (where we drop messages TO them) |
 |---|---|
 | **kglite** | `/Volumes/EksternalHome/Koding/Rust/KGLite/inbox/unread/` |
-| **mcp-servers** | `/Volumes/EksternalHome/Koding/MCP servers/inbox/unread/` (note the space in the path) |
+| **mcp-servers** | `/Volumes/EksternalHome/Koding/mcp-servers/inbox/unread/` |
 
 Our own inbox (messages FROM them land here):
 `/Volumes/EksternalHome/Koding/Rust/mcp-methods/inbox/unread/`
@@ -139,3 +144,26 @@ sort and prioritise inbox work from it without opening every file.
   (legal/o&g/code). One hop further downstream — most coordination
   with them goes via kglite, but we ship release notes directly when a
   framework cut affects their deployment.
+
+## Review — report what is broken, not what you would have written
+
+The bar is estate rule **R15** in `../doctrine/rules/RULES.md`, cited here
+rather than copied: two copies of a rule are zero copies. What it obliges:
+
+- A finding names a **concrete failure** — the input or state, and the wrong
+  outcome it produces: a wrong result, a crash, data loss, a broken contract
+  with a caller or a persisted file, a security hole, a *measured* performance
+  regression, a gate that cannot fail (`R1`), or a claim the code contradicts.
+  **"No findings" is a valid review, and a good one.**
+- Design, structure, naming, "consider using X", "this won't scale" are **not
+  findings at review — they are mis-staged.** Their venue is planning, before
+  the code exists; a design opinion formed while reading a diff is input to the
+  *next* plan, not a defect.
+- **A finding that cannot state its failure case is removed, not downgraded.**
+  "Minor:" and "nit:" are the laundering mechanism, not a lower tier.
+- **One narrow exception:** citing a constraint this project declared *before*
+  the diff existed, naming both the rule and the violating line. That is
+  enforcement, not taste.
+
+A review tool's effort or confidence level is orthogonal to this: a higher
+level buys more *speculative bugs*, never permission to report preferences.
