@@ -42,9 +42,13 @@ venv/
 inbox/
 
 # Local dev working folder — the backlog index (todos.md) and its plans/
-# detail docs. Never committed: it carries in-flight intent and sibling-project
-# paths, and this repo is public. See dev-docs/README.md for the layout AND for
-# the record of which estate conventions this repo adopts vs. declines.
+# detail docs, plus the `.doctrine-synced` marker the release skill's step 0
+# reads and writes. Never committed: it carries in-flight intent and
+# sibling-project paths, and this repo is public. It is also unbacked, so
+# nothing committed may cite a path inside it as an instruction — a citation
+# outlives the file and silently becomes a dangling pointer. Its size/file
+# bound is `make check-dev-docs`, and the conventions it adopts or declines
+# belong in CLAUDE.md or the commit that decided them.
 #
 # NOT the same thing as the tracked, public `dev-documentation/` folder, which
 # holds durable design write-ups meant to be read by consumers of the crate.
@@ -54,9 +58,11 @@ inbox/
 # filesystem paths, so new ones stay out of this public repo.
 #
 # `.claude/skills/release/SKILL.md` is ALREADY TRACKED and stays tracked —
-# .gitignore has no effect on tracked files. Whether the estate should track
-# skills at all is an open maintainer decision (see dev-docs/README.md); this
-# entry deliberately changes nothing that is already published.
+# .gitignore has no effect on tracked files. It is also this repo's declared
+# authority for the release procedure (CLAUDE.md, top), which is why it is the
+# one skill worth tracking. Whether the estate should track the rest is an open
+# maintainer decision; this entry deliberately changes nothing already
+# published.
 /.claude/
 
 # Same reason, same rule: the Codex mirror also names sibling projects and

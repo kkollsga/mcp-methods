@@ -36,7 +36,9 @@ so the bump must land only on the ref you mean to release from.
 
 ## Steps
 0. **Doctrine sync — one file read when there is nothing to do.** Read
-   `../doctrine/VERSION` and compare it against `dev-docs/.doctrine-synced`.
+   `../doctrine/VERSION` and compare it against `dev-docs/.doctrine-synced`
+   (this step owns that marker and creates it; **missing means never synced**,
+   so read the changelog from its first entry).
    Equal: continue. Doctrine ahead: read `../doctrine/CHANGELOG.md` forward
    from the marker and act on every entry newer than it, per its class —
    `[skills-update]` merges into this repo's declared authority (`CLAUDE.md`,
