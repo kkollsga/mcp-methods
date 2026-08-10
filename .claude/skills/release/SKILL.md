@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut an mcp-methods release — goal-check the change, run the gate, bump the single workspace version, finalize the CHANGELOG, commit (version in the fix/feat subject), and with explicit approval push main to fire the crates.io + PyPI publish workflows, verify both registries, then ping any downstream counterpart the cut affects.
+description: Cut an mcp-methods release — goal-check the change, run the gate, bump the single workspace version, finalize the CHANGELOG, commit (version in the fix/feat subject), then push main to fire the crates.io + PyPI publish workflows (invoking `/release` is the authorization), verify both registries, then ping any downstream counterpart the cut affects.
 ---
 
 # Release
@@ -25,7 +25,30 @@ so the bump must land only on the ref you mean to release from.
   <src…>`, never `git add -A`/`.`) and leave the rest for its author.
   Confirm with `git status --porcelain` that only release files are staged.
 
+  **That confirmation is load-bearing, because `git add` is all-or-nothing
+  across its pathspecs**: one bad path — a typo, a file you thought you
+  changed — aborts the whole invocation and stages *nothing*, including
+  `Cargo.toml`. The failure is quiet in the reassuring direction: the commit
+  still succeeds, without the version bump, and here the bump IS the publish
+  trigger — so the push goes green and ships nothing. Read back
+  `git diff --cached --name-only` and check `Cargo.toml` is in it.
+  (KGLite hit this on 2026-08-09.)
+
 ## Steps
+0. **Doctrine sync — one file read when there is nothing to do.** Read
+   `../doctrine/VERSION` and compare it against `dev-docs/.doctrine-synced`.
+   Equal: continue. Doctrine ahead: read `../doctrine/CHANGELOG.md` forward
+   from the marker and act on every entry newer than it, per its class —
+   `[skills-update]` merges into this repo's declared authority (`CLAUDE.md`,
+   `.claude/skills/`) and regenerates the adapters from it, never the reverse;
+   `[local-sweep]` runs the check command the entry states, and a red sweep is
+   release work made visible, not a deferral; `[info]` needs nothing. Write the
+   new version into the marker **only after** those actions completed — a
+   marker written first permanently hides the entry it skipped, because the
+   next sync compares against the marker and sees nothing.
+
+   This repo has no planning skill, so the release flow is the one procedure
+   that reliably runs before work ships; the step lives here for that reason.
 1. **Goal check — did the change do what it set out to do?** Re-read the
    diff and any triggering inbox message / issue. Confirm the fix or
    feature is complete and the CHANGELOG entry explains the *why* (not
@@ -43,6 +66,18 @@ so the bump must land only on the ref you mean to release from.
      **CI** run the full gate (it does — `ci.yml` is the `ci-gate` the
      publish workflows wait on). Don't claim the Python gate passed locally
      when it was skipped.
+   - **Where the environment CAN run those legs, run them before the first
+     push — not after CI reports them.** Every step a branch has never executed
+     accumulates failures independently until CI sees them all at once;
+     KGLite's 2026-08-09 program found four CI blockers this way on a branch
+     whose fast gate was green throughout. Here the stakes are sharper than a
+     red PR: `ci-gate` failing after a `Cargo.toml` bump lands leaves the
+     version **unpublished**, and the `workflow_dispatch` retry gap (CLAUDE.md,
+     "Failed-CI retry gap") means fixing it with a `.rs`-only commit does not
+     re-fire publish — both workflows must then be dispatched by hand.
+   - **Review what the diff earned, against the bar** in CLAUDE.md "Review —
+     report what is broken" (estate rule R15). A finding names a concrete
+     failure; "no findings" is a valid outcome and does not hold the release.
 3. **Bump the version — patch by default** (`0.3.Z` → `0.3.Z+1`). One
    line: `version` under `[workspace.package]` in the **root
    `Cargo.toml`**. All three crates inherit it via `version.workspace =
@@ -99,6 +134,17 @@ always 0) yields a green run that publishes *nothing* — a silent non-release.
 Assert the extracted version is well-formed before it drives any publish
 decision.
 
+Two more shapes of the same trap, added from KGLite's 2026-08-09/10 program:
+- **`grep -c` exits 1 when the count is zero.** So `... | grep -c <tag> && …`
+  breaks the chain on exactly the artifact that is *missing* — the case this
+  whole check exists to catch — and under `set -e` it kills the script mid-
+  verification. A zero count is an answer, not an error: capture it
+  (`n=$(… | grep -c … || true)`) and test the number.
+- **Read a backgrounded run's outcome from its artifact, never from the
+  wrapper.** An echoed exit status, a "done" line, or the absence of visible
+  errors is not the result — open the log or output file the run wrote. This is
+  how a failed background build gets reported as a passing one.
+
 8. **Verify published** — poll both registries; 200 = live:
    - crates.io (needs an explicit User-Agent, else 403 that looks like a
      failed publish): `curl -fsSL -A "mcp-methods-release" \
@@ -117,6 +163,20 @@ decision.
    on publish, or a framework change touches **mcp-servers**' running
    deployment. No blanket announcement — only where there's a real
    dependency. Then archive any related incoming message to `inbox/read/`.
+10. **Adapter resync — diff each adapter against its declared authority,
+    rename-aware.** Identical: done. Divergent: classify each hunk before
+    touching either side — an *improvement* is merged into the **authority**
+    first and the adapter regenerated from it; *staleness* is simply
+    regenerated away. Never run a blind sync on a divergent pair: blind sync
+    deletes improvements (sonara, 2026-08-10, ~20 lines), and no sync preserves
+    stale doctrine the other harness will follow. The mirror check must pass
+    afterwards.
+
+    Here that is `CLAUDE.md` → `AGENTS.md` and each `.claude/skills/<n>/SKILL.md`
+    → `.agents/skills/<n>/SKILL.md`, substituting `CLAUDE.md`→`AGENTS.md`
+    everywhere **except the authority-declaration line**, which names the
+    authority literally in every copy — a substituted declaration inverts
+    itself and tells the adapter's reader to edit the adapter.
 
 ## Notes
 - **Version source of truth:** `[workspace.package] version` in the root
