@@ -86,13 +86,27 @@ so the bump must land only on the ref you mean to release from.
    true`; `pyproject.toml` is `dynamic = ["version"]` (maturin reads
    Cargo.toml), so there is **no** per-manifest or pyproject bump.
    `Cargo.lock` is gitignored — leave it.
-   - **Minor/major** (`0.3` → `0.4`): if the change is a new feature,
-     breaking change, or scope expansion, STOP and confirm the bump level
-     first (see `CONTRIBUTING.md` "Release cadence"). Only on a minor/major
-     do you also bump the `mcp-server` → `mcp-methods` dependency pin
-     (`mcp-methods = { version = "0.3", … }` in
+   - **Bump-size escalation is one-way: user → agent, never agent → user**
+     (doctrine 0.1.4, bought by codingest shipping 0.2.0 off an
+     agent-announced "minor unless you object" the user never typed). Go
+     minor/major **only when the user's release invocation named it**. The
+     agent never suggests, recommends, or announces a minor/major anywhere —
+     readiness reports included; an agent-announced number the user did not
+     repeat back is void, and proceeding past it adopts the patch default.
+     Semver findings (breaking changes, scope expansions) are CHANGELOG
+     prose, never a numbering proposal.
+   - **Minor/major mechanics** (when the user named it): also bump the
+     `mcp-server` → `mcp-methods` dependency pin
+     (`mcp-methods = { version = "0.4", … }` in
      `crates/mcp-server/Cargo.toml`) — patch bumps don't touch it.
      `mcp-methods-py` depends by path only; never needs a pin bump.
+   - **Moving a dependency floor is its own surface** (doctrine 0.1.6, R16):
+     a floor is declared wherever it is *required now* — manifests, CI
+     install pins, docs, copy-pasteable install strings, error messages —
+     and a manifest bump touches only one of those. After moving any floor,
+     `git grep -n "<old-version>" -- . ':!CHANGELOG.md'` and classify every
+     hit: historical *citations* stay at their number forever; live
+     *declarations* of the old version must reach zero.
 4. **Finalize the CHANGELOG top block.** Set the date, drop any
    `(proposed)` marker on the `## x.y.z` header. Entries are required.
 5. **Commit — version rides the fix/feat subject** (our convention, not a

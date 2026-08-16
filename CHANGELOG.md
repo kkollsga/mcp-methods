@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (proposed)
+## 0.4.5 — 2026-08-16
 
 ### Changed — GitHub tools are manifest opt-in, default off (behaviour break)
 
