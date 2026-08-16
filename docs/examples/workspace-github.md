@@ -34,9 +34,13 @@ trust:
 builtins:
   save_graph: false
   temp_cleanup: never
+  github: true       # required — GitHub tools are off unless the manifest asks
+                     # for them, no matter what token is reachable
 
 env_file: .env       # for GITHUB_TOKEN
 ```
+
+`builtins.github: true` and a reachable token are *both* required for `github_issues` / `github_api` to appear in `tools/list`. Note that `repo_management` and the clone flow are unaffected by this switch — they are workspace tools, not GitHub API tools.
 
 `.env` resolution walks upward from the workspace dir if `env_file:` is unset.
 

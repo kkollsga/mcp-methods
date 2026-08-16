@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased (proposed)
+
+### Changed — GitHub tools are manifest opt-in, default off (behaviour break)
+
+**Every deployment that relies on token-presence registration must add
+`builtins.github: true` to its manifest, or `github_issues`, `github_api`
+and `screen_stargazers` disappear from its `tools/list`.** There is no
+migration shim and no deprecation window: the whole point of the change is
+that the old trigger — a reachable credential — is not an expression of
+intent and must stop registering anything.
+
+Registration used to key off `has_git_token()` alone. An operator
+reproduced what that means in practice: a personal music server silently
+gained three authenticated GitHub tools because a `.env` several
+directories above its root happened to hold a `GITHUB_TOKEN`, and the
+framework's walk-up found it. `tools/list` went from 14 tools to 17 on a
+two-line env diff nobody would have connected to GitHub. An ambient credential picked
+up from a parent directory is exactly the credential whose blast radius
+should be smallest, and it was widening the agent-facing surface of an
+unrelated server on its own.
+
+The gates now run in the order intent-then-capability. `builtins.github`
+(new, default `false`) decides whether the GitHub tools are part of this
+deployment at all; only then does token reachability decide whether they
+can actually register — an opted-in server with no reachable token still
+hides them, because an agent should not see a tool that is guaranteed to
+fail. `builtins.screen_stargazers` (unchanged, default `true`) is now
+subordinate to the new key: with `github: false` it registers nothing
+whatever its value.
+
+`BuiltinsConfig` is publicly re-exported and is not `#[non_exhaustive]`,
+and it gained a `github` field. Downstream code that builds it with a
+struct literal, or destructures it exhaustively, will not compile until it
+accounts for the field; `..Default::default()`, `clone()` and field access
+are unaffected. `Manifest::to_json()` gains a `builtins.github` key —
+additive, per the documented stability rule for that shape.
+
+The bundled `github_issues` skill carried the old rule in its description
+and its Authorisation section, and that text is injected into the
+`github_issues` tool description agents read — so a server missing the
+opt-in would have told its agent to go provision a token it already had.
+Both statements now name both gates, opt-in first.
+
 ## 0.4.4 — 2026-08-06
 
 ### Changed — rmcp 3.1.1 alignment (public source break)

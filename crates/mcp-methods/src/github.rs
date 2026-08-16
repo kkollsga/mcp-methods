@@ -1977,18 +1977,21 @@ fn format_mixed_list(repo: &str, state: &str, items: &[&Value]) -> String {
     out.trim_end().to_string()
 }
 
+/// Tests mutate the process-wide GitHub token vars; serialise them
+/// through one crate-wide mutex so parallel test threads in *any*
+/// module (here, `server::server`) don't race each other.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Tests mutate process env; serialise to avoid cross-test races.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
 
     #[test]
     fn transient_status_classification() {

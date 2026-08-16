@@ -6,10 +6,14 @@
 //!   `grep`, `list_source`) gated on an active source-roots provider;
 //!   `repo_management` (no-ops outside `--workspace` mode).
 //! - **Conditionally registered at boot** (dynamic):
-//!   - `github_issues` and `github_api` — only when `GITHUB_TOKEN` is
-//!     reachable. This is "honest tool listing": agents see the tools
-//!     only when they can succeed. Decision is boot-time; restart the
-//!     server to pick up a token that appears later.
+//!   - `github_issues`, `github_api` and `screen_stargazers` — only
+//!     when the manifest opts in with `builtins.github: true` (default
+//!     off, so a `GITHUB_TOKEN` reachable in the environment or via the
+//!     `.env` walk-up never widens the surface on its own) *and* a
+//!     token is actually reachable. The second gate is "honest tool
+//!     listing": agents see the tools only when they can succeed. Both
+//!     decisions are boot-time; restart the server to pick up a token
+//!     or manifest change that appears later.
 //!   - `set_root_dir` — only when the bound workspace is local-flavoured
 //!     (`workspace.kind: local`); swaps the active root at runtime.
 //!   - Manifest-declared `python:` tools and `cypher:` tools — added by
@@ -548,16 +552,38 @@ impl McpServer {
         );
     }
 
-    /// Register `github_issues` + `github_api` as dynamic tools — but
-    /// only when a GitHub token is reachable. This is honest tool
-    /// listing: agents see the tool only if it can actually succeed.
-    /// Decision is boot-time; restart the server to pick up a token
-    /// that appears later.
+    /// Register `github_issues` + `github_api` (+ `screen_stargazers`)
+    /// as dynamic tools, behind two gates in this order:
+    ///
+    /// 1. **Manifest opt-in** — `builtins.github: true`. Default off, so
+    ///    a server that never asked for GitHub tooling never grows it.
+    ///    A reachable token is not an intent: `GITHUB_TOKEN` in the
+    ///    environment, or one the `.env` walk-up finds several
+    ///    directories above the server's root, used to be enough to add
+    ///    three authenticated GitHub tools to an unrelated server.
+    /// 2. **Token reachability** — with the opt-in set, the tools still
+    ///    only register when a token is actually reachable. That is
+    ///    honest tool listing: agents see the tool only if it can
+    ///    succeed.
+    ///
+    /// Both decisions are boot-time; restart the server to pick up a
+    /// token (or a manifest change) that appears later.
     fn register_github_tools_if_authorized(&mut self) {
+        if !self.options.builtins.github {
+            // The normal case now — keep it at debug so an ordinary
+            // non-GitHub server doesn't log about a feature it never
+            // asked for.
+            tracing::debug!(
+                "GitHub tools disabled (default) — set `builtins.github: true` in the manifest \
+                 to register github_issues / github_api / screen_stargazers."
+            );
+            return;
+        }
         if !crate::github::has_git_token() {
             tracing::info!(
-                "GITHUB_TOKEN not set — github_issues / github_api tools hidden from the agent. \
-                 Set the env var and restart to enable them."
+                "`builtins.github: true` is set but no GitHub token is reachable — \
+                 github_issues / github_api tools hidden from the agent. Set GITHUB_TOKEN \
+                 (env or the manifest's env_file) and restart to enable them."
             );
             return;
         }
@@ -652,9 +678,11 @@ impl McpServer {
         // REST into a per-server store, return a compact cohort+relevance
         // overview, and let the agent drill via `element_id` (cache hits;
         // only `.../readme` costs a request). The store is the stargazer
-        // analogue of `github_issues`' ElementCache. Operators can drop it
-        // (keeping the other GitHub tools) via `builtins.screen_stargazers:
-        // false`; default on.
+        // analogue of `github_issues`' ElementCache. Registered here, so
+        // it inherits both gates above (`builtins.github: true` + a
+        // reachable token). Within an opted-in deployment operators can
+        // drop just this tool (keeping the other GitHub tools) via
+        // `builtins.screen_stargazers: false`; default on.
         if self.options.builtins.screen_stargazers {
             let screen_store: Arc<Mutex<crate::screen::ScreenStore>> =
                 Arc::new(Mutex::new(crate::screen::ScreenStore::new()));
@@ -1452,6 +1480,91 @@ mod tests {
             !names.contains(&"repo_management"),
             "repo_management should be gated out without a workspace; tools were {names:?}"
         );
+    }
+
+    /// Build a server with `builtins.github` set as given, under a
+    /// process env where the GitHub token is either present or absent,
+    /// and return the resulting tool names. Restores the previous env
+    /// before returning; the crate-wide `env_lock` serialises against
+    /// the other env-mutating tests.
+    fn github_tool_surface(github_opt_in: bool, token_present: bool) -> Vec<String> {
+        use crate::server::manifest::BuiltinsConfig;
+        let _g = crate::github::env_lock();
+        let prev_token = std::env::var("GITHUB_TOKEN").ok();
+        let prev_alt = std::env::var("GH_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            if token_present {
+                std::env::set_var("GITHUB_TOKEN", "ghp_surface_test_not_real");
+            } else {
+                std::env::remove_var("GITHUB_TOKEN");
+            }
+        }
+        let opts = ServerOptions {
+            builtins: BuiltinsConfig {
+                github: github_opt_in,
+                ..Default::default()
+            },
+            ..ServerOptions::default()
+        };
+        let server = McpServer::new(opts);
+        let names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        unsafe {
+            match prev_token {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+            match prev_alt {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+        }
+        names
+    }
+
+    const GITHUB_TOOLS: [&str; 3] = ["github_issues", "github_api", "screen_stargazers"];
+
+    #[test]
+    fn github_tools_absent_by_default_even_with_a_token() {
+        // The security-critical case: an ambient credential (plain env
+        // var, or one the `.env` walk-up found several directories up)
+        // must not widen an unrelated server's tool surface.
+        let names = github_tool_surface(false, true);
+        for tool in GITHUB_TOOLS {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "{tool} registered without `builtins.github: true`; tools were {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_tools_register_on_opt_in_with_a_token() {
+        let names = github_tool_surface(true, true);
+        for tool in GITHUB_TOOLS {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "{tool} missing with `builtins.github: true` and a token; tools were {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_tools_absent_on_opt_in_without_a_token() {
+        // Opt-in declares intent; the token gate still decides whether
+        // the tools can actually succeed, so they stay hidden.
+        let names = github_tool_surface(true, false);
+        for tool in GITHUB_TOOLS {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "{tool} registered with no reachable token; tools were {names:?}"
+            );
+        }
     }
 
     #[test]

@@ -70,7 +70,8 @@ const ALLOWED_TOOL_KEYS: &[&str] = &[
     "rename",
 ];
 const ALLOWED_EMBEDDER_KEYS: &[&str] = &["module", "class", "kwargs"];
-const ALLOWED_BUILTIN_KEYS: &[&str] = &["save_graph", "temp_cleanup", "screen_stargazers"];
+const ALLOWED_BUILTIN_KEYS: &[&str] =
+    &["save_graph", "temp_cleanup", "github", "screen_stargazers"];
 const VALID_TEMP_CLEANUP: &[&str] = &["never", "on_overview"];
 
 #[derive(Debug, Error)]
@@ -192,9 +193,26 @@ pub struct EmbedderConfig {
 pub struct BuiltinsConfig {
     pub save_graph: bool,
     pub temp_cleanup: TempCleanup,
-    /// Register the `screen_stargazers` GitHub tool. Default on; set
-    /// `builtins.screen_stargazers: false` to keep the other GitHub tools
-    /// (`github_issues` / `github_api`) but drop stargazer screening.
+    /// Register the GitHub tools — `github_issues`, `github_api`, and
+    /// (subject to [`screen_stargazers`](Self::screen_stargazers))
+    /// `screen_stargazers`. **Default off**; set `builtins.github: true`
+    /// to opt a deployment in.
+    ///
+    /// This is the ambient-credential gate. Registration used to key off
+    /// token *reachability* alone — a `GITHUB_TOKEN` in the environment,
+    /// or one picked up by the `.env` walk-up from a directory several
+    /// levels above the server's root, silently added three
+    /// authenticated GitHub tools to an unrelated server's surface. A
+    /// reachable credential must never widen the tool surface on its
+    /// own: the operator declares the intent in the manifest, and the
+    /// token only decides whether the opted-in tools can actually work.
+    pub github: bool,
+    /// Register the `screen_stargazers` GitHub tool. Only meaningful when
+    /// `builtins.github: true` — with GitHub tools off (the default) this
+    /// flag registers nothing whatever its value. Default on within an
+    /// opted-in deployment; set `builtins.screen_stargazers: false` to
+    /// keep the other GitHub tools (`github_issues` / `github_api`) but
+    /// drop stargazer screening.
     pub screen_stargazers: bool,
 }
 
@@ -203,6 +221,7 @@ impl Default for BuiltinsConfig {
         Self {
             save_graph: false,
             temp_cleanup: TempCleanup::default(),
+            github: false,
             screen_stargazers: true,
         }
     }
@@ -469,6 +488,7 @@ impl Manifest {
             "builtins": {
                 "save_graph": self.builtins.save_graph,
                 "temp_cleanup": self.builtins.temp_cleanup.as_str(),
+                "github": self.builtins.github,
                 "screen_stargazers": self.builtins.screen_stargazers,
             },
             "env_file": self.env_file,
@@ -1478,6 +1498,11 @@ fn build_builtins(
             .as_bool()
             .ok_or_else(|| ManifestError::at(yaml_path, "builtins.save_graph must be a bool"))?;
     }
+    if let Some(v) = map.get("github") {
+        cfg.github = v
+            .as_bool()
+            .ok_or_else(|| ManifestError::at(yaml_path, "builtins.github must be a bool"))?;
+    }
     if let Some(v) = map.get("screen_stargazers") {
         cfg.screen_stargazers = v.as_bool().ok_or_else(|| {
             ManifestError::at(yaml_path, "builtins.screen_stargazers must be a bool")
@@ -1876,6 +1901,42 @@ mod tests {
         let m = load(f.path()).unwrap();
         assert!(m.builtins.save_graph);
         assert_eq!(m.builtins.temp_cleanup, TempCleanup::OnOverview);
+    }
+
+    #[test]
+    fn builtins_github_defaults_off_and_parses() {
+        // Absent `builtins:` block, and a present one that says nothing
+        // about github, both leave the GitHub tools opted out — a token
+        // reachable in the environment must not widen the surface.
+        let f = write_tmp("name: No Builtins\n");
+        assert!(!load(f.path()).unwrap().builtins.github);
+        let f = write_tmp("builtins:\n  save_graph: true\n");
+        assert!(!load(f.path()).unwrap().builtins.github);
+        // Explicit opt-in.
+        let f = write_tmp("builtins:\n  github: true\n");
+        let m = load(f.path()).unwrap();
+        assert!(m.builtins.github);
+        // screen_stargazers keeps its own default within an opted-in
+        // deployment.
+        assert!(m.builtins.screen_stargazers);
+    }
+
+    #[test]
+    fn rejects_non_bool_github() {
+        let f = write_tmp("builtins:\n  github: 42\n");
+        assert_eq!(
+            load(f.path()).unwrap_err().message,
+            "builtins.github must be a bool"
+        );
+    }
+
+    #[test]
+    fn to_json_reports_github_opt_in() {
+        let f = write_tmp("builtins:\n  github: true\n  screen_stargazers: false\n");
+        let m = load(f.path()).unwrap();
+        let builtins = m.to_json()["builtins"].clone();
+        assert_eq!(builtins["github"], serde_json::json!(true));
+        assert_eq!(builtins["screen_stargazers"], serde_json::json!(false));
     }
 
     #[test]
@@ -2440,7 +2501,12 @@ builtins:
                 "class": "SentenceTransformerEmbedder",
                 "kwargs": {},
             },
-            "builtins": { "save_graph": true, "temp_cleanup": "on_overview", "screen_stargazers": true },
+            "builtins": {
+                "save_graph": true,
+                "temp_cleanup": "on_overview",
+                "github": false,
+                "screen_stargazers": true,
+            },
             "env_file": null,
             "workspace": null,
             "extensions": {},

@@ -62,6 +62,8 @@ The framework parses but doesn't instantiate. Downstream binaries load when `tru
 |---|---|---|---|
 | `save_graph` | bool | `false` | Whether to register `save_graph` tool (downstream-binary use) |
 | `temp_cleanup` | `"never"` \| `"on_overview"` | `"never"` | When to clear `temp/` dir |
+| `github` | bool | `false` | Opt in to the GitHub tools (`github_issues`, `github_api`, `screen_stargazers`). Off by default: a reachable `GITHUB_TOKEN` never registers them on its own. With it on, the tools still register only when a token is actually reachable |
+| `screen_stargazers` | bool | `true` | Whether the stargazer screener is part of that set. Subordinate to `github` — registers nothing when `github` is `false` |
 
 ## `workspace:` object
 

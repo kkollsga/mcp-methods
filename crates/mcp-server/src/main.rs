@@ -100,8 +100,9 @@ enum Mode {
     about = "Rust-native MCP server framework — source navigation + GitHub + python tools",
     long_about = "\
 Boot a Model Context Protocol server over stdio. Generic by design: ships \
-folder navigation (read_source / grep / list_source), GitHub access \
-(github_issues / github_api), and a manifest-driven tool surface. \
+folder navigation (read_source / grep / list_source), opt-in GitHub access \
+(github_issues / github_api — manifest `builtins.github: true` plus a \
+reachable GITHUB_TOKEN), and a manifest-driven tool surface. \
 Graph-specific tools (e.g. cypher_query) are layered on top by domain \
 binaries like kglite-mcp-server.
 

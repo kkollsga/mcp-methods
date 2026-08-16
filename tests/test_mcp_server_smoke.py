@@ -308,22 +308,51 @@ class TestSourceRootMode:
             client.shutdown()
 
 
-# ── GitHub-token-gated tools ─────────────────────────────────────────────
+# ── GitHub tools: manifest opt-in, then token ────────────────────────────
+
+
+def _github_optin_manifest(tmp_path: Path, name: str = "github_optin_mcp.yaml") -> Path:
+    """Write a manifest that opts into the GitHub tools. Registration
+    requires `builtins.github: true` — a reachable token alone never
+    registers them."""
+    p = tmp_path / name
+    p.write_text("name: GitHub Opt-In\nbuiltins:\n  github: true\n")
+    return p
 
 
 class TestGithubTools:
-    """`github_issues` / `github_api` register at boot only when
-    `GITHUB_TOKEN` is reachable. The .env walk-up may leak a token from a
-    parent directory; unauthorized tests use an isolated cwd above which
-    no `.env` lives."""
+    """`github_issues` / `github_api` register at boot only when the
+    manifest declares `builtins.github: true` **and** a `GITHUB_TOKEN` is
+    reachable. The .env walk-up may leak a token from a parent directory;
+    token-absent tests use an isolated cwd above which no `.env` lives."""
 
-    def test_unauthorized_hides_github_tools(self, tmp_path: Path):
+    def test_default_hides_github_tools_even_with_a_token(self, tmp_path: Path):
+        """The security-critical case: an ambient credential must not
+        widen an unrelated server's tool surface."""
+        src = tmp_path / "src"
+        src.mkdir()
+        client = _spawn(
+            ["--source-root", str(src)],
+            env_extra={"GITHUB_TOKEN": "ghp_ambient_not_real"},
+        )
+        try:
+            names = {t["name"] for t in client.list_tools()}
+            assert "github_issues" not in names, (
+                "github_issues registered from token presence alone — "
+                "`builtins.github` is meant to be the only opt-in."
+            )
+            assert "github_api" not in names
+            assert "screen_stargazers" not in names
+        finally:
+            client.shutdown()
+
+    def test_opted_in_without_a_token_hides_github_tools(self, tmp_path: Path):
         isolated_cwd = tmp_path / "no_env_here"
         isolated_cwd.mkdir()
         src = tmp_path / "src"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             cwd=isolated_cwd,
             env_remove=["GITHUB_TOKEN", "GH_TOKEN"],
         )
@@ -345,7 +374,7 @@ class TestGithubTools:
         src = tmp_path / "src"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             env_extra={"GITHUB_TOKEN": GITHUB_TOKEN or ""},
         )
         try:
@@ -364,7 +393,7 @@ class TestGithubTools:
         src = tmp_path / "src"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             env_extra={"GITHUB_TOKEN": GITHUB_TOKEN or ""},
         )
         try:
@@ -382,7 +411,7 @@ class TestGithubTools:
         src = tmp_path / "src"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             env_extra={"GITHUB_TOKEN": GITHUB_TOKEN or ""},
         )
         try:
@@ -402,7 +431,12 @@ class TestGithubTools:
 
 class TestEnvFileLoading:
     """`load_env_for_mode` walks up from the mode dir looking for `.env`.
-    Explicit `env_file:` YAML key overrides walk-up. Both paths must work."""
+    Explicit `env_file:` YAML key overrides walk-up. Both paths must work.
+
+    `github_issues` in `tools/list` is the observable proof that the token
+    reached the process — so every test here also opts into the GitHub
+    tools (`builtins.github: true`), which is now required on top of a
+    reachable token."""
 
     def test_walk_up_from_source_root_finds_env(self, tmp_path: Path):
         outer = tmp_path / "outer"
@@ -411,7 +445,7 @@ class TestEnvFileLoading:
         src = outer / "src"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             cwd=tmp_path,
             env_remove=["GITHUB_TOKEN", "GH_TOKEN"],
         )
@@ -429,7 +463,9 @@ class TestEnvFileLoading:
         env_dir.mkdir()
         (env_dir / "my.env").write_text("GITHUB_TOKEN=ghp_explicit_test_token_not_real\n")
         manifest = tmp_path / "explicit_mcp.yaml"
-        manifest.write_text("name: Explicit Env Test\nenv_file: stash/my.env\n")
+        manifest.write_text(
+            "name: Explicit Env Test\nenv_file: stash/my.env\nbuiltins:\n  github: true\n"
+        )
         client = _spawn(
             ["--mcp-config", str(manifest)],
             cwd=tmp_path,
@@ -444,17 +480,61 @@ class TestEnvFileLoading:
             client.shutdown()
 
     def test_existing_env_var_not_overwritten(self, tmp_path: Path):
-        """`apply_env_file` must not overwrite an already-set env var."""
-        src = tmp_path / "src_no_env"
+        """`apply_env_file` must not overwrite an already-set env var.
+
+        The walk-up path carries a *competing* `.env` that clears
+        `GITHUB_TOKEN` (empty value). `auth_token()` filters empty
+        tokens, so an overwrite regression would leave the process with
+        no usable token and `github_issues` would drop out of
+        `tools/list` — which is the observable this asserts on. Without
+        the competing `.env` the test could not fail at all."""
+        outer = tmp_path / "outer"
+        outer.mkdir()
+        (outer / ".env").write_text("GITHUB_TOKEN=\n")
+        src = outer / "src_competing_env"
         src.mkdir()
         client = _spawn(
-            ["--source-root", str(src)],
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
             cwd=src,
             env_extra={"GITHUB_TOKEN": "ghp_via_env_not_real"},
         )
         try:
             names = {t["name"] for t in client.list_tools()}
-            assert "github_issues" in names
+            assert "github_issues" in names, (
+                "github_issues missing — the walk-up .env overwrote the token "
+                "already set in the environment. Tools listed: " + str(sorted(names))
+            )
+        finally:
+            client.shutdown()
+
+    @pytest.mark.skipif(
+        GITHUB_TOKEN is None,
+        reason="No GITHUB_TOKEN reachable.",
+    )
+    def test_existing_env_var_wins_over_env_file_value(self, tmp_path: Path):
+        """Stronger form of the above: with a real token in the process
+        env and a bogus one on the walk-up path, a live call proves
+        *which* token the server actually used — the bogus value would
+        401 rather than merely hide the tool."""
+        outer = tmp_path / "outer"
+        outer.mkdir()
+        (outer / ".env").write_text("GITHUB_TOKEN=ghp_from_env_file_not_real\n")
+        src = outer / "src_competing_env"
+        src.mkdir()
+        client = _spawn(
+            # cwd stays at the repo root (as in TestGitHubTools) so
+            # github_api can resolve an active repo; the .env walk-up is
+            # driven by --source-root, not cwd.
+            ["--source-root", str(src), "--mcp-config", str(_github_optin_manifest(tmp_path))],
+            env_extra={"GITHUB_TOKEN": GITHUB_TOKEN or ""},
+        )
+        try:
+            r = client.call_tool("github_api", {"path": "users/octocat"})
+            text = _text_content(r)
+            assert "octocat" in text.lower(), (
+                "github_api didn't succeed — the walk-up .env token appears to "
+                "have overwritten the one already in the environment. Body: " + text[:200]
+            )
         finally:
             client.shutdown()
 

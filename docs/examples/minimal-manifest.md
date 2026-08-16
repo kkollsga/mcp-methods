@@ -40,7 +40,7 @@ Plus the built-in `ping` tool (lets the agent verify the server is alive).
 ## When to use this shape
 
 - You want the agent to navigate a single fixed codebase
-- You don't need GitHub access (no token in env)
+- You don't need GitHub access (this manifest leaves `builtins.github` at its default `false`, so the GitHub tools stay unregistered even if a `GITHUB_TOKEN` is in env)
 - You don't need watch/rebuild hooks
 - You don't have domain-specific tools
 

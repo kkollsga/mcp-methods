@@ -46,6 +46,10 @@ builtins:
   save_graph: false                   # whether the save_graph tool is registered
                                       # (only by downstream binaries; framework no-op)
   temp_cleanup: never                 # "never" | "on_overview" — when to clear temp/
+  github: false                       # opt in to github_issues / github_api /
+                                      # screen_stargazers. Default OFF — a reachable
+                                      # GITHUB_TOKEN alone never registers them.
+  screen_stargazers: true             # only meaningful when github: true
 
 # Manifest-declared tools. The generic mcp-server CLI registers `python:` tools
 # if trust permits, but does NOT execute `cypher:` tools (no graph backend).
@@ -134,6 +138,16 @@ Each gate defaults to `false`. The framework parses the block and surfaces it vi
 `save_graph` controls whether downstream binaries that ship a `save_graph` tool should register it. The framework doesn't ship `save_graph` itself.
 
 `temp_cleanup` accepts `"never"` (default) or `"on_overview"`. `on_overview` is consumed by downstream binaries to clear a `temp/` directory whenever the `graph_overview` tool runs.
+
+`github` (default `false`) opts the deployment into the GitHub tools — `github_issues`, `github_api`, and `screen_stargazers`. **A reachable token is not an opt-in.** Before this key existed, registration keyed off token reachability alone, so a `GITHUB_TOKEN` in the environment — or one the `env_file:` walk-up picked up from a `.env` several directories above the server's root — silently added three authenticated GitHub tools to servers that had nothing to do with GitHub. Now the manifest declares intent and the token only decides whether the opted-in tools can actually work: with `github: true` and no reachable token the tools still stay out of `tools/list` (an agent should not see a tool that is guaranteed to fail). Both decisions are made at boot — restart the server after changing either.
+
+`screen_stargazers` (default `true`) is subordinate to `github`: with `github: false` it registers nothing whatever its value. Set it to `false` inside an opted-in deployment to keep `github_issues` / `github_api` but drop the stargazer screener.
+
+```yaml
+builtins:
+  github: true              # register github_issues / github_api / screen_stargazers
+  screen_stargazers: false  # …but not the stargazer screener
+```
 
 ### `tools:`
 

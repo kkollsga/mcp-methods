@@ -13,7 +13,7 @@ A YAML file (`workspace_mcp.yaml` by convention, or `--mcp-config path/to/file.y
 - The **server's identity** (`name:`, `instructions:`, `overview_prefix:`)
 - The **operating mode** (`source_roots:`, `workspace: { kind, root, watch }`)
 - The **trust gates** (`trust: { allow_python_tools, allow_embedder }`)
-- The **builtin behaviour** (`builtins: { save_graph, temp_cleanup }`)
+- The **builtin behaviour** (`builtins: { save_graph, temp_cleanup, github, screen_stargazers }`)
 - Optional **manifest-declared tools** (`tools: [{ kind: cypher | python, ... }]`)
 - An **opaque passthrough** (`extensions: { ... }`) for downstream-binary-specific config
 

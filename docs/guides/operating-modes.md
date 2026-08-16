@@ -105,7 +105,7 @@ For each mode, the framework runs:
 8. Spawn watcher if mode requires it
 9. Serve over stdio
 
-The `env_file:` resolution happens *before* anything reads env vars — so `GITHUB_TOKEN` and similar are guaranteed to be in scope by the time the GitHub tools are constructed.
+The `env_file:` resolution happens *before* anything reads env vars — so `GITHUB_TOKEN` and similar are guaranteed to be in scope by the time the GitHub tools are constructed. A token in scope is not by itself enough to register them: the GitHub tools require `builtins.github: true` in the manifest, and only then does token reachability decide whether they appear. See [Writing a Manifest](writing-a-manifest.md#builtins).
 
 ## Manifest auto-detection
 
