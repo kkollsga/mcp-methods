@@ -119,6 +119,21 @@ server.register_typed_tool::<ArgsB, _>(
 );
 ```
 
+For a handler that can fail, use `register_typed_tool_fallible` — same
+shape, but the handler returns `Result<String, String>` and an `Err`
+sets `isError: true` on the MCP result (the result-postprocess hook
+still runs on both arms):
+
+```rust
+server.register_typed_tool_fallible::<ArgsC, _>(
+    "tool_c",
+    "Tool C's description.",
+    move |args: ArgsC| -> Result<String, String> {
+        run_query(&args.query).map_err(|e| format!("query failed: {e}"))
+    },
+);
+```
+
 The `T` type parameter is your tool's argument schema. It must implement:
 
 - `serde::Deserialize` — for parsing the agent's call arguments
@@ -126,7 +141,11 @@ The `T` type parameter is your tool's argument schema. It must implement:
 - `Default` — for the case where the agent invokes the tool with no arguments
 - `Send + Sync + 'static`
 
-The handler is a sync `Fn(T) -> String`. The string body becomes the tool's response.
+The handler is a sync `Fn(T) -> String` for `register_typed_tool`, or
+`Fn(T) -> Result<String, String>` for `register_typed_tool_fallible`. The
+string body becomes the tool's response; an `Err` body becomes a response
+with `isError: true`. On either method, arguments that fail to deserialise
+produce an `isError: true` response — the handler is never invoked.
 
 ## Loading a manifest
 

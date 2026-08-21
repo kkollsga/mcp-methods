@@ -23,7 +23,8 @@ The most-imported types and functions, grouped:
 
 - [`mcp_methods::server::McpServer`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html) — the framework's MCP server
 - [`mcp_methods::server::McpServer::new`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.new)
-- [`mcp_methods::server::McpServer::register_typed_tool`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.register_typed_tool) — register a custom tool
+- [`mcp_methods::server::McpServer::register_typed_tool`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.register_typed_tool) — register a custom tool (infallible handler)
+- [`mcp_methods::server::McpServer::register_typed_tool_fallible`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.register_typed_tool_fallible) — register a custom tool whose `Err` arm sets `isError: true` on the MCP result
 - [`mcp_methods::server::McpServer::serve`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.serve) — start the server (via rmcp transport)
 - [`mcp_methods::server::ServerOptions`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.ServerOptions.html) — config used to construct the server
 - [`mcp_methods::server::ServerOptions::from_manifest`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.ServerOptions.html#method.from_manifest)

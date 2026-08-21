@@ -93,6 +93,69 @@ fn append_footer(body: String, footer: Option<String>) -> String {
     }
 }
 
+/// The per-call body of a dynamically registered typed tool:
+/// deserialise the arguments, run the handler, apply the consumer's
+/// result-postprocess hook, and pick the MCP envelope. Both
+/// [`McpServer::register_typed_tool`] and
+/// [`McpServer::register_typed_tool_fallible`] install the same dyn
+/// route and differ only in how their handler spells failure, so the
+/// plumbing lives here once rather than in two near-identical
+/// closures.
+///
+/// The hook runs on every arm — handler `Ok`, handler `Err`, and
+/// arguments that never deserialised — because a footer that vanishes
+/// exactly when something went wrong is a footer the agent can't rely
+/// on: a downstream server that stamps identity or rebuild state onto
+/// results needs that stamp most on the failure. `is_error` is the
+/// only thing the arms disagree on.
+fn dispatch_typed_call<T, F>(
+    tool_name: &str,
+    arguments: Option<rmcp::model::JsonObject>,
+    handler: &F,
+    postprocess: Option<&ResultPostprocessHook>,
+    source_roots: Option<&SourceRootsProvider>,
+    workspace: Option<&crate::server::workspace::Workspace>,
+) -> rmcp::model::CallToolResult
+where
+    T: for<'de> serde::Deserialize<'de> + Default,
+    F: Fn(T) -> Result<String, String>,
+{
+    // Preserve the raw args as JSON for the hook, before consuming
+    // them into the typed `T`.
+    let args_json = match &arguments {
+        Some(map) => serde_json::Value::Object(map.clone()),
+        None => serde_json::Value::Null,
+    };
+    let outcome = match arguments {
+        Some(map) => match serde_json::from_value::<T>(serde_json::Value::Object(map)) {
+            Ok(args) => handler(args),
+            Err(e) => Err(format!("invalid arguments: {e}")),
+        },
+        None => handler(T::default()),
+    };
+    let is_error = outcome.is_err();
+    let body = match outcome {
+        Ok(body) | Err(body) => body,
+    };
+    let body = match postprocess {
+        Some(hook) => {
+            let ctx = ResultCtx {
+                source_roots: source_roots.map(|p| p()).unwrap_or_default(),
+                active_repo: workspace.and_then(|w| w.active_repo_name()),
+            };
+            let footer = hook(tool_name, &args_json, &body, &ctx);
+            append_footer(body, footer)
+        }
+        None => body,
+    };
+    let content = vec![rmcp::model::ContentBlock::text(body)];
+    if is_error {
+        rmcp::model::CallToolResult::error(content)
+    } else {
+        rmcp::model::CallToolResult::success(content)
+    }
+}
+
 /// Per-server runtime state shared by every tool dispatch.
 #[derive(Clone, Default)]
 pub struct ServerOptions {
@@ -825,7 +888,8 @@ impl McpServer {
         &mut self.prompt_router
     }
 
-    /// Register a typed dynamic tool. Compresses the boilerplate of:
+    /// Register a typed dynamic tool with an infallible handler.
+    /// Compresses the boilerplate of:
     /// 1. Generating a JSON Schema for the args type via `schemars`.
     /// 2. Building a [`rmcp::model::Tool`] attr from the schema +
     ///    name + description.
@@ -835,10 +899,24 @@ impl McpServer {
     ///
     /// The handler is `Fn(T) -> String`; it owns whatever state it
     /// needs through the closure environment (typically an Arc-clone
-    /// of a domain-specific state handle). Returning a string means
-    /// the tool reports a clean text body to the agent rather than
-    /// exposing a tool-error envelope — matches the framework's
-    /// "errors as values" convention for source / GitHub tools.
+    /// of a domain-specific state handle). A `String` is the only
+    /// outcome the *handler* can produce, so every call that reaches
+    /// it reports a success envelope (`isError: false`). That makes
+    /// this the entry point for tools that genuinely cannot fail, and
+    /// for tools that
+    /// deliberately render their own failures as ordinary prose the
+    /// agent reads and moves on from — the "errors as values" shape
+    /// the source / GitHub builtins use.
+    ///
+    /// A tool whose failure the *client* should be able to branch on
+    /// wants [`register_typed_tool_fallible`](Self::register_typed_tool_fallible)
+    /// instead: it takes `Fn(T) -> Result<String, String>` and routes
+    /// the `Err` body through the MCP error envelope, so a caller sees
+    /// `isError: true` rather than having to pattern-match the text.
+    ///
+    /// Arguments that fail to deserialise are an error envelope on
+    /// either method — a call the framework could not even hand to
+    /// the handler is not a result the agent should read as one.
     pub fn register_typed_tool<T, F>(
         &mut self,
         name: &'static str,
@@ -852,6 +930,65 @@ impl McpServer {
             + Sync
             + 'static,
         F: Fn(T) -> String + Send + Sync + 'static,
+    {
+        // The fallible route is the general case; an infallible
+        // handler is just one that never takes the `Err` arm.
+        self.register_typed_route(name, description, move |args: T| Ok(handler(args)));
+    }
+
+    /// Register a typed dynamic tool whose handler can fail.
+    ///
+    /// Same shape as [`register_typed_tool`](Self::register_typed_tool)
+    /// — same schema generation, same argument deserialisation, same
+    /// dyn route — except the handler is
+    /// `Fn(T) -> Result<String, String>`. `Ok(body)` produces the
+    /// usual success envelope; `Err(body)` produces an MCP error
+    /// envelope (`isError: true`) carrying the error text verbatim.
+    /// That string is what the agent reads, so write it for that
+    /// reader rather than dumping a `Debug` of some internal type
+    /// into it.
+    ///
+    /// The consumer's [`ResultPostprocessHook`] runs on **both** arms,
+    /// with the same [`ResultCtx`], and its footer is appended to the
+    /// error text exactly as it is to a success body. A downstream
+    /// server that stamps identity or rebuild state onto every result
+    /// keeps that stamp on the failure path, where an unplaceable
+    /// error would otherwise send the agent hunting in the wrong
+    /// graph.
+    pub fn register_typed_tool_fallible<T, F>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+        handler: F,
+    ) where
+        T: for<'de> serde::Deserialize<'de>
+            + schemars::JsonSchema
+            + Default
+            + Send
+            + Sync
+            + 'static,
+        F: Fn(T) -> Result<String, String> + Send + Sync + 'static,
+    {
+        self.register_typed_route(name, description, handler);
+    }
+
+    /// The registration half both public typed-tool methods share:
+    /// build the schema + attr, capture the postprocess plumbing, and
+    /// install one dyn route that defers every per-call decision to
+    /// [`dispatch_typed_call`].
+    fn register_typed_route<T, F>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+        handler: F,
+    ) where
+        T: for<'de> serde::Deserialize<'de>
+            + schemars::JsonSchema
+            + Default
+            + Send
+            + Sync
+            + 'static,
+        F: Fn(T) -> Result<String, String> + Send + Sync + 'static,
     {
         use std::pin::Pin;
         type DynFut<'a, R> = Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>>;
@@ -882,48 +1019,14 @@ impl McpServer {
                     let source_roots = source_roots.clone();
                     let workspace = workspace.clone();
                     Box::pin(async move {
-                        // Preserve the raw args as JSON for the hook,
-                        // before consuming them into the typed `T`.
-                        let args_json = match &arguments {
-                            Some(map) => serde_json::Value::Object(map.clone()),
-                            None => serde_json::Value::Null,
-                        };
-                        let args: T = match arguments {
-                            Some(map) => {
-                                match serde_json::from_value(serde_json::Value::Object(map)) {
-                                    Ok(a) => a,
-                                    Err(e) => {
-                                        return Ok(rmcp::model::CallToolResult::success(vec![
-                                            rmcp::model::ContentBlock::text(format!(
-                                                "invalid arguments: {e}"
-                                            )),
-                                        ])
-                                        .into());
-                                    }
-                                }
-                            }
-                            None => T::default(),
-                        };
-                        let body = handler(args);
-                        let body = match &postprocess {
-                            Some(hook) => {
-                                let ctx = ResultCtx {
-                                    source_roots: source_roots
-                                        .as_ref()
-                                        .map(|p| p())
-                                        .unwrap_or_default(),
-                                    active_repo: workspace
-                                        .as_ref()
-                                        .and_then(|w| w.active_repo_name()),
-                                };
-                                let footer = hook(tool_name, &args_json, &body, &ctx);
-                                append_footer(body, footer)
-                            }
-                            None => body,
-                        };
-                        Ok(rmcp::model::CallToolResult::success(vec![
-                            rmcp::model::ContentBlock::text(body),
-                        ])
+                        Ok(dispatch_typed_call(
+                            tool_name,
+                            arguments,
+                            handler.as_ref(),
+                            postprocess.as_ref(),
+                            source_roots.as_ref(),
+                            workspace.as_ref(),
+                        )
                         .into())
                     })
                 },
@@ -1653,6 +1756,232 @@ mod tests {
         assert_eq!(server.current_source_roots(), vec!["/initial".to_string()]);
         *state.lock().unwrap() = vec!["/swapped".to_string()];
         assert_eq!(server.current_source_roots(), vec!["/swapped".to_string()]);
+    }
+
+    // ─── Typed dynamic tools ──────────────────────────────────────
+
+    /// Args type for the typed-tool tests. `count` is the typed field
+    /// an invalid-arguments call feeds a string to.
+    #[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+    struct EchoArgs {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        count: u32,
+    }
+
+    /// Concatenate the text blocks of a dispatch result. Every typed
+    /// tool emits exactly one, but joining keeps the assertion honest
+    /// if that ever changes.
+    fn result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// A hook that footers every tool unconditionally, so the tests
+    /// can assert the footer's presence per arm rather than per tool.
+    fn footer_hook() -> ResultPostprocessHook {
+        Arc::new(|_tool, _args, _body, _ctx| Some("↳ footer".to_string()))
+    }
+
+    fn args_map(json: serde_json::Value) -> Option<rmcp::model::JsonObject> {
+        json.as_object().cloned()
+    }
+
+    #[test]
+    fn fallible_ok_reports_success_with_footer() {
+        let hook = footer_hook();
+        let out = dispatch_typed_call(
+            "echo",
+            args_map(serde_json::json!({ "text": "hi", "count": 2 })),
+            &|args: EchoArgs| Ok(format!("{} x{}", args.text, args.count)),
+            Some(&hook),
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(false));
+        assert_eq!(result_text(&out), "hi x2\n\n↳ footer");
+    }
+
+    #[test]
+    fn fallible_err_sets_is_error_and_keeps_footer() {
+        // kglite's requirement: the postprocess hook runs on the error
+        // arm too, so identity footers survive a failed call.
+        let hook = footer_hook();
+        let out = dispatch_typed_call(
+            "echo",
+            args_map(serde_json::json!({ "text": "hi" })),
+            &|_args: EchoArgs| Err::<String, String>("no rows matched".to_string()),
+            Some(&hook),
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(true));
+        assert_eq!(result_text(&out), "no rows matched\n\n↳ footer");
+    }
+
+    #[test]
+    fn fallible_err_without_hook_is_error_text_verbatim() {
+        let out = dispatch_typed_call(
+            "echo",
+            args_map(serde_json::json!({})),
+            &|_args: EchoArgs| Err::<String, String>("boom".to_string()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(true));
+        assert_eq!(result_text(&out), "boom");
+    }
+
+    #[test]
+    fn postprocess_ctx_reaches_both_arms() {
+        use std::sync::Mutex;
+        // (body, ctx.source_roots) per hook invocation.
+        type Seen = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let hook: ResultPostprocessHook = Arc::new(move |_tool, _args, body, ctx| {
+            seen_c
+                .lock()
+                .unwrap()
+                .push((body.to_string(), ctx.source_roots.clone()));
+            None
+        });
+        let roots: SourceRootsProvider = Arc::new(|| vec!["/src".to_string()]);
+        for handler_result in ["ok", "err"] {
+            let _ = dispatch_typed_call(
+                "echo",
+                args_map(serde_json::json!({})),
+                &|_args: EchoArgs| {
+                    if handler_result == "ok" {
+                        Ok("body".to_string())
+                    } else {
+                        Err("failed".to_string())
+                    }
+                },
+                Some(&hook),
+                Some(&roots),
+                None,
+            );
+        }
+        let rec = seen.lock().unwrap().clone();
+        assert_eq!(rec.len(), 2, "hook must run on both arms");
+        assert_eq!(rec[0].0, "body");
+        assert_eq!(rec[1].0, "failed");
+        for (_, roots) in &rec {
+            assert_eq!(roots, &vec!["/src".to_string()]);
+        }
+    }
+
+    #[test]
+    fn invalid_arguments_set_is_error_on_both_registrations() {
+        // `count` is a u32; a string can't deserialise into it. The
+        // handler never runs, so the arm is identical for a fallible
+        // handler and for the infallible one `register_typed_tool`
+        // wraps into `Ok(...)`.
+        let bad = || args_map(serde_json::json!({ "count": "not a number" }));
+
+        let fallible = dispatch_typed_call(
+            "echo",
+            bad(),
+            &|_args: EchoArgs| Ok("unreachable".to_string()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(fallible.is_error, Some(true));
+        assert!(
+            result_text(&fallible).starts_with("invalid arguments: "),
+            "got {:?}",
+            result_text(&fallible)
+        );
+
+        // Exactly the wrapping `register_typed_tool` applies.
+        let plain_handler = |_args: EchoArgs| "unreachable".to_string();
+        let plain = dispatch_typed_call(
+            "echo",
+            bad(),
+            &move |args: EchoArgs| Ok(plain_handler(args)),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(plain.is_error, Some(true));
+        assert!(result_text(&plain).starts_with("invalid arguments: "));
+    }
+
+    #[test]
+    fn invalid_arguments_still_get_the_footer() {
+        let hook = footer_hook();
+        let out = dispatch_typed_call(
+            "echo",
+            args_map(serde_json::json!({ "count": "not a number" })),
+            &|_args: EchoArgs| Ok("unreachable".to_string()),
+            Some(&hook),
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(true));
+        assert!(result_text(&out).ends_with("\n\n↳ footer"));
+    }
+
+    #[test]
+    fn plain_handler_success_unchanged() {
+        // The pre-existing contract: an infallible handler's body,
+        // footered, in a success envelope.
+        let hook = footer_hook();
+        let plain_handler = |args: EchoArgs| format!("said {}", args.text);
+        let out = dispatch_typed_call(
+            "echo",
+            args_map(serde_json::json!({ "text": "hello" })),
+            &move |args: EchoArgs| Ok(plain_handler(args)),
+            Some(&hook),
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(false));
+        assert_eq!(result_text(&out), "said hello\n\n↳ footer");
+    }
+
+    #[test]
+    fn missing_arguments_fall_back_to_default_args() {
+        // No `arguments` at all — `T::default()`, handler still runs.
+        let out = dispatch_typed_call(
+            "echo",
+            None,
+            &|args: EchoArgs| Ok(format!("[{}]", args.text)),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(out.is_error, Some(false));
+        assert_eq!(result_text(&out), "[]");
+    }
+
+    #[test]
+    fn both_registrations_reach_the_router() {
+        let mut server = McpServer::new(ServerOptions::default());
+        server.register_typed_tool("echo_plain", "plain", |args: EchoArgs| args.text);
+        server.register_typed_tool_fallible("echo_fallible", "fallible", |args: EchoArgs| {
+            if args.text.is_empty() {
+                Err("text is required".to_string())
+            } else {
+                Ok(args.text)
+            }
+        });
+        let names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "echo_plain"), "{names:?}");
+        assert!(names.iter().any(|n| n == "echo_fallible"), "{names:?}");
     }
 
     // ─── Prompt / skill wiring ────────────────────────────────────

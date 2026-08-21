@@ -201,23 +201,29 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
     // shows full state, agent prompts/list shows filtered) lets
     // operators debug "why isn't my skill firing?" by reading this
     // output. We pass empty tool / extension state since `skills-list`
-    // runs without a live server; predicates relying on runtime state
-    // show as Unsatisfied/Unknown and are explicitly labelled.
+    // runs without a live server, so every runtime-state predicate
+    // (`tool_registered:`, `extension_enabled:`) necessarily evaluates
+    // Unsatisfied here — that verdict is an artefact of the offline
+    // evaluation, not a real suppression. Those clauses are therefore
+    // reported as `[RUNTIME]` and the skill as `conditional`, never as
+    // `[   FAIL]` / `inactive`. Only predicates the CLI can actually
+    // decide from the manifest + skill files (the domain predicates)
+    // are allowed to mark a skill `inactive`.
     let empty_tools = std::collections::HashSet::new();
     let empty_ext = serde_json::Map::new();
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<28}  {:<14}  {:<10}  description",
+        "{:<28}  {:<14}  {:<12}  description",
         "name", "provenance", "status"
     );
     let _ = writeln!(
         out,
-        "{:<28}  {:<14}  {:<10}  {}",
+        "{:<28}  {:<14}  {:<12}  {}",
         "-".repeat(28),
         "-".repeat(14),
-        "-".repeat(10),
+        "-".repeat(12),
         "-".repeat(40)
     );
     for name in registry.skill_names() {
@@ -226,33 +232,93 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
         };
         let prov = provenance_label(&skill.provenance);
         let activation = registry.activation_for(skill, &empty_tools, &empty_ext);
+        // Clauses this CLI run cannot decide offline, keyed by the exact
+        // label `activation_for` renders for them.
+        let runtime = runtime_clause_notes(skill);
+        let runtime_note = |clause: &String| -> Option<&'static str> {
+            runtime
+                .iter()
+                .find(|(label, _)| label == clause)
+                .map(|(_, note)| *note)
+        };
+        // A skill is only truly suppressed when a predicate the CLI can
+        // decide came out false; runtime-state clauses don't count.
+        let decidable_failure = activation.clauses.iter().any(|(clause, outcome)| {
+            *outcome != crate::server::skills::PredicateOutcome::Satisfied
+                && runtime_note(clause).is_none()
+        });
         let status = if activation.active {
             "active"
-        } else {
+        } else if decidable_failure {
             "inactive"
+        } else {
+            "conditional"
         };
         let desc: String = skill.description().chars().take(60).collect();
         let _ = writeln!(
             out,
-            "{:<28}  {:<14}  {status:<10}  {desc}",
+            "{:<28}  {:<14}  {status:<12}  {desc}",
             skill.name(),
             prov
         );
-        // For inactive skills, surface which predicate suppressed them
-        // so the operator can debug. Indented sub-lines keep the table
-        // readable while still giving full attribution.
+        // For skills that aren't unconditionally active, surface each
+        // predicate so the operator can debug. Indented sub-lines keep
+        // the table readable while still giving full attribution.
         if !activation.active {
             for (clause, outcome) in &activation.clauses {
-                let mark = match outcome {
-                    crate::server::skills::PredicateOutcome::Satisfied => "ok",
-                    crate::server::skills::PredicateOutcome::Unsatisfied => "FAIL",
-                    crate::server::skills::PredicateOutcome::Unknown => "UNKNOWN",
-                };
-                let _ = writeln!(out, "    [{mark:>7}]  {clause}");
+                let unresolved_runtime =
+                    *outcome != crate::server::skills::PredicateOutcome::Satisfied;
+                match runtime_note(clause).filter(|_| unresolved_runtime) {
+                    Some(note) => {
+                        // "RUNTIME" is exactly the 7-wide mark column
+                        // the other marks are right-aligned into.
+                        let _ = writeln!(out, "    [RUNTIME]  {clause} — {note}");
+                    }
+                    None => {
+                        let mark = match outcome {
+                            crate::server::skills::PredicateOutcome::Satisfied => "ok",
+                            crate::server::skills::PredicateOutcome::Unsatisfied => "FAIL",
+                            crate::server::skills::PredicateOutcome::Unknown => "UNKNOWN",
+                        };
+                        let _ = writeln!(out, "    [{mark:>7}]  {clause}");
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// The `activation.clauses` labels that come from *runtime-state*
+/// predicates, each paired with the note explaining where the real
+/// answer comes from.
+///
+/// `skills-list` has no live server, so these predicates cannot be
+/// evaluated offline; rendering their forced `Unsatisfied` verdict as a
+/// failure would tell operators a correctly-configured skill is
+/// suppressed. The labels are rebuilt from the skill's typed
+/// frontmatter using the same `format!` shapes
+/// [`Registry::activation_for`](crate::server::skills::Registry::activation_for)
+/// uses, so classification keys off the parsed predicate set rather
+/// than sniffing the prefix of a display string.
+fn runtime_clause_notes(skill: &Skill) -> Vec<(String, &'static str)> {
+    let mut notes = Vec::new();
+    let Some(applies_when) = skill.frontmatter.applies_when.as_ref() else {
+        return notes;
+    };
+    if let Some(tool) = applies_when.tool_registered.as_ref() {
+        notes.push((
+            format!("tool_registered: {tool}"),
+            "resolved against the live tool router at boot",
+        ));
+    }
+    if let Some(key) = applies_when.extension_enabled.as_ref() {
+        notes.push((
+            format!("extension_enabled: {key}"),
+            "resolved against the live manifest extensions at boot",
+        ));
+    }
+    notes
 }
 
 fn format_skill_body(skill: &Skill) -> String {
@@ -324,6 +390,173 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("WARN") && l.contains("4 KB")));
+    }
+
+    /// Write a skill whose frontmatter carries an `applies_when:`
+    /// block. `applies_when` is the already-indented YAML body of the
+    /// block (each line prefixed with two spaces, newline-terminated).
+    fn write_gated_skill(dir: &Path, name: &str, applies_when: &str) {
+        fs::write(
+            dir.join(format!("{name}.md")),
+            format!(
+                "---\nname: {name}\ndescription: A {name} skill.\napplies_when:\n{applies_when}---\n\nBody {name}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Answers the domain predicates with a hard "no" so the CLI has a
+    /// clause it can actually decide offline.
+    struct DenyGraphPredicates;
+
+    impl crate::server::skills::SkillPredicateEvaluator for DenyGraphPredicates {
+        fn evaluate(&self, clause: &crate::server::skills::PredicateClause<'_>) -> Option<bool> {
+            use crate::server::skills::PredicateClause;
+            match clause {
+                PredicateClause::GraphHasNodeType(_) | PredicateClause::GraphHasProperty { .. } => {
+                    Some(false)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Build a registry from the project layer next to `manifest`,
+    /// with the domain-predicate evaluator attached — `skills_list`
+    /// can't register one, and we need a decidable failing clause.
+    fn project_registry_with_evaluator(manifest: &Path) -> ResolvedRegistry {
+        Registry::new()
+            .with_predicate_evaluator(DenyGraphPredicates)
+            .auto_detect_project_layer(manifest)
+            .finalise()
+            .unwrap()
+    }
+
+    fn line_for<'a>(output: &'a str, name: &str) -> &'a str {
+        output
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no row for {name} in:\n{output}"))
+    }
+
+    #[test]
+    fn skills_list_reports_runtime_gated_skills_as_conditional() {
+        // `skills-list` runs without a live server, so `tool_registered:`
+        // is unknowable offline. It must not be rendered as a failure —
+        // the bundled github/workspace skills are gated on their own
+        // tool and would otherwise report as suppressed in *every*
+        // deployment, including ones where the tool registers at boot.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let output = skills_list(&manifest, true).unwrap();
+
+        for name in ["github_issues", "repo_management"] {
+            let row = line_for(&output, name);
+            assert!(
+                row.contains("conditional"),
+                "expected `{name}` to be conditional, got: {row}"
+            );
+            assert!(
+                !row.contains("inactive"),
+                "`{name}` must not be reported inactive offline, got: {row}"
+            );
+            assert!(
+                output.contains(&format!(
+                    "    [RUNTIME]  tool_registered: {name} — resolved against the live tool router at boot"
+                )),
+                "expected a RUNTIME clause line for `{name}` in:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains("FAIL"),
+            "no bundled skill may render as FAIL offline:\n{output}"
+        );
+    }
+
+    #[test]
+    fn skills_list_extension_gate_is_runtime_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_gated_skill(
+            &skills_dir,
+            "gated",
+            "  extension_enabled: csv_http_server\n",
+        );
+        let output = skills_list(&manifest, false).unwrap();
+        assert!(line_for(&output, "gated").contains("conditional"));
+        assert!(output.contains(
+            "    [RUNTIME]  extension_enabled: csv_http_server — resolved against the live manifest extensions at boot"
+        ), "got:\n{output}");
+    }
+
+    #[test]
+    fn format_skill_list_keeps_decidable_failures_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_gated_skill(&skills_dir, "domain", "  graph_has_node_type: [Function]\n");
+        let output = format_skill_list(&project_registry_with_evaluator(&manifest));
+        assert!(
+            line_for(&output, "domain").contains("inactive"),
+            "got:\n{output}"
+        );
+        assert!(
+            output.contains("    [   FAIL]  graph_has_node_type: [\"Function\"]"),
+            "got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn format_skill_list_decidable_failure_wins_over_runtime_clause() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_gated_skill(
+            &skills_dir,
+            "mixed",
+            "  graph_has_node_type: [Function]\n  tool_registered: cypher_query\n",
+        );
+        let output = format_skill_list(&project_registry_with_evaluator(&manifest));
+        // A clause the CLI *can* decide came out false — that's a real
+        // suppression, so `inactive` wins over `conditional`.
+        assert!(
+            line_for(&output, "mixed").contains("inactive"),
+            "got:\n{output}"
+        );
+        assert!(
+            output.contains("    [   FAIL]  graph_has_node_type"),
+            "got:\n{output}"
+        );
+        assert!(
+            output.contains("    [RUNTIME]  tool_registered: cypher_query — resolved against the live tool router at boot"),
+            "got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn format_skill_list_ungated_skill_stays_active_without_clause_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_skill(&skills_dir, "plain", "Plain body.");
+        let output = skills_list(&manifest, false).unwrap();
+        let row = line_for(&output, "plain");
+        assert!(row.contains("active"), "got: {row}");
+        assert!(!row.contains("conditional") && !row.contains("inactive"));
+        assert!(
+            !output.contains("    ["),
+            "no clause lines expected:\n{output}"
+        );
     }
 
     #[test]

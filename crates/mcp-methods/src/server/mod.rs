@@ -14,7 +14,10 @@
 //! 2. `let mut server = server::McpServer::new(options);`
 //! 3. Register your domain-specific tools with
 //!    [`server::McpServer::register_typed_tool`] — typed arg struct
-//!    plus a `Fn(T) -> String` handler. (For lower-level control, use
+//!    plus a `Fn(T) -> String` handler — or
+//!    [`server::McpServer::register_typed_tool_fallible`] when the
+//!    handler returns `Result<String, String>` and an `Err` should set
+//!    `isError: true` on the MCP result. (For lower-level control, use
 //!    [`server::McpServer::tool_router_mut`] and rmcp's `ToolRoute`
 //!    directly.)
 //! 4. `server.serve(rmcp::transport::stdio()).await`.

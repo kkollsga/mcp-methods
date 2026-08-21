@@ -16,7 +16,7 @@ Boot the server:
 mcp-server --mcp-config ./my_mcp.yaml
 ```
 
-Connect any MCP client. You'll now see five prompts in `prompts/list`: `grep`, `read_source`, `list_source`, `github_issues`, `repo_management`. Each returns methodology for the corresponding framework tool.
+Connect any MCP client. You'll now see three prompts in `prompts/list`: `grep`, `read_source`, `list_source`. Each returns methodology for the corresponding framework tool. Two more bundled skills — `github_issues` and `repo_management` — gate on their tool actually being registered (`applies_when: tool_registered:`), so they appear only when the manifest opts into `builtins.github: true` (with a token reachable) or configures a workspace, respectively.
 
 That's the bundled-only path. Three lines of YAML, zero new files.
 
@@ -37,7 +37,7 @@ auto_inject_hint: true
 For "what calls X" questions: ...
 ```
 
-Re-boot the server. `prompts/list` now includes `cypher_query` alongside the five bundled defaults. If your binary registers a tool named `cypher_query`, the framework also appends a pointer to that tool's description: "See `prompts/get` `cypher_query` for the full methodology."
+Re-boot the server. `prompts/list` now includes `cypher_query` alongside the bundled defaults active in the session (three in a default deployment; `github_issues` and `repo_management` join when their tools register). If your binary registers a tool named `cypher_query`, the framework also appends a pointer to that tool's description: "See `prompts/get` `cypher_query` for the full methodology."
 
 ## Adding a shared skill pack
 
@@ -71,15 +71,22 @@ mcp-server skills-show --mcp-config ./my_mcp.yaml cypher_query
 `skills-list` is the easiest sanity check: it shows you, at a glance, every skill the server will surface and where each came from.
 
 ```
-name                          provenance      description
-----------------------------  --------------  ------------------------------
-cypher_query                  project         Cypher patterns specific...
-github_issues                 bundled         Methodology for the `github_issues` tool — ...
-grep                          bundled         Methodology for the `grep` source-search tool ...
-list_source                   bundled         Methodology for the `list_source` directory-listing ...
-read_source                   bundled         Methodology for the `read_source` file-reading tool ...
-repo_management               bundled         Methodology for the `repo_management` workspace tool ...
+name                          provenance      status        description
+----------------------------  --------------  ------------  ----------------------------------------
+cypher_query                  project         active        Cypher patterns specific to this graph's schema, plus query
+github_issues                 bundled         conditional   Search, list, or fetch GitHub issues, pull requests, and Dis
+    [RUNTIME]  tool_registered: github_issues — resolved against the live tool router at boot
+grep                          bundled         active        Regex text search across the configured source roots, with f
+list_source                   bundled         active        List directory contents under the configured source roots in
+read_source                   bundled         active        Read source files from the configured source roots, with opt
+repo_management               bundled         conditional   Clone GitHub repos into the workspace, swap which repo is cu
+    [RUNTIME]  tool_registered: repo_management — resolved against the live tool router at boot
 ```
+
+`conditional` means the skill's `applies_when:` gate depends on runtime
+state the CLI can't see (which tools actually registered): it activates at
+boot if its tool does. `inactive` + `[FAIL]` is reserved for predicates
+the CLI *can* decide offline — those skills really are suppressed.
 
 A project-layer skill with the same name as a bundled one will show up with `provenance: project`, masking the bundled version. That's how you tell whether your override is winning.
 

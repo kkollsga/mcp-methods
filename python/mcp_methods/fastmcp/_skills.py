@@ -22,6 +22,14 @@ and tool descriptions are fixed at decoration time, so the hint would
 need to be applied at decorator scope. Operators who want the hint
 can compose tool descriptions explicitly. The Rust-side
 `serve_prompts` is the canonical path when this matters.
+
+`applies_when:` predicate gating is *not* mirrored here either: every
+skill in the registry registers unconditionally, including bundled
+skills that gate on `tool_registered:` (`github_issues`,
+`repo_management`) — this helper has no view of which tools the
+FastMCP app registered. A deployment that must not advertise gated
+skills should filter before calling, or use the Rust-side
+`serve_prompts`, which evaluates the predicates.
 """
 
 from __future__ import annotations

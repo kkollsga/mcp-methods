@@ -2165,4 +2165,111 @@ Body.\n";
         tools.insert("cypher_query".to_string());
         assert!(registry.activation_for(&skill, &tools, &extensions).active);
     }
+
+    // ─── Bundled-skill gating on their own tool ───────────────────
+
+    fn bundled_skill(name: &str) -> Skill {
+        let bundled = library_bundled_skills()
+            .into_iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("bundled skill `{name}` not in the index"));
+        let path = PathBuf::from(format!("<bundled:{name}>"));
+        let (frontmatter, body) = parse_skill(bundled.body, &path).unwrap();
+        Skill {
+            frontmatter,
+            body,
+            provenance: SkillProvenance::Bundled,
+        }
+    }
+
+    #[test]
+    fn optional_bundled_skills_declare_their_tool_registered_gate() {
+        // `github_issues` registers only under `builtins.github: true`
+        // with a reachable token; `repo_management` only in workspace
+        // mode (`kind: github`). Both gate on the registration
+        // *outcome*, so one predicate covers both origins. Without the
+        // gate they advertised methodology for tools absent from the
+        // session (observed downstream in `--graph` mode).
+        for name in ["github_issues", "repo_management"] {
+            let skill = bundled_skill(name);
+            let applies =
+                skill.frontmatter.applies_when.as_ref().unwrap_or_else(|| {
+                    panic!("bundled skill `{name}` lost its applies_when block")
+                });
+            assert_eq!(
+                applies.tool_registered.as_deref(),
+                Some(name),
+                "bundled skill `{name}` must gate on its own tool"
+            );
+        }
+    }
+
+    #[test]
+    fn always_registered_bundled_skills_stay_ungated() {
+        // The source-tool skills ship with every deployment — gating
+        // them would suppress the framework's baseline methodology.
+        for name in ["grep", "read_source", "list_source"] {
+            let skill = bundled_skill(name);
+            assert!(
+                skill.frontmatter.applies_when.is_none(),
+                "bundled skill `{name}` should not be predicate-gated"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_bundled_skills_activate_only_with_their_tool() {
+        let registry = ResolvedRegistry::default();
+        let extensions = serde_json::Map::new();
+        for name in ["github_issues", "repo_management"] {
+            let skill = bundled_skill(name);
+
+            // Tool unregistered (github builtins off / non-workspace
+            // mode) → suppressed from prompts/list and auto-inject.
+            let inactive =
+                registry.activation_for(&skill, &std::collections::HashSet::new(), &extensions);
+            assert!(
+                !inactive.active,
+                "bundled skill `{name}` must be inactive when `{name}` is unregistered"
+            );
+            assert_eq!(
+                inactive.clauses,
+                vec![(
+                    format!("tool_registered: {name}"),
+                    PredicateOutcome::Unsatisfied
+                )]
+            );
+
+            // Tool registered → active.
+            let mut tools = std::collections::HashSet::new();
+            tools.insert(name.to_string());
+            let active = registry.activation_for(&skill, &tools, &extensions);
+            assert!(
+                active.active,
+                "bundled skill `{name}` must be active when `{name}` is registered"
+            );
+            assert_eq!(active.clauses[0].1, PredicateOutcome::Satisfied);
+        }
+    }
+
+    #[test]
+    fn unrelated_registered_tool_does_not_activate_optional_bundled_skills() {
+        // A session with the source tools but no github tools (the
+        // `--graph` deployment) must not surface either skill.
+        let registry = ResolvedRegistry::default();
+        let tools: std::collections::HashSet<String> =
+            ["grep", "read_source", "list_source", "set_root_dir"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        for name in ["github_issues", "repo_management"] {
+            let skill = bundled_skill(name);
+            assert!(
+                !registry
+                    .activation_for(&skill, &tools, &serde_json::Map::new())
+                    .active,
+                "bundled skill `{name}` leaked into a session without `{name}`"
+            );
+        }
+    }
 }

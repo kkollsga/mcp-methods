@@ -8,7 +8,7 @@ Skills resolve through three layers — **project → domain pack → bundled de
 
 Compile-time skills shipped inside a binary's `.so` / executable. Two sources:
 
-- **Framework** — the five SKILL.md files in `mcp-methods` (`grep`, `read_source`, `list_source`, `github_issues`, `repo_management`). These cover the always-registered framework tools and ship with `mcp_methods::server::library_bundled_skills()`.
+- **Framework** — the five SKILL.md files in `mcp-methods` (`grep`, `read_source`, `list_source`, `github_issues`, `repo_management`). All five ship with `mcp_methods::server::library_bundled_skills()`; the first three cover always-registered framework tools, while `github_issues` and `repo_management` carry `applies_when: tool_registered:` gates and surface only in sessions where their tool actually registered. (The gate is evaluated by the Rust `serve_prompts` path; the Python FastMCP helper registers skills unconditionally — see its module docs.)
 - **Downstream binary** — a domain binary (e.g. `kglite-mcp-server`) can add its own bundled skills via `Registry::add_bundled_many(...)` before finalising. These ship inside the binary; operators don't see them as files.
 
 When to put a skill here:

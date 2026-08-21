@@ -35,7 +35,8 @@
 //! overrides CLI-derived mode if set → `.env` walk-up (or explicit
 //! `env_file:`) → build ServerOptions → register dynamic tools →
 //! apply Python extensions (manifest-declared `python:` tools and
-//! embedder factory under trust gates) → spawn watcher if configured
+//! embedder factory under trust gates) → wire manifest-declared
+//! `skills:` into the prompt surface → spawn watcher if configured
 //! → serve over stdio.
 //!
 //! The manifest schema mirrors the legacy `kglite-mcp-server` Python
@@ -51,10 +52,12 @@ use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
-use mcp_methods::server::manifest::{self, find_workspace_manifest, Manifest, ManifestError};
+use mcp_methods::server::manifest::{
+    self, find_workspace_manifest, Manifest, ManifestError, SkillsSource,
+};
 use mcp_methods::server::{
     cli as skills_cli, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
-    workspace, McpServer, ServerOptions,
+    serve_prompts, workspace, McpServer, ServerOptions, SkillRegistry,
 };
 
 /// Operating mode picked from the CLI flags and the manifest's
@@ -321,6 +324,7 @@ fn print_boot_summary(
     source_roots: &[String],
     python_tool_count: usize,
     env_file_loaded: Option<&Path>,
+    skills: Option<SkillsSummary>,
 ) {
     let mode_label = match mode {
         Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
@@ -370,10 +374,79 @@ fn print_boot_summary(
     if python_tool_count > 0 {
         parts.push(format!("{python_tool_count} python tool(s) registered"));
     }
+    if let Some(s) = skills {
+        let suppressed = s.resolved.saturating_sub(s.registered);
+        parts.push(format!(
+            "{} skill prompt(s) registered{}",
+            s.registered,
+            if suppressed > 0 {
+                format!(" ({suppressed} suppressed by applies_when)")
+            } else {
+                String::new()
+            }
+        ));
+    }
     if !source_roots.is_empty() {
         parts.push(format!("source roots: {source_roots:?}"));
     }
     eprintln!("mcp-server: {}", parts.join("; "));
+}
+
+/// What the skills layer contributed at boot, for the boot summary.
+/// `resolved` counts every skill the three-layer composition produced;
+/// `registered` counts the ones that survived their `applies_when:`
+/// predicates and became prompt routes. The difference is the number
+/// suppressed at this deployment's runtime state.
+#[derive(Debug, Clone, Copy)]
+struct SkillsSummary {
+    resolved: usize,
+    registered: usize,
+}
+
+/// Resolve the manifest's `skills:` declaration and wire the result
+/// into the server's `prompts/list` / `prompts/get` surface.
+///
+/// Gated on an opted-in manifest: no manifest, or `skills:` absent /
+/// `false`, leaves the server byte-identical to a pre-skills boot (no
+/// registry is built, no prompts capability is advertised). An empty
+/// `skills: []` list still counts as opt-in — the manifest loader
+/// treats it as "skills on, no root layer", so the project-local
+/// `<basename>.skills/` auto-detection still applies.
+///
+/// Resolution failure is fatal: the operator explicitly asked for
+/// skills, so a broken skill directory must not degrade into a server
+/// that silently serves no prompts.
+///
+/// Must be called after every tool is registered — [`serve_prompts`]
+/// evaluates `tool_registered:` predicates and the auto-inject pass
+/// against the final tool catalogue. This binary registers all of its
+/// tools inside [`McpServer::new`], so immediately after construction
+/// satisfies that.
+fn wire_skills(
+    manifest: Option<&Manifest>,
+    server: &mut McpServer,
+) -> Result<Option<SkillsSummary>> {
+    let Some(m) = manifest else {
+        return Ok(None);
+    };
+    if matches!(m.skills, SkillsSource::Disabled) {
+        return Ok(None);
+    }
+    let registry = SkillRegistry::from_manifest(&m.yaml_path, true).with_context(|| {
+        format!(
+            "skill registry resolution failed for manifest {}",
+            m.yaml_path.display()
+        )
+    })?;
+    // Per-file parse failures are already logged by the loader; the
+    // count is what the boot summary needs.
+    let resolved = registry.len();
+    serve_prompts(&registry, server);
+    let registered = server.prompt_router_mut().list_all().len();
+    Ok(Some(SkillsSummary {
+        resolved,
+        registered,
+    }))
 }
 
 /// Dispatch a skills subcommand and return — server boot is skipped
@@ -545,7 +618,11 @@ async fn main() -> Result<()> {
     if !source_roots.is_empty() {
         options = options.with_static_source_roots(source_roots.clone());
     }
-    let server = McpServer::new(options);
+    let mut server = McpServer::new(options);
+    // Skills → prompts. Done here, before anything else touches the
+    // server, because `serve_prompts` needs the final tool catalogue
+    // and this binary registers every tool inside `McpServer::new`.
+    let skills_summary = wire_skills(manifest.as_ref(), &mut server)?;
     // Python tool / embedder extension hooks were removed in 0.3.26 — they
     // required PyO3 in the framework's source and violated the pure-Rust
     // contract of `mcp-methods`. Manifest entries declaring `python:`
@@ -589,6 +666,7 @@ async fn main() -> Result<()> {
         &source_roots,
         python_tool_count,
         env_file_loaded.as_deref(),
+        skills_summary,
     );
 
     let service = server
@@ -602,6 +680,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::ServerHandler;
 
     fn cli(args: &[&str]) -> Cli {
         let mut full = vec!["mcp-server"];
@@ -787,6 +866,124 @@ mod tests {
     fn watch_and_workspace_mutually_exclusive() {
         let res = Cli::try_parse_from(["mcp-server", "--watch", "/tmp/a", "--workspace", "/tmp/b"]);
         assert!(res.is_err());
+    }
+
+    /// Boot a server the way `main` does for a manifest, then run the
+    /// skills-wiring step against it. Mirrors the real boot: options
+    /// come from the manifest (so `builtins.github` stays off and no
+    /// workspace is bound), and no tool is registered after
+    /// `McpServer::new`.
+    fn boot_with_manifest(
+        yaml_body: &str,
+    ) -> (tempfile::TempDir, McpServer, Option<SkillsSummary>) {
+        let td = tempfile::tempdir().unwrap();
+        let yaml = td.path().join("test_mcp.yaml");
+        std::fs::write(&yaml, yaml_body).unwrap();
+        let m = manifest::load(&yaml).unwrap();
+        let options = ServerOptions::from_manifest(Some(&m), "test");
+        let mut server = McpServer::new(options);
+        let summary = wire_skills(Some(&m), &mut server).unwrap();
+        (td, server, summary)
+    }
+
+    fn prompt_names(server: &mut McpServer) -> Vec<String> {
+        server
+            .prompt_router_mut()
+            .list_all()
+            .into_iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn bundled_skills_manifest_registers_prompts_on_the_shipped_binary() {
+        let (_td, mut server, summary) = boot_with_manifest("name: t\nskills:\n  - true\n");
+        let names = prompt_names(&mut server);
+        for expected in ["grep", "read_source", "list_source"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "bundled skill `{expected}` must reach prompts/list; got: {names:?}"
+            );
+        }
+        let s = summary.expect("an opted-in manifest must report a skills summary");
+        assert_eq!(s.registered, names.len());
+        assert!(
+            s.resolved >= s.registered,
+            "resolved ({}) must cover registered ({})",
+            s.resolved,
+            s.registered
+        );
+    }
+
+    #[test]
+    fn tool_gated_bundled_skills_stay_suppressed_by_default() {
+        // Default deployment: `builtins.github` off and no workspace,
+        // so neither github_issues nor repo_management is registered
+        // as a tool — their skills must not surface either.
+        let (_td, mut server, summary) = boot_with_manifest("name: t\nskills:\n  - true\n");
+        let names = prompt_names(&mut server);
+        for gated in ["github_issues", "repo_management"] {
+            assert!(
+                !names.iter().any(|n| n == gated),
+                "skill `{gated}` must stay suppressed without its tool; got: {names:?}"
+            );
+        }
+        let s = summary.unwrap();
+        assert!(
+            s.resolved > s.registered,
+            "the gated skills should show up as suppressed: {s:?}"
+        );
+    }
+
+    #[test]
+    fn prompts_capability_is_advertised_once_skills_register() {
+        let (_td, server, _) = boot_with_manifest("name: t\nskills:\n  - true\n");
+        assert!(
+            server.get_info().capabilities.prompts.is_some(),
+            "the prompts capability must be advertised when skills registered"
+        );
+    }
+
+    #[test]
+    fn manifest_without_skills_leaves_the_prompt_surface_empty() {
+        let (_td, mut server, summary) = boot_with_manifest("name: t\n");
+        assert!(summary.is_none(), "no skills declaration → no wiring");
+        assert!(prompt_names(&mut server).is_empty());
+        assert!(
+            server.get_info().capabilities.prompts.is_none(),
+            "a pre-skills boot must not advertise the prompts capability"
+        );
+    }
+
+    #[test]
+    fn skills_false_is_the_same_as_no_declaration() {
+        let (_td, mut server, summary) = boot_with_manifest("name: t\nskills: false\n");
+        assert!(summary.is_none());
+        assert!(prompt_names(&mut server).is_empty());
+    }
+
+    #[test]
+    fn no_manifest_at_all_skips_the_registry() {
+        let mut server = McpServer::new(ServerOptions::default());
+        assert!(wire_skills(None, &mut server).unwrap().is_none());
+        assert!(prompt_names(&mut server).is_empty());
+    }
+
+    #[test]
+    fn a_broken_skills_path_fails_the_boot_loudly() {
+        let td = tempfile::tempdir().unwrap();
+        let yaml = td.path().join("test_mcp.yaml");
+        std::fs::write(&yaml, "name: t\nskills:\n  - ./nope/\n").unwrap();
+        let m = manifest::load(&yaml).unwrap();
+        let mut server = McpServer::new(ServerOptions::default());
+        let err = wire_skills(Some(&m), &mut server)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("skill registry resolution failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

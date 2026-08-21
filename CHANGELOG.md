@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.4.6 — 2026-08-21
+
+### Added — `register_typed_tool_fallible`: tool failures can finally say so
+
+`McpServer` gains `register_typed_tool_fallible`, the same registration
+shape as `register_typed_tool` but taking `Fn(T) -> Result<String, String>`.
+An `Err` routes through `CallToolResult::error`, so the MCP response
+carries `isError: true` instead of a success envelope with failure prose
+inside it.
+
+Until now the framework structurally could not emit `isError: true`:
+`register_typed_tool` is the only typed registration path and it ended in
+an unconditional success envelope, so every downstream server reported
+every failure — syntax errors, read-only rejections, unknown procedures —
+as a success. An LLM reading the body copes; a programmatic MCP client
+branching on `isError` treats every failure as a result to build on.
+Surfaced by an external adversarial evaluation of a downstream deployment
+(kglite, 2026-08-20).
+
+The `result_postprocess` hook runs on both arms with the same `ResultCtx`,
+so downstream footers (kglite's identity/rebuild trailers ride on this
+hook) appear on error results exactly as on successes. Both public
+methods now delegate to one shared dispatch path; there is no behavioural
+fork to keep in sync.
+
+### Changed — invalid arguments now set `isError: true` (behaviour break)
+
+Argument-deserialization failure on a typed tool used to return a
+*success* envelope carrying the text `invalid arguments: …`. It now
+returns the same text with `isError: true`, for both `register_typed_tool`
+and the new fallible sibling — a request the server could not even parse
+is not a success under any reading. The postprocess hook still runs on
+this arm (with the raw argument map as `args_json`), so footers survive.
+Clients that pattern-match the `invalid arguments:` text keep working;
+clients that branch on `isError` stop mistaking rejections for results.
+
+### Fixed — bundled GitHub skills no longer advertise absent tools
+
+`github_issues` and `repo_management` bundled skills now carry
+`applies_when: tool_registered: <their tool>` in their frontmatter. Both
+skill bodies always *described* their gate in prose ("the tool only
+registers when…"), but nothing encoded it: `prompts/list` gates on
+`applies_when` alone, and neither skill had one. A server in `--graph`
+mode with GitHub builtins off (the 0.4.5 default) therefore still listed
+both skills, teaching methodology for tools absent from the session —
+observed by the same external evaluation.
+
+The existing predicate machinery does all the work; suppression covers
+both the `prompts/list` entry and the description text injected into
+referenced tools. One consequence worth naming: in local-workspace
+sessions, `set_root_dir` no longer receives the `repo_management`
+methodology injection — correct, since that body documents a tool the
+session does not have and itself tells local-mode operators to use
+`set_root_dir` instead.
+
+### Fixed — the shipped `mcp-server` binary now serves skill prompts
+
+`mcp-server` parsed the manifest's `skills:` section and then ignored it:
+boot went straight from `McpServer::new` to the stdio transport without
+ever building a `SkillRegistry` or calling `serve_prompts`, so
+`prompts/list` was always empty and the skills-aware-manifests guide's
+walkthrough did not work on the binary it demonstrates. Only downstream
+binaries that wired `serve_prompts` themselves got the documented
+behaviour. The binary now resolves the registry and registers prompts
+before serving (a registry that fails to resolve fails the boot loudly —
+the operator opted in), and the boot summary reports how many prompts
+registered and how many were suppressed by predicates. A manifest without
+`skills:` boots exactly as before, including advertising no prompts
+capability.
+
+### Fixed — `skills-list` no longer reports runtime-gated skills as failed
+
+`skills-list` runs without a live server and evaluated `applies_when`
+predicates against an empty tool set, so the newly gated bundled skills
+rendered `inactive` with a `[FAIL]` clause in every deployment — including
+ones where the skill activates at boot. Runtime-state predicates
+(`tool_registered`, `extension_enabled`) now render as a `conditional`
+status with a `[RUNTIME]` clause naming what resolves them at boot;
+`inactive`/`[FAIL]` is reserved for predicates the CLI can actually decide
+offline, and a decidable failure still wins in mixed cases.
+
 ## 0.4.5 — 2026-08-16
 
 ### Changed — GitHub tools are manifest opt-in, default off (behaviour break)
