@@ -22,9 +22,9 @@ Blocking fired *after* the irreversible decision was already made, so it
 added nothing to the choice, and it broke unattended releases: a kglite
 release sat at a staged commit while the owner was away. Note the
 sharper geometry here — the push IS the publish, since the workflows
-trigger on the root `Cargo.toml` path with no branch guard and there is
-no PR or branch-CI interlock the way kglite has one. That argues for
-strong *checks* before the push, not for a prompt at it.
+trigger on any code push to `main` and there is no PR or branch-CI
+interlock the way kglite has one. That argues for strong *checks*
+before the push, not for a prompt at it.
 
 Publishes are immutable; there is no undo.
 
@@ -36,24 +36,31 @@ owner's standing call, so a prompt only spends attention re-confirming
 it. Note the semver-relevant change in the CHANGELOG entry instead,
 where it reaches the people it affects.
 
-The trigger: any push to `main` that touches the **root `Cargo.toml`**
-(the single-source `[workspace.package].version`; both workflows are
-scoped to `paths: ['Cargo.toml']`). `publish_crates.yml` and
-`build_wheels.yml` each re-read the version, skip if it's already live
-on the registry (`should_publish` check), and otherwise publish after
-CI passes (`ci-gate`). Publishes are **immutable** — a version, once on
-crates.io/PyPI, can never be overwritten or unpublished. There is no
-branch guard on the workflows, so the bump must only land on the ref
-you intend to release from.
+The trigger (since 2026-08-31): any push to **`main`** that touches the
+root `Cargo.toml`, `crates/**`, `python/**`, or `pyproject.toml`
+(`branches: [main]` + those `paths:` on both workflows). The version is
+still single-sourced in `[workspace.package].version` in the root
+`Cargo.toml`. `publish_crates.yml` and `build_wheels.yml` each re-read
+the version, skip if it's already live on the registry (`should_publish`
+check), and otherwise publish after CI passes (`ci-gate`). Publishes are
+**immutable** — a version, once on crates.io/PyPI, can never be
+overwritten or unpublished. The branch guard means a bump on a feature
+branch fires nothing; the moment it lands on `main` — by push or merge —
+it publishes.
 
-**Failed-CI retry gap**: because the publish triggers are
-path-scoped to `Cargo.toml`, a version-bump push that fails CI and is
-then fixed by a commit touching only `.rs`/`.py` files re-runs CI but
-*not* publish — the version silently stays unpublished. Both workflows
-support `workflow_dispatch`; fire them manually from the Actions tab
-(or `gh workflow run publish_crates.yml` / `build_wheels.yml`) after
-the fix goes green. The `should_publish` check makes a manual dispatch
-safe to run at any time — it no-ops if the version is already live.
+**Consequence of the broad trigger**: every code push to `main` is a
+publish attempt for whatever version `Cargo.toml` carries. That is
+harmless while the version is live (`should_publish` no-ops), and it
+closes the old **failed-CI retry gap** — a version-bump push that fails
+CI and is then fixed by a `.rs`/`.py`-only commit now re-runs publish
+automatically. It also means an unpublished version must never sit on
+`main`: bump only in the commit you mean to release. `workflow_dispatch`
+still exists on both workflows for manual re-fires (`gh workflow run
+publish_crates.yml` / `build_wheels.yml`); it is safe at any time
+because of the same `should_publish` check. Both registry checks now
+**fail the run** if the registry does not answer (non-200 from crates.io;
+anything but 200/404 from PyPI) rather than defaulting to publish —
+re-fire manually once the registry is reachable.
 
 ### Steps
 
@@ -164,6 +171,23 @@ rather than copied: two copies of a rule are zero copies. What it obliges:
 - **One narrow exception:** citing a constraint this project declared *before*
   the diff existed, naming both the rule and the violating line. That is
   enforcement, not taste.
+
+Two upstream duties feed this bar, cited from the same rules file (doctrine
+0.1.7, adopted 2026-08-31):
+
+- **R17 — a comment is a claim, and a false claim is a defect.** A comment
+  contradicted by its own function is a bug of the same class as a wrong
+  value, and review already accepts it as a finding. R17 puts the repair
+  upstream: a change that falsifies a nearby comment or doc block corrects
+  it **in the same change**, and a change through commented code applies the
+  information test to the comments it touches. A future-predicting comment
+  is a claim with an expiry date.
+- **R18 — a comment the tooling parses is load-bearing.** Before removing or
+  rewording a comment, check whether something reads it. This repo's
+  enumeration of comment-reading mechanisms (pyo3 `///` → Python `__doc__`,
+  `cargo doc -D warnings`, runtime-parsed bundled-skill markdown, …) lives in
+  `.claude/skills/clean-comments/SKILL.md`, which is also the procedure for
+  any comment cleanup wider than two files.
 
 A review tool's effort or confidence level is orthogonal to this: a higher
 level buys more *speculative bugs*, never permission to report preferences.

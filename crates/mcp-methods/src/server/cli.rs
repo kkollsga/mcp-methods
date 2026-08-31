@@ -140,7 +140,7 @@ pub fn skills_list(manifest_path: &Path, include_bundled: bool) -> Result<String
 
 /// Scaffold a starter SKILL.md at `dest` and return the resolved
 /// path written. Thin wrapper around
-/// [`write_skill_template`](crate::server::skills::write_skill_template)
+/// [`write_skill_template`]
 /// that bubbles errors as `String` for symmetric handling alongside
 /// [`skills_list`] / [`skills_show`].
 ///

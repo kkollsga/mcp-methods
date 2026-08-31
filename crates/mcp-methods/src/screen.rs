@@ -1760,6 +1760,29 @@ fn verify_dependency(full_name: &str, path: &str, pkg: &str) -> Option<String> {
 // Orchestration (fetch)
 // ---------------------------------------------------------------------------
 
+/// Append the read-only way out to a stargazer-endpoint 403.
+///
+/// GitHub gates `repos/{repo}/stargazers` behind `contents=write` for
+/// fine-grained PATs — reading a *public* star list needs a push-capable
+/// credential. Widening the token is therefore the wrong instinct and the
+/// bare API error invites it, so name the `users=` seed, which reads the
+/// same list through a path that needs no repo permission at all.
+fn annotate_stargazer_forbidden(repo: &str, err: String) -> String {
+    if !err.contains("GitHub API forbidden") {
+        return err;
+    }
+    format!(
+        "{err}\n\nListing stargazers over the REST API needs a classic token with \
+         the `repo` scope, or a fine-grained PAT granting Contents: Read and write \
+         on {repo} — GitHub gates the public star list behind `contents=write`. \
+         To avoid widening the token, seed the screen with `users=` instead: \
+         `gh api repos/{repo}/stargazers --paginate --jq '.[].login'` produces the \
+         login list, and `users=` seeding needs no repo permission. The only loss \
+         is the auto-derivation of keywords/stack from the seed repo — pass \
+         `keywords=`/`stack=` explicitly to replace it."
+    )
+}
+
 /// Fetch a repo's stargazer logins, most-recent first (owner excluded).
 /// Uncapped — the caller samples [item 9].
 pub fn fetch_stargazer_logins(repo: &str) -> Result<Vec<String>, String> {
@@ -1771,7 +1794,8 @@ pub fn fetch_stargazer_logins(repo: &str) -> Result<Vec<String>, String> {
     // so the *last* pages are the most recent — reverse to get most-recent
     // first for sampling.
     let endpoint = format!("repos/{repo}/stargazers?per_page=100");
-    let pages = github::gh_get_paginated(&endpoint)?;
+    let pages =
+        github::gh_get_paginated(&endpoint).map_err(|e| annotate_stargazer_forbidden(repo, e))?;
     let owner = repo.split('/').next().unwrap_or("").to_lowercase();
     let mut logins: Vec<String> = pages
         .iter()
@@ -2324,5 +2348,51 @@ mod tests {
             false,
         );
         assert!(miss.contains("No screen cached"));
+    }
+
+    /// A 403 on the stargazer endpoint must name the read-only `users=` seed.
+    /// Regression shape: without this the operator sees only "Resource not
+    /// accessible by personal access token" and grants Contents: Write —
+    /// turning a review credential into a push-capable one in order to read
+    /// a public list.
+    #[test]
+    fn stargazer_forbidden_names_the_users_seed_and_the_permission() {
+        let err = annotate_stargazer_forbidden(
+            "kkollsga/sonara",
+            "GitHub API forbidden: {\"message\":\"Resource not accessible by \
+             personal access token\"}"
+                .to_string(),
+        );
+        assert!(
+            err.contains("users="),
+            "the read-only seed must be named: {err}"
+        );
+        assert!(
+            err.contains("Contents: Read and write"),
+            "the grant GitHub actually demands must be named: {err}"
+        );
+        assert!(
+            err.contains("kkollsga/sonara"),
+            "the hint must be about the repo that failed: {err}"
+        );
+        assert!(
+            err.contains("Resource not accessible"),
+            "the original API error must survive: {err}"
+        );
+    }
+
+    /// Non-403 failures have nothing to do with token permissions; appending
+    /// the seed advice to a 404 or a rate-limit would misdirect.
+    #[test]
+    fn stargazer_non_forbidden_errors_pass_through_untouched() {
+        let missing = "Not found: repos/o/r/stargazers".to_string();
+        assert_eq!(
+            annotate_stargazer_forbidden("o/r", missing.clone()),
+            missing
+        );
+        let rate = "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN \
+                    env var for higher limits."
+            .to_string();
+        assert_eq!(annotate_stargazer_forbidden("o/r", rate.clone()), rate);
     }
 }

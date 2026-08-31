@@ -3,9 +3,11 @@
 //! Tool surface, top to bottom:
 //!
 //! - **Always registered**: `ping`; the source tools (`read_source`,
-//!   `grep`, `list_source`) gated on an active source-roots provider;
-//!   `repo_management` (no-ops outside `--workspace` mode).
+//!   `grep`, `list_source`) gated on an active source-roots provider.
 //! - **Conditionally registered at boot** (dynamic):
+//!   - `repo_management` — only with a `kind: github` workspace bound.
+//!     A local workspace uses `set_root_dir` instead, and a server
+//!     with no workspace at all has nothing for the tool to manage.
 //!   - `github_issues`, `github_api` and `screen_stargazers` — only
 //!     when the manifest opts in with `builtins.github: true` (default
 //!     off, so a `GITHUB_TOKEN` reachable in the environment or via the
@@ -166,6 +168,19 @@ pub struct ServerOptions {
     /// Dynamic provider returning the active source roots, if any.
     /// `None` disables the source tools entirely.
     pub source_roots: Option<SourceRootsProvider>,
+    /// Ready-to-print explanations for `source_root(s)` entries the
+    /// caller *declared* but could not resolve at boot.
+    ///
+    /// A boot path that degrades instead of dying (see
+    /// [`resolve_source_roots_lenient`](crate::server::resolve_source_roots_lenient))
+    /// has the only copy of that diagnosis, and it lands on stderr where
+    /// no agent will ever see it. Handing it here lets `read_source` /
+    /// `grep` / `list_source` say *which* declared root is missing and
+    /// where it was looked for, instead of telling an operator who
+    /// already configured `source_root:` to go configure `source_root:`.
+    /// Empty when nothing was declared, or when everything resolved.
+    /// Set via [`with_unresolved_source_roots`](Self::with_unresolved_source_roots).
+    pub unresolved_source_roots: Vec<String>,
     /// Dynamic provider returning the active GitHub repo (org/repo).
     /// When `None`, github tools require a per-call `repo_name=` arg.
     pub default_repo: Option<RepoProvider>,
@@ -212,6 +227,7 @@ impl ServerOptions {
                 .or_else(|| Some(fallback_name.to_string())),
             instructions: manifest.and_then(|m| m.instructions.clone()),
             source_roots: None,
+            unresolved_source_roots: Vec::new(),
             default_repo: None,
             workspace: None,
             builtins: manifest.map(|m| m.builtins.clone()).unwrap_or_default(),
@@ -223,6 +239,32 @@ impl ServerOptions {
     pub fn with_static_source_roots(mut self, roots: Vec<String>) -> Self {
         let captured = Arc::new(roots);
         self.source_roots = Some(Arc::new(move || captured.as_ref().clone()));
+        self
+    }
+
+    /// Record `source_root(s)` entries that were declared but did not
+    /// resolve, as `(declared, path_it_was_looked_for_at)` pairs.
+    ///
+    /// Additive to whatever [`with_static_source_roots`](Self::with_static_source_roots)
+    /// served: a manifest with three roots and one gone passes two
+    /// resolved roots *and* one entry here. The pairs are rendered once,
+    /// at call time, into the message the source tools return when no
+    /// root is active — the wording matches the `ManifestError` the
+    /// strict resolver would have produced.
+    pub fn with_unresolved_source_roots(
+        mut self,
+        roots: Vec<(String, std::path::PathBuf)>,
+    ) -> Self {
+        self.unresolved_source_roots = roots
+            .into_iter()
+            .map(|(declared, path)| {
+                format!(
+                    "declared source root {declared:?} did not resolve: {:?} is not an \
+                     existing directory",
+                    path.display()
+                )
+            })
+            .collect();
         self
     }
 
@@ -535,7 +577,7 @@ pub struct ScreenStargazersArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_stargazers: Option<usize>,
     /// Drill into the cached screen instead of returning the overview:
-    /// "cohort:<key>", "user:<login>", "user:<login>/repo:<name>", or
+    /// `cohort:<key>`, `user:<login>`, `user:<login>/repo:<name>`, or
     /// ".../readme". Requires a prior no-element_id call for the repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_id: Option<String>,
@@ -573,15 +615,30 @@ impl McpServer {
         server
     }
 
-    /// Drop `repo_management` from the router when no workspace is
-    /// bound — `tools/list` should reflect the actual surface, not a
-    /// tool whose handler immediately errors out with "requires
-    /// --workspace mode." Mirrors the gating downstream binaries
-    /// (e.g. `kglite-mcp-server`) apply to the same tool. Operators
-    /// comparing the bare framework against a downstream binary's
-    /// surface see consistent behaviour now.
+    /// Keep `repo_management` in the router only for a `kind: github`
+    /// workspace — `tools/list` should reflect the actual surface, not
+    /// a tool whose actions cannot apply.
+    ///
+    /// Three cases:
+    ///
+    /// - **No workspace**: dropped. The handler would immediately error
+    ///   out with "requires --workspace mode." Mirrors the gating
+    ///   downstream binaries (e.g. `kglite-mcp-server`) apply, so
+    ///   operators comparing the bare framework against a downstream
+    ///   binary's surface see consistent behaviour.
+    /// - **`kind: github`**: kept. This is the tool's home — clone,
+    ///   activate, update, delete.
+    /// - **`kind: local`**: dropped. Every action `repo_management`
+    ///   offers is a GitHub-workspace operation against a clone
+    ///   directory a local workspace does not have; the entry point
+    ///   there is `set_root_dir`, registered by
+    ///   [`register_local_workspace_tools`](Self::register_local_workspace_tools).
+    ///   Dropping the route also lets the bundled `repo_management`
+    ///   skill's `applies_when: tool_registered:` gate suppress its
+    ///   prompt in local mode.
     fn gate_workspace_tools(&mut self) {
-        if self.options.workspace.is_none() {
+        let kind = self.options.workspace.as_ref().map(|ws| ws.kind());
+        if !matches!(kind, Some(crate::server::workspace::WorkspaceKind::Github)) {
             self.tool_router.remove_route("repo_management");
         }
     }
@@ -881,7 +938,8 @@ impl McpServer {
     }
 
     /// Mutable access to the prompt router for dynamic skill / prompt
-    /// registration. Same lifecycle contract as [`tool_router_mut`]:
+    /// registration. Same lifecycle contract as
+    /// [`tool_router_mut`](Self::tool_router_mut):
     /// boot-time only. Most operators reach prompts via
     /// [`serve_prompts`] rather than touching the router directly.
     pub fn prompt_router_mut(&mut self) -> &mut PromptRouter<McpServer> {
@@ -1040,6 +1098,29 @@ impl McpServer {
         }
     }
 
+    /// The body `read_source` / `grep` / `list_source` return when no
+    /// source root is active. `lead` is the per-tool opener (e.g.
+    /// `"Cannot read source"`).
+    ///
+    /// "Configure `source_root:`" is the right advice only when nobody
+    /// configured one. When the boot *did* find a declaration and could
+    /// not resolve it, that advice sends the operator to re-do the thing
+    /// they already did — the real cause (a directory that moved, or a
+    /// manifest copied away from its tree) is otherwise visible only on
+    /// stderr. So append one line per declared-but-unresolved root,
+    /// naming it and the path it was looked for at.
+    fn no_source_root_message(&self, lead: &str) -> String {
+        let mut msg = format!(
+            "{lead}: no active source root. Configure source_root in your manifest or \
+             activate one (e.g. via repo_management in workspace mode)."
+        );
+        for note in &self.options.unresolved_source_roots {
+            msg.push('\n');
+            msg.push_str(note);
+        }
+        msg
+    }
+
     /// Run the consumer's result-postprocess hook (if any) against a
     /// builtin tool's text `body`, appending any returned footer. The
     /// single application point for the static `#[tool]` methods; the
@@ -1101,8 +1182,7 @@ impl McpServer {
         let roots = self.current_source_roots();
         if roots.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "Cannot read source: no active source root. Configure source_root in your manifest \
-                 or activate one (e.g. via repo_management in workspace mode).",
+                self.no_source_root_message("Cannot read source"),
             )]));
         }
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
@@ -1134,8 +1214,7 @@ impl McpServer {
         let roots = self.current_source_roots();
         if roots.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "Cannot grep: no active source root. Configure source_root in your manifest \
-                 or activate one (e.g. via repo_management in workspace mode).",
+                self.no_source_root_message("Cannot grep"),
             )]));
         }
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
@@ -1164,8 +1243,7 @@ impl McpServer {
         let roots = self.current_source_roots();
         if roots.is_empty() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "Cannot list source: no active source root. Configure source_root in your \
-                 manifest or activate one (e.g. via repo_management in workspace mode).",
+                self.no_source_root_message("Cannot list source"),
             )]));
         }
         let primary = std::path::PathBuf::from(&roots[0]);
@@ -1572,6 +1650,51 @@ mod tests {
         assert!(server.current_source_roots().is_empty());
     }
 
+    /// With nothing declared, the advice to configure a root is the
+    /// whole story and must stay exactly that.
+    #[test]
+    fn no_root_message_without_declarations_is_the_configure_advice() {
+        let server = McpServer::new(ServerOptions::default());
+        let msg = server.no_source_root_message("Cannot read source");
+        assert_eq!(
+            msg,
+            "Cannot read source: no active source root. Configure source_root in your \
+             manifest or activate one (e.g. via repo_management in workspace mode)."
+        );
+    }
+
+    /// The operator's repro: `source_root: source` *is* configured, the
+    /// directory is not there. Telling them to configure `source_root:`
+    /// is a misdirection, so all three source tools must also name the
+    /// declared root and the path it was looked for at.
+    #[test]
+    fn no_root_message_names_a_declared_root_that_did_not_resolve() {
+        let opts = ServerOptions::default().with_unresolved_source_roots(vec![(
+            "source".to_string(),
+            std::path::PathBuf::from("/nowhere/proj/source"),
+        )]);
+        let server = McpServer::new(opts);
+        for lead in ["Cannot read source", "Cannot grep", "Cannot list source"] {
+            let msg = server.no_source_root_message(lead);
+            assert!(
+                msg.contains("no active source root"),
+                "{lead}: the unconfigured-case sentence must survive: {msg}"
+            );
+            assert!(
+                msg.contains(r#"declared source root "source" did not resolve"#),
+                "{lead}: the message must name the declared root: {msg}"
+            );
+            assert!(
+                msg.contains("/nowhere/proj/source"),
+                "{lead}: the message must name the path it was looked for at: {msg}"
+            );
+            assert!(
+                msg.contains("is not an existing directory"),
+                "{lead}: the message must say why it failed: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn repo_management_gated_to_workspace_mode() {
         // Bare (no workspace): repo_management should NOT be in the
@@ -1672,18 +1795,139 @@ mod tests {
 
     #[test]
     fn repo_management_present_when_workspace_bound() {
-        // With a workspace handle bound, repo_management should be
-        // registered.
+        // With a github workspace handle bound, repo_management should
+        // be registered.
+        let (_dir, names) = tool_surface_for_workspace(WorkspaceFlavour::Github);
+        assert!(
+            names.iter().any(|n| n == "repo_management"),
+            "repo_management should be registered with a github workspace; tools were {names:?}"
+        );
+    }
+
+    enum WorkspaceFlavour {
+        Github,
+        Local,
+    }
+
+    /// Boot a server against a workspace of the given flavour and
+    /// return (the tempdir keeping it alive, the tool names).
+    fn tool_surface_for_workspace(flavour: WorkspaceFlavour) -> (tempfile::TempDir, Vec<String>) {
         use crate::server::workspace::Workspace;
         let dir = tempfile::tempdir().unwrap();
-        let ws = Workspace::open(dir.path().to_path_buf(), 7, None).unwrap();
-        let opts = ServerOptions::default().with_workspace(ws);
-        let server = McpServer::new(opts);
-        let tools = server.tool_router.list_all();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        let ws = match flavour {
+            WorkspaceFlavour::Github => Workspace::open(dir.path().to_path_buf(), 7, None).unwrap(),
+            WorkspaceFlavour::Local => {
+                Workspace::open_local(dir.path().to_path_buf(), None).unwrap()
+            }
+        };
+        let server = McpServer::new(ServerOptions::default().with_workspace(ws));
+        let names = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        (dir, names)
+    }
+
+    #[test]
+    fn local_workspace_drops_repo_management_and_keeps_set_root_dir() {
+        // Every `repo_management` action is a GitHub-workspace
+        // operation (clone / update / delete a tracked clone); a
+        // `kind: local` workspace has none of that, so the tool must
+        // not be advertised. `set_root_dir` is the local entry point
+        // and must be there.
+        let (_dir, names) = tool_surface_for_workspace(WorkspaceFlavour::Local);
         assert!(
-            names.contains(&"repo_management"),
-            "repo_management should be registered with a workspace; tools were {names:?}"
+            !names.iter().any(|n| n == "repo_management"),
+            "repo_management must be gated out of a kind: local workspace; tools were {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "set_root_dir"),
+            "set_root_dir must stay registered in a kind: local workspace; tools were {names:?}"
+        );
+    }
+
+    #[test]
+    fn github_workspace_keeps_repo_management_and_has_no_set_root_dir() {
+        // The github case must be untouched by the kind-aware gate.
+        let (_dir, names) = tool_surface_for_workspace(WorkspaceFlavour::Github);
+        assert!(
+            names.iter().any(|n| n == "repo_management"),
+            "repo_management must stay registered in a kind: github workspace; tools were {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "set_root_dir"),
+            "set_root_dir is local-only; tools were {names:?}"
+        );
+    }
+
+    #[test]
+    fn no_workspace_has_neither_workspace_tool() {
+        let server = McpServer::new(ServerOptions::default());
+        let names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "repo_management")
+                && !names.iter().any(|n| n == "set_root_dir"),
+            "a workspace-less server must advertise neither workspace tool; tools were {names:?}"
+        );
+    }
+
+    /// The bundled `repo_management` skill carries
+    /// `applies_when: tool_registered: repo_management`. Now that the
+    /// tool is gated out in local mode, the prompt must vanish with it
+    /// — otherwise the agent reads clone/update methodology for a tool
+    /// it cannot call.
+    fn bundled_prompt_names(flavour: WorkspaceFlavour) -> (tempfile::TempDir, Vec<String>) {
+        use crate::server::skills::Registry as SkillsBuilder;
+        use crate::server::workspace::Workspace;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = match flavour {
+            WorkspaceFlavour::Github => Workspace::open(dir.path().to_path_buf(), 7, None).unwrap(),
+            WorkspaceFlavour::Local => {
+                Workspace::open_local(dir.path().to_path_buf(), None).unwrap()
+            }
+        };
+        let registry = SkillsBuilder::new()
+            .merge_framework_defaults()
+            .layer_dirs(
+                &crate::server::manifest::SkillsSource::Sources(vec![
+                    crate::server::manifest::SkillSource::Bundled,
+                ]),
+                &dir.path().join("test_mcp.yaml"),
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+        let mut server = McpServer::new(ServerOptions::default().with_workspace(ws));
+        super::serve_prompts(&registry, &mut server);
+        let names = server
+            .prompt_router
+            .map
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        (dir, names)
+    }
+
+    #[test]
+    fn bundled_repo_management_skill_suppressed_in_local_mode() {
+        let (_dir, local) = bundled_prompt_names(WorkspaceFlavour::Local);
+        assert!(
+            !local.iter().any(|n| n == "repo_management"),
+            "the bundled repo_management skill must be gated out with its tool; prompts were \
+             {local:?}"
+        );
+        let (_dir2, github) = bundled_prompt_names(WorkspaceFlavour::Github);
+        assert!(
+            github.iter().any(|n| n == "repo_management"),
+            "the bundled repo_management skill must still surface with a github workspace; \
+             prompts were {github:?}"
         );
     }
 

@@ -56,7 +56,7 @@ use mcp_methods::server::manifest::{
     self, find_workspace_manifest, Manifest, ManifestError, SkillsSource,
 };
 use mcp_methods::server::{
-    cli as skills_cli, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
+    cli as skills_cli, init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots_lenient,
     serve_prompts, workspace, McpServer, ServerOptions, SkillRegistry,
 };
 
@@ -307,6 +307,39 @@ fn load_manifest(cli: &Cli, mode: &Mode) -> Result<Option<Manifest>, ManifestErr
     }
 }
 
+/// Why a manifest `workspace: kind: github` block is inert, when it is.
+///
+/// This binary converts the mode for `kind: local` only — a github
+/// workspace is a clone-and-track directory, and the only thing that
+/// names one is `--workspace DIR`. A manifest that declares `kind:
+/// github` and is booted without that flag therefore binds no
+/// workspace at all: `repo_management` is dropped by
+/// `gate_workspace_tools`, no clone directory exists, and the block's
+/// only remaining effect is the boot-time validation that rejects the
+/// `local`-only keys under it. That used to happen in silence.
+///
+/// Returns `None` when there is no such block, or when a workspace did
+/// come up (`--workspace DIR` was passed, so the declaration and the
+/// runtime agree).
+fn github_workspace_unbound_warning(manifest: Option<&Manifest>, mode: &Mode) -> Option<String> {
+    let m = manifest?;
+    let wcfg = m.workspace.as_ref()?;
+    if wcfg.kind != mcp_methods::server::WorkspaceKind::Github {
+        return None;
+    }
+    if matches!(mode, Mode::Workspace { .. }) {
+        return None;
+    }
+    Some(format!(
+        "{}: workspace.kind: github declares a clone-and-track workspace but none is \
+         bound — unlike kind: local, a github workspace is not created from the \
+         manifest and comes only from --workspace DIR. Booting without that flag \
+         leaves repo_management unregistered and the workspace block with no effect \
+         beyond validation.",
+        m.yaml_path.display()
+    ))
+}
+
 fn fallback_name(mode: &Mode) -> &'static str {
     match mode {
         Mode::SourceRoot { .. } => "MCP Server (source-root)",
@@ -318,78 +351,151 @@ fn fallback_name(mode: &Mode) -> &'static str {
     }
 }
 
-fn print_boot_summary(
-    mode: &Mode,
-    manifest: Option<&Manifest>,
-    source_roots: &[String],
+/// Everything the boot summary reports, including what *failed* to
+/// come up.
+///
+/// Peripheral boot failures (an unresolvable source root, a missing
+/// explicit `env_file:`, a watcher that would not start) degrade to a
+/// `warn!` plus a line here rather than killing the process before the
+/// MCP `initialize` handshake — a client that never gets a handshake
+/// cannot be told anything at all. Rendering is split from printing so
+/// the degraded lines are assertable in tests.
+struct BootReport<'a> {
+    mode: &'a Mode,
+    manifest: Option<&'a Manifest>,
+    source_roots: &'a [String],
+    /// `source_root(s)` entries that did not resolve, verbatim as declared.
+    unresolved_source_roots: &'a [String],
     python_tool_count: usize,
-    env_file_loaded: Option<&Path>,
+    env_file_loaded: Option<&'a Path>,
+    /// Why an explicit `env_file:` could not be loaded, if it could not.
+    env_file_error: Option<&'a str>,
+    /// Why the file watcher did not start, if it was asked for and failed.
+    watch_error: Option<&'a str>,
     skills: Option<SkillsSummary>,
-) {
-    let mode_label = match mode {
-        Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
-        Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
-        Mode::LocalWorkspace {
-            root,
-            watch,
-            sandbox_root,
-            adopt_client_roots,
-        } => format!(
-            "local-workspace [{}{}{}{}]",
-            root.display(),
-            if *watch { " +watch" } else { "" },
-            match sandbox_root {
-                Some(b) => format!(" sandbox={}", b.display()),
-                None => String::new(),
-            },
-            if *adopt_client_roots {
-                " +adopt_client_roots"
-            } else {
-                ""
-            }
-        ),
-        Mode::LocalWorkspaceUnanchored { sandbox_root } => format!(
-            "local-workspace [unanchored, awaiting client root{}]",
-            match sandbox_root {
-                Some(b) => format!(", sandbox={}", b.display()),
-                None => String::new(),
-            }
-        ),
-        Mode::Watch { dir } => format!("watch [{}]", dir.display()),
-        Mode::Bare => "bare framework".to_string(),
-    };
-    let mut parts = vec![format!("mode: {mode_label}")];
-    if let Some(p) = env_file_loaded {
-        parts.push(format!("env: {}", p.display()));
-    }
-    if let Some(m) = manifest {
-        parts.push(format!("manifest: {}", m.yaml_path.display()));
-        if !m.tools.is_empty() {
-            parts.push(format!("{} manifest tool(s)", m.tools.len()));
+}
+
+fn print_boot_summary(report: &BootReport<'_>) {
+    eprintln!("{}", report.render());
+}
+
+impl BootReport<'_> {
+    fn render(&self) -> String {
+        let BootReport {
+            mode,
+            manifest,
+            source_roots,
+            unresolved_source_roots,
+            python_tool_count,
+            env_file_loaded,
+            env_file_error,
+            watch_error,
+            skills,
+        } = *self;
+        let mode_label = match mode {
+            Mode::SourceRoot { dir } => format!("source-root [{}]", dir.display()),
+            Mode::Workspace { dir } => format!("workspace [{}]", dir.display()),
+            Mode::LocalWorkspace {
+                root,
+                watch,
+                sandbox_root,
+                adopt_client_roots,
+            } => format!(
+                "local-workspace [{}{}{}{}]",
+                root.display(),
+                if *watch { " +watch" } else { "" },
+                match sandbox_root {
+                    Some(b) => format!(" sandbox={}", b.display()),
+                    None => String::new(),
+                },
+                if *adopt_client_roots {
+                    " +adopt_client_roots"
+                } else {
+                    ""
+                }
+            ),
+            Mode::LocalWorkspaceUnanchored { sandbox_root } => format!(
+                "local-workspace [unanchored, awaiting client root{}]",
+                match sandbox_root {
+                    Some(b) => format!(", sandbox={}", b.display()),
+                    None => String::new(),
+                }
+            ),
+            Mode::Watch { dir } => format!("watch [{}]", dir.display()),
+            Mode::Bare => "bare framework".to_string(),
+        };
+        let mut parts = vec![format!("mode: {mode_label}")];
+        if let Some(p) = env_file_loaded {
+            parts.push(format!("env: {}", p.display()));
         }
-        if m.embedder.is_some() {
-            parts.push("embedder loaded".to_string());
+        if let Some(msg) = env_file_error {
+            parts.push(format!("env_file unavailable: {msg}"));
+        }
+        if let Some(m) = manifest {
+            parts.push(format!("manifest: {}", m.yaml_path.display()));
+            if !m.tools.is_empty() {
+                parts.push(format!("{} manifest tool(s)", m.tools.len()));
+            }
+            if m.embedder.is_some() {
+                parts.push("embedder loaded".to_string());
+            }
+        }
+        if python_tool_count > 0 {
+            parts.push(format!("{python_tool_count} python tool(s) registered"));
+        }
+        if let Some(s) = skills {
+            let suppressed = s.resolved.saturating_sub(s.registered);
+            parts.push(format!(
+                "{} skill prompt(s) registered{}",
+                s.registered,
+                if suppressed > 0 {
+                    format!(" ({suppressed} suppressed by applies_when)")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if !source_roots.is_empty() {
+            parts.push(format!("source roots: {source_roots:?}"));
+        }
+        if !unresolved_source_roots.is_empty() {
+            parts.push(format!(
+                "unresolved source roots: {unresolved_source_roots:?}"
+            ));
+        }
+        if let Some(msg) = watch_error {
+            parts.push(format!("watcher unavailable: {msg}"));
+        }
+        format!("mcp-server: {}", parts.join("; "))
+    }
+}
+
+/// Start the filesystem watcher, degrading to "no watcher" instead of
+/// aborting the boot.
+///
+/// A watcher that will not start (the realistic cause is an OS watch
+/// limit — inotify instances on Linux, file-descriptor limits on macOS)
+/// leaves the server serving a source tree that no longer auto-refreshes.
+/// A stale-but-answering server beats a server that never reaches
+/// `initialize`, so this warns and returns the reason for the boot
+/// summary rather than propagating the error.
+///
+/// Returns `(handle, failure_reason)`; both are `None` when no watcher
+/// was requested.
+fn watch_or_warn(dir: Option<&Path>) -> (Option<mcp_methods::server::WatchHandle>, Option<String>) {
+    let Some(d) = dir else { return (None, None) };
+    match maybe_watch(Some(d), None) {
+        Ok(handle) => (handle, None),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::warn!(
+                "file watcher for {} did not start: {msg} — continuing without it; \
+                 changes under that directory will not be picked up automatically",
+                d.display(),
+            );
+            (None, Some(msg))
         }
     }
-    if python_tool_count > 0 {
-        parts.push(format!("{python_tool_count} python tool(s) registered"));
-    }
-    if let Some(s) = skills {
-        let suppressed = s.resolved.saturating_sub(s.registered);
-        parts.push(format!(
-            "{} skill prompt(s) registered{}",
-            s.registered,
-            if suppressed > 0 {
-                format!(" ({suppressed} suppressed by applies_when)")
-            } else {
-                String::new()
-            }
-        ));
-    }
-    if !source_roots.is_empty() {
-        parts.push(format!("source roots: {source_roots:?}"));
-    }
-    eprintln!("mcp-server: {}", parts.join("; "));
 }
 
 /// What the skills layer contributed at boot, for the boot summary.
@@ -540,6 +646,9 @@ async fn main() -> Result<()> {
             }
         }
     }
+    if let Some(msg) = github_workspace_unbound_warning(manifest.as_ref(), &mode) {
+        tracing::warn!("{msg}");
+    }
 
     // Load .env before anything reads env vars (e.g. github tools' GITHUB_TOKEN).
     let env_start_dir: PathBuf = match &mode {
@@ -551,7 +660,27 @@ async fn main() -> Result<()> {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }
     };
-    let env_file_loaded = load_env_for_mode(manifest.as_ref(), &env_start_dir)?;
+    // A manifest that names an `env_file:` which is not there degrades:
+    // the missing file disables whatever tools needed those variables
+    // (they report the missing credential themselves), it does not make
+    // the server unserveable. The walk-up fallback already tolerates
+    // absence; only the explicit path used to be fatal.
+    let (env_file_loaded, env_file_error) =
+        match load_env_for_mode(manifest.as_ref(), &env_start_dir) {
+            Ok(loaded) => (loaded, None),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!(
+                    "{}: {msg} — continuing without it; tools that need those \
+                     variables will report the missing credential when called",
+                    manifest
+                        .as_ref()
+                        .map(|m| m.yaml_path.display().to_string())
+                        .unwrap_or_else(|| "<no manifest>".to_string()),
+                );
+                (None, Some(msg))
+            }
+        };
 
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
     if cli.name.is_some() {
@@ -562,6 +691,8 @@ async fn main() -> Result<()> {
     // a single dir; --workspace gets a dynamic provider driven by the
     // active repo; manifest declaration applies in bare mode.
     let mut source_roots: Vec<String> = Vec::new();
+    let mut unresolved_source_roots: Vec<String> = Vec::new();
+    let mut unresolved_root_paths: Vec<(String, PathBuf)> = Vec::new();
     match &mode {
         Mode::SourceRoot { dir } | Mode::Watch { dir } => {
             let canon = dir
@@ -584,6 +715,13 @@ async fn main() -> Result<()> {
             let mut ws = workspace::Workspace::open_local(root.clone(), None)
                 .context("local-workspace initialisation failed")?;
             if let Some(boundary) = sandbox_root {
+                // Deliberately fatal, unlike the peripheral degrades
+                // above: `sandbox_root` is a containment boundary. If
+                // it cannot be established, degrading would serve
+                // *unbounded* `set_root_dir` swaps after the operator
+                // explicitly asked for a boundary — a containment
+                // regression wearing graceful degradation's clothes.
+                // Do not "fix" this into a warning.
                 ws = ws
                     .with_sandbox_root(boundary)
                     .context("workspace.sandbox_root rejected")?;
@@ -597,6 +735,9 @@ async fn main() -> Result<()> {
             let mut ws = workspace::Workspace::open_local_unanchored(None)
                 .context("local-workspace initialisation failed")?;
             if let Some(boundary) = sandbox_root {
+                // Fatal on purpose — see the anchored arm above. An
+                // unanchored boot adopts a client-supplied root, so a
+                // dropped boundary here would be even wider.
                 ws = ws
                     .with_sandbox_root(boundary)
                     .context("workspace.sandbox_root rejected")?;
@@ -609,14 +750,45 @@ async fn main() -> Result<()> {
         Mode::Bare => {
             if let Some(m) = manifest.as_ref() {
                 if !m.source_roots.is_empty() {
-                    source_roots =
-                        resolve_source_roots(m).context("source root resolution failed")?;
+                    // Per-root, not all-or-nothing, and never fatal. A
+                    // source root that has moved or been left behind
+                    // (copying a manifest to a fresh directory is the
+                    // common way to hit this) only disables
+                    // `read_source` / `grep` / `list_source` for that
+                    // root — killing the process here instead means the
+                    // client never gets an `initialize` reply and has
+                    // no way to learn why.
+                    let (resolved, unresolved) = resolve_source_roots_lenient(m);
+                    for bad in &unresolved {
+                        tracing::warn!(
+                            "{}: source root {:?} is unavailable at {} — continuing \
+                             without it; source tools will not serve this root",
+                            m.yaml_path.display(),
+                            bad.declared,
+                            bad.path.display(),
+                        );
+                    }
+                    unresolved_source_roots =
+                        unresolved.iter().map(|bad| bad.declared.clone()).collect();
+                    // The same failures, handed to the server so the
+                    // source tools can name the missing root instead of
+                    // telling an operator who already set `source_root:`
+                    // to set `source_root:`. stderr is not a channel the
+                    // agent calling the tool can read.
+                    unresolved_root_paths = unresolved
+                        .into_iter()
+                        .map(|bad| (bad.declared, bad.path))
+                        .collect();
+                    source_roots = resolved;
                 }
             }
         }
     }
     if !source_roots.is_empty() {
         options = options.with_static_source_roots(source_roots.clone());
+    }
+    if !unresolved_root_paths.is_empty() {
+        options = options.with_unresolved_source_roots(unresolved_root_paths);
     }
     let mut server = McpServer::new(options);
     // Skills → prompts. Done here, before anything else touches the
@@ -652,22 +824,25 @@ async fn main() -> Result<()> {
         0
     };
 
-    let _watch_handle = match &mode {
-        Mode::Watch { dir } => maybe_watch(Some(dir), None)?,
+    let (_watch_handle, watch_error) = match &mode {
+        Mode::Watch { dir } => watch_or_warn(Some(dir)),
         Mode::LocalWorkspace {
             root, watch: true, ..
-        } => maybe_watch(Some(root), None)?,
-        _ => None,
+        } => watch_or_warn(Some(root)),
+        _ => (None, None),
     };
 
-    print_boot_summary(
-        &mode,
-        manifest.as_ref(),
-        &source_roots,
+    print_boot_summary(&BootReport {
+        mode: &mode,
+        manifest: manifest.as_ref(),
+        source_roots: &source_roots,
+        unresolved_source_roots: &unresolved_source_roots,
         python_tool_count,
-        env_file_loaded.as_deref(),
-        skills_summary,
-    );
+        env_file_loaded: env_file_loaded.as_deref(),
+        env_file_error: env_file_error.as_deref(),
+        watch_error: watch_error.as_deref(),
+        skills: skills_summary,
+    });
 
     let service = server
         .serve(stdio())
@@ -707,16 +882,63 @@ mod tests {
         (td, yaml)
     }
 
+    /// `<tmp>/gh_mcp.yaml` declaring a bare `workspace: kind: github`.
+    fn github_manifest() -> (tempfile::TempDir, Manifest) {
+        let td = tempfile::tempdir().unwrap();
+        let yaml = td.path().canonicalize().unwrap().join("gh_mcp.yaml");
+        std::fs::write(&yaml, "name: GH\nworkspace:\n  kind: github\n").unwrap();
+        let m = manifest::load(&yaml).unwrap();
+        (td, m)
+    }
+
+    /// `kind: github` does not create a workspace in this binary — only
+    /// `--workspace DIR` does. Booted without it the block is inert
+    /// (no `repo_management`, no clone dir), which used to be silent.
+    #[test]
+    fn a_github_workspace_manifest_without_the_flag_warns() {
+        let (_td, m) = github_manifest();
+        let msg = github_workspace_unbound_warning(Some(&m), &Mode::Bare)
+            .expect("an unbound github workspace block must be reported");
+        assert!(
+            msg.contains("gh_mcp.yaml"),
+            "the WARN must name the manifest: {msg}"
+        );
+        assert!(
+            msg.contains("--workspace DIR"),
+            "the WARN must name the flag that actually binds one: {msg}"
+        );
+    }
+
+    /// With `--workspace DIR` the declaration and the runtime agree,
+    /// so there is nothing to say.
+    #[test]
+    fn a_github_workspace_manifest_with_the_flag_is_silent() {
+        let (_td, m) = github_manifest();
+        let mode = Mode::Workspace {
+            dir: PathBuf::from("/some/workspace"),
+        };
+        assert!(github_workspace_unbound_warning(Some(&m), &mode).is_none());
+    }
+
+    /// A `kind: local` manifest is converted into a workspace mode by
+    /// the caller — it must not be swept into the github WARN.
+    #[test]
+    fn a_local_workspace_manifest_is_not_the_github_warning() {
+        let (_td, yaml) = manifest_layout();
+        let m = manifest::load(&yaml).unwrap();
+        let mode = local_workspace_mode(m.workspace.as_ref().unwrap(), &yaml).unwrap();
+        assert!(github_workspace_unbound_warning(Some(&m), &mode).is_none());
+        assert!(github_workspace_unbound_warning(None, &Mode::Bare).is_none());
+    }
+
     #[test]
     fn local_workspace_mode_resolves_sandbox_root_against_the_manifest_dir() {
         let (_td, yaml) = manifest_layout();
         let base = yaml.parent().unwrap().to_path_buf();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: Some("./repos/active".to_string()),
-            sandbox_root: Some("./repos".to_string()),
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_root("./repos/active")
+                .with_sandbox_root("./repos");
         match local_workspace_mode(&cfg, &yaml).unwrap() {
             Mode::LocalWorkspace {
                 root, sandbox_root, ..
@@ -735,11 +957,9 @@ mod tests {
     #[test]
     fn local_workspace_mode_without_sandbox_root_is_unbounded() {
         let (_td, yaml) = manifest_layout();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: Some("./repos/active".to_string()),
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_root("./repos/active");
         match local_workspace_mode(&cfg, &yaml).unwrap() {
             Mode::LocalWorkspace { sandbox_root, .. } => assert!(
                 sandbox_root.is_none(),
@@ -752,12 +972,10 @@ mod tests {
     #[test]
     fn local_workspace_mode_rejects_a_sandbox_root_that_does_not_exist() {
         let (_td, yaml) = manifest_layout();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: Some("./repos/active".to_string()),
-            sandbox_root: Some("./nope".to_string()),
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_root("./repos/active")
+                .with_sandbox_root("./nope");
         let err = local_workspace_mode(&cfg, &yaml)
             .map(|_| ())
             .unwrap_err()
@@ -769,13 +987,10 @@ mod tests {
     fn local_workspace_mode_without_a_root_is_unanchored() {
         let (_td, yaml) = manifest_layout();
         let base = yaml.parent().unwrap().to_path_buf();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: None,
-            sandbox_root: Some("./repos".to_string()),
-            adopt_client_roots: true,
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_sandbox_root("./repos")
+                .with_adopt_client_roots(true);
         match local_workspace_mode(&cfg, &yaml).unwrap() {
             Mode::LocalWorkspaceUnanchored { sandbox_root } => assert_eq!(
                 sandbox_root,
@@ -789,12 +1004,10 @@ mod tests {
     #[test]
     fn local_workspace_mode_carries_adopt_client_roots_alongside_a_root() {
         let (_td, yaml) = manifest_layout();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: Some("./repos/active".to_string()),
-            adopt_client_roots: true,
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_root("./repos/active")
+                .with_adopt_client_roots(true);
         match local_workspace_mode(&cfg, &yaml).unwrap() {
             Mode::LocalWorkspace {
                 adopt_client_roots, ..
@@ -806,13 +1019,10 @@ mod tests {
     #[test]
     fn unanchored_workspace_cannot_ask_for_the_watcher() {
         let (_td, yaml) = manifest_layout();
-        let cfg = mcp_methods::server::WorkspaceConfig {
-            kind: mcp_methods::server::WorkspaceKind::Local,
-            root: None,
-            watch: true,
-            adopt_client_roots: true,
-            ..Default::default()
-        };
+        let cfg =
+            mcp_methods::server::WorkspaceConfig::new(mcp_methods::server::WorkspaceKind::Local)
+                .with_watch(true)
+                .with_adopt_client_roots(true);
         let err = local_workspace_mode(&cfg, &yaml)
             .map(|_| ())
             .unwrap_err()
@@ -991,5 +1201,102 @@ mod tests {
         // mcp-methods's binary doesn't know about graphs — that's a kglite concept.
         let res = Cli::try_parse_from(["mcp-server", "--graph", "x.kgl"]);
         assert!(res.is_err());
+    }
+
+    // ── Peripheral boot failures degrade instead of aborting ──────────
+
+    /// A watcher that cannot start must not take the boot with it —
+    /// `watch::watch` bails on a path that is not a directory, which is
+    /// the cheapest reproducible failure mode (the realistic one in the
+    /// field is an OS watch-descriptor limit).
+    #[test]
+    fn watch_failure_degrades_to_a_reason_instead_of_an_error() {
+        let td = tempfile::tempdir().unwrap();
+        let absent = td.path().join("gone");
+        let (handle, reason) = watch_or_warn(Some(&absent));
+        assert!(handle.is_none(), "no watcher should have been installed");
+        let reason = reason.expect(
+            "a failed watcher must report a reason for the boot summary, \
+             not silently look like 'no watcher requested'",
+        );
+        assert!(
+            reason.contains("failed to start file watcher"),
+            "reason must explain the failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn no_watcher_requested_is_not_a_watcher_failure() {
+        let (handle, reason) = watch_or_warn(None);
+        assert!(handle.is_none());
+        assert!(
+            reason.is_none(),
+            "an unwatched mode must not report a watcher failure"
+        );
+    }
+
+    fn report<'a>(
+        source_roots: &'a [String],
+        unresolved: &'a [String],
+        env_file_error: Option<&'a str>,
+        watch_error: Option<&'a str>,
+    ) -> BootReport<'a> {
+        BootReport {
+            mode: &Mode::Bare,
+            manifest: None,
+            source_roots,
+            unresolved_source_roots: unresolved,
+            python_tool_count: 0,
+            env_file_loaded: None,
+            env_file_error,
+            watch_error,
+            skills: None,
+        }
+    }
+
+    #[test]
+    fn boot_summary_names_the_unresolved_source_roots() {
+        let served = vec!["/tmp/kept".to_string()];
+        let missing = vec!["source".to_string(), "docs".to_string()];
+        let line = report(&served, &missing, None, None).render();
+        assert!(
+            line.contains(r#"unresolved source roots: ["source", "docs"]"#),
+            "summary must name every root that did not resolve: {line}"
+        );
+        assert!(
+            line.contains(r#"source roots: ["/tmp/kept"]"#),
+            "summary must still name the roots that are served: {line}"
+        );
+    }
+
+    #[test]
+    fn boot_summary_stays_quiet_when_nothing_degraded() {
+        let served = vec!["/tmp/kept".to_string()];
+        let line = report(&served, &[], None, None).render();
+        assert!(
+            !line.contains("unresolved source roots"),
+            "a healthy boot must not claim a degraded root: {line}"
+        );
+        assert!(!line.contains("env_file unavailable"), "{line}");
+        assert!(!line.contains("watcher unavailable"), "{line}");
+    }
+
+    #[test]
+    fn boot_summary_names_the_env_file_and_watcher_failures() {
+        let line = report(
+            &[],
+            &[],
+            Some("env_file does not exist: /nope/my.env"),
+            Some("failed to start file watcher"),
+        )
+        .render();
+        assert!(
+            line.contains("env_file unavailable: env_file does not exist: /nope/my.env"),
+            "summary must name the env_file that could not be loaded: {line}"
+        );
+        assert!(
+            line.contains("watcher unavailable: failed to start file watcher"),
+            "summary must record that the watcher is not running: {line}"
+        );
     }
 }

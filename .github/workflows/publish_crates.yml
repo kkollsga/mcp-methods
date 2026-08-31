@@ -1,9 +1,27 @@
 name: Publish to crates.io
 on:
   push:
+    # Release-only ref. `ci.yml` runs on push to `main` (and on PRs), so a
+    # feature-branch push finds no matching checks and `ci-gate` waits on
+    # something that never appears — with the broadened paths below that
+    # would be every `.rs` push. It also matches the documented intent:
+    # the bump must only land on the ref you intend to release from.
+    # `workflow_dispatch` stays unrestricted, so a manual re-run from any
+    # ref is still possible.
+    branches: [main]
     paths:
       # Version is single-sourced in the root [workspace.package].version.
       - 'Cargo.toml'
+      # Broadened 2026-08-31: a `Cargo.toml`-only trigger meant a version
+      # bump that failed CI and was then fixed by a commit touching only
+      # `.rs`/`.py` re-ran CI but *not* this workflow, leaving the version
+      # silently unpublished until someone fired workflow_dispatch by hand.
+      # Re-runs are idempotent: every publishing job is gated on
+      # `needs.version.outputs.should_publish`, so a push at an
+      # already-live version is a complete no-op.
+      - 'crates/**'
+      - 'python/**'
+      - 'pyproject.toml'
   workflow_dispatch:
 
 jobs:
@@ -18,28 +36,58 @@ jobs:
       - name: Extract version from Cargo.toml
         id: get_version
         run: |
+          set -euo pipefail
           # Single source of truth: [workspace.package].version in root Cargo.toml.
-          VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # `cut` is last in the pipeline, so its exit status (always 0) is the
+          # step's — a grep that matches nothing yields an empty VERSION and a
+          # green run that publishes nothing. Assert well-formedness here,
+          # before the value can reach $GITHUB_OUTPUT and drive should_publish.
+          VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2) || VERSION=''
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::could not read a semver version from the root Cargo.toml (got '$VERSION')"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Package version: $VERSION"
       - name: Check if version exists on crates.io
         id: check_crates_io
         env:
           VERSION: ${{ steps.get_version.outputs.version }}
         run: |
+          set -euo pipefail
           # crates.io rate-limits / blocks default GitHub-runner User-Agents
           # on the per-version endpoint (returns 403 instead of 200/404). Use
           # the per-crate endpoint with an explicit UA and pull the version
           # list — this is the same source the cargo client reads.
-          VERSIONS=$(curl -fsSL -A "mcp-methods-ci (kkollsga/mcp-methods)" \
-            "https://crates.io/api/v1/crates/mcp-methods" \
-            | jq -r '.versions[].num')
-          if echo "$VERSIONS" | grep -qx "$VERSION"; then
+          #
+          # The publish decision must rest on an answer we actually got. This
+          # pipeline used to end in `jq`, so it reported jq's status: a 403,
+          # a 5xx or a dropped connection left VERSIONS empty, the membership
+          # test missed, and should_publish became `true` on no evidence at
+          # all — a gate that cannot fail, on an irreversible path. Capture
+          # the HTTP status explicitly and fail loudly instead. Recovery is a
+          # `workflow_dispatch` re-run once the outage clears, which
+          # should_publish already makes safe at any time.
+          STATUS=$(curl -sS -A "mcp-methods-ci (kkollsga/mcp-methods)" \
+            -o response.json -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/mcp-methods") || STATUS=000
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::crates.io did not answer for mcp-methods (HTTP $STATUS, 000 = curl/network failure); refusing to guess the publish state"
+            head -c 500 response.json || true
+            exit 1
+          fi
+          if ! jq -e 'has("versions") and (.versions | type == "array")' response.json >/dev/null 2>&1; then
+            echo "::error::crates.io answered 200 for mcp-methods but the body has no .versions array"
+            head -c 500 response.json || true
+            exit 1
+          fi
+          VERSIONS=$(jq -r '.versions[].num' response.json)
+          if printf '%s\n' "$VERSIONS" | grep -qx "$VERSION"; then
             echo "Version $VERSION already on crates.io"
-            echo "should_publish=false" >> $GITHUB_OUTPUT
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
             echo "Version $VERSION not on crates.io"
-            echo "should_publish=true" >> $GITHUB_OUTPUT
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
 
   ci-gate:

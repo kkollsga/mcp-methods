@@ -71,7 +71,7 @@ fn estimate_size(val: &Value) -> usize {
 // Internal text helpers (unchanged from before)
 // ---------------------------------------------------------------------------
 
-/// Collapse large fenced code blocks and <details> sections, mutating cache in place.
+/// Collapse large fenced code blocks and `<details>` sections, mutating cache in place.
 pub fn collapse_code_blocks_mut(text: &str, cache: &mut Option<Value>) -> String {
     if text.is_empty() {
         return text.to_string();
@@ -1027,7 +1027,7 @@ fn cache_all_patches(result: &mut Value, cache: &mut Option<Value>) {
 // PyO3 wrappers (serialize/deserialize cache at boundary)
 // ---------------------------------------------------------------------------
 
-/// Collapse large fenced code blocks and <details> sections in text.
+/// Collapse large fenced code blocks and `<details>` sections in text.
 ///
 /// When cache_json is provided (a JSON object string), collapsed elements are stored with IDs.
 /// Returns (collapsed_text, updated_cache_json).

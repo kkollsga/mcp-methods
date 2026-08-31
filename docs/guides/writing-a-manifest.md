@@ -123,6 +123,8 @@ Choose one — specifying both is a validation error. The single-form `source_ro
 
 Paths are resolved relative to the manifest's parent directory. `~` is NOT expanded (use absolute paths or paths relative to the YAML location).
 
+An entry that doesn't resolve to an existing directory does **not** stop the server booting: the reference binary warns per failed entry, serves the roots that did resolve, and lists the rest as `unresolved source roots: [...]` in its boot summary. With no root left, the source tools stay registered and say so when called. The same applies to a missing `env_file:` and to a watcher that won't start — see [Operating Modes](operating-modes.md#what-is-fatal-at-boot-and-what-degrades). Callers that want the strict, all-or-nothing check (linters, pre-flight validation) use `resolve_source_roots`; the boot path uses `resolve_source_roots_lenient`.
+
 ### `trust:`
 
 Each gate defaults to `false`. The framework parses the block and surfaces it via:
@@ -142,6 +144,10 @@ Each gate defaults to `false`. The framework parses the block and surfaces it vi
 `github` (default `false`) opts the deployment into the GitHub tools — `github_issues`, `github_api`, and `screen_stargazers`. **A reachable token is not an opt-in.** Before this key existed, registration keyed off token reachability alone, so a `GITHUB_TOKEN` in the environment — or one the `env_file:` walk-up picked up from a `.env` several directories above the server's root — silently added three authenticated GitHub tools to servers that had nothing to do with GitHub. Now the manifest declares intent and the token only decides whether the opted-in tools can actually work: with `github: true` and no reachable token the tools still stay out of `tools/list` (an agent should not see a tool that is guaranteed to fail). Both decisions are made at boot — restart the server after changing either.
 
 `screen_stargazers` (default `true`) is subordinate to `github`: with `github: false` it registers nothing whatever its value. Set it to `false` inside an opted-in deployment to keep `github_issues` / `github_api` but drop the stargazer screener.
+
+**Token requirement — `repo=` seeding needs a wide token; `users=` seeding needs none.** Seeding a screen with `repo=` calls `GET /repos/{owner}/{repo}/stargazers`, and GitHub gates that endpoint behind **Contents: Read and write** for fine-grained PATs — reading a *public* star list requires a push-capable credential. A classic token with the `repo` scope also works. On a fine-grained PAT without that grant the call 403s (`x-accepted-github-permissions: metadata=read; contents=write`), and the tool now says so, including the header GitHub sent.
+
+Widening the token is the wrong response: it turns a read-oriented review credential into one that can push to every selected repo. Seed with `users=` instead — pass the logins directly (e.g. from `gh api repos/OWNER/REPO/stargazers --paginate --jq '.[].login'`), which needs no repo permission at all. The only thing lost is `repo=`'s auto-derivation of keywords/stack from the seed repo; pass `keywords=` / `stack=` explicitly to replace it. Drill-downs (`user:<login>`, `cohort:<key>`) behave identically either way.
 
 ```yaml
 builtins:
@@ -172,7 +178,7 @@ Pointer to a `.env`-style file. If unset, the framework walks upward from the ma
 
 When set, this wins over the CLI `--workspace` flag.
 
-- `kind: github` — clone-and-track flow (same as `--workspace DIR`). `root:` and `watch:` are ignored.
+- `kind: github` — declares that the workspace, once bound, is the clone-and-track flow. **It does not create one.** Unlike `kind: local`, the reference `mcp-server` binary does not turn this block into a workspace: the clone directory comes from `--workspace DIR` and nothing else, so a manifest declaring `kind: github` booted without that flag binds no workspace at all — `repo_management` is not registered, and the block's only effect is the validation below (the binary warns at boot when it finds this combination). What the key drives when a workspace *is* bound: `repo_management` stays registered (it is dropped for `kind: local`, which gets `set_root_dir` instead), and the bundled `repo_management` skill's `applies_when: tool_registered:` gate follows that registration. `root:` is accepted and ignored (the active source root is the clone, not a path you pick). `watch:`, `sandbox_root:` and `adopt_client_roots:` are **rejected at boot**, not ignored — each is a `local`-only key and setting it under `kind: github` is a manifest error.
 - `kind: local` — bind a fixed local directory. `root:` is required (path to bind) unless `adopt_client_roots: true` is set. `watch: true` enables the filesystem watcher (calls the post-activate hook on changes) and requires `root:`. `sandbox_root:` (optional) bounds the runtime `set_root_dir` swap to a subtree — see [Watch & Workspace](watch-and-workspace.md#bounding-the-swap-sandbox_root). Omitted, swaps stay unbounded, which is the default. `adopt_client_roots: true` (optional) lets the server take its root from the MCP client when the operator configured none — fallback-only, and built on an [upstream-deprecated](watch-and-workspace.md#adopting-the-clients-root-adopt_client_roots) MCP feature.
 
 ### `extensions:`
@@ -188,6 +194,8 @@ The framework rejects:
 - Wrong types (e.g. `trust.allow_python_tools: "yes"` instead of `true`)
 - Both `source_root` and `source_roots` set
 - Non-existent paths under `workspace.root:` (local mode)
+- `workspace.watch:`, `workspace.sandbox_root:` or `workspace.adopt_client_roots:` under `workspace.kind: github` — all three are local-only
+- `workspace.watch: true` with no `workspace.root:` (an adoption-only workspace has nothing to watch at boot)
 
 Errors include the YAML's file path and a description: `manifest.yaml: trust.allow_python_tools must be a bool`.
 

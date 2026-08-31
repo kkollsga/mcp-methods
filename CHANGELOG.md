@@ -1,5 +1,169 @@
 # Changelog
 
+## 0.4.7 — 2026-08-31
+
+### Fixed — a missing `source_root` no longer kills the server before `initialize`
+
+A manifest whose `source_root:` pointed at a directory that no longer
+existed exited the reference `mcp-server` binary with one stderr line
+*before* the MCP handshake. From the client side that was a server that
+never answered `initialize` — no tools, no diagnosis unless a human read
+stderr — even though the primary capability was fine and only
+`read_source` / `grep` / `list_source` needed the root. Trivial to hit by
+copying a manifest next to a moved source tree. Reported by an
+mcp-servers operator via kglite (2026-08-31), whose own server had
+copied the fatal `?` from this binary.
+
+Two changes. The framework gains `resolve_source_roots_lenient`, which
+returns `(resolved, unresolved)` — every root that exists is served and
+every one that doesn't comes back as an `UnresolvedSourceRoot` naming the
+declared value, the path it resolved to, and the `ManifestError` — so a
+caller can serve two roots out of three instead of dropping the whole
+set. The strict `resolve_source_roots` is unchanged and remains the
+validation entry point. The reference binary now uses the lenient form:
+it `WARN`s once per failed root (naming the manifest and the path), adds
+an `unresolved source roots: [...]` line to the boot summary, serves what
+resolved, and proceeds to `initialize`. When `read_source` / `grep` /
+`list_source` are then called with no root, their reply names the cause
+instead of telling the operator to configure what they already
+configured: `declared source root "source" did not resolve: "<path>" is
+not an existing directory` — the diagnosis now reaches the client, not
+just stderr. (`ServerOptions::with_unresolved_source_roots` carries the
+list for downstream binaries that want the same.)
+
+The same "only a failure of the primary capability is fatal" rule now
+covers two more boot-path failures in the binary: an explicit `env_file:`
+that does not exist **or cannot be read** (`WARN` + `env_file
+unavailable:` summary line; token-bearing tools simply see no token) and a
+filesystem watcher that fails to start (`WARN` + `watcher unavailable:`;
+a stale graph beats no server). The unreadable case was a pre-existing
+silent failure: `load_env_explicit` checked only that the file existed
+and the parser swallowed the read error, so a mode-000 `.env` was
+reported as loaded with zero variables applied. It now returns the read
+error, and the walk-up `.env` loader warns on the same condition. `workspace.sandbox_root` rejection **stays fatal on purpose** —
+degrading there would serve unbounded after the operator asked for a
+boundary. `docs/guides/operating-modes.md` now carries the fatal/degrade
+table.
+
+### Changed — `repo_management` registers only with a `kind: github` workspace (behaviour break)
+
+A `kind: local` workspace used to list both `repo_management` and
+`set_root_dir`, even though every `repo_management` action (clone,
+update, delete a tracked clone) is a GitHub-workspace operation a local
+workspace cannot perform; `gate_workspace_tools` removed the tool only
+when *no* workspace was bound. `tools/list` in local mode now carries
+`set_root_dir` alone; the github and no-workspace surfaces are unchanged.
+Because the bundled `repo_management` skill gates on
+`applies_when: tool_registered:`, its prompt also disappears from
+`prompts/list` in local mode. A local-mode client that hard-codes a
+`repo_management` call now gets an unknown-tool error instead of a
+runtime failure. Semver-relevant; shipped as a patch per this repo's
+bump policy, and the bundled skill / docs prose corrected on 2026-08-21
+to describe the old behaviour now describes this one.
+
+### Changed — `WorkspaceConfig` is `#[non_exhaustive]` (source break for struct literals)
+
+The manifest schema keeps growing and each added key (two in 0.4.3) broke
+downstream code that built `WorkspaceConfig` with struct-literal syntax.
+The struct is now `#[non_exhaustive]`, so that construction — including
+`..Default::default()` — and exhaustive destructuring no longer compile
+outside this crate. Build one with `WorkspaceConfig::new(kind)` and the
+`with_root` / `with_watch` / `with_sandbox_root` / `with_adopt_client_roots`
+/ `with_applies_to` builders, or `Default::default()` plus field
+assignment (fields stay `pub`). `new(kind)` produces exactly the defaults
+the parser produces for `workspace: {kind: …}`. Future fields are
+additive from here on.
+
+### Fixed — `screen_stargazers` 403s on fine-grained PATs now say why, and what to do instead
+
+GitHub gates the public star list behind `contents=write` for
+fine-grained tokens and says so in its `x-accepted-github-permissions`
+response header; the framework passed through only `GitHub API
+forbidden: {body}`, naming neither the cause nor the way around it, so the
+operator's instinct was to grant push rights to every selected repo
+(reported by sonara, 2026-08-17). All three 403 sites now echo the
+accepted-permissions header when GitHub sends one, and the stargazer-seed
+path additionally names the read-only alternative: seed with `users=`
+(`gh api repos/<repo>/stargazers --paginate --jq '.[].login'`), which
+needs no repo permission. The token requirement is documented alongside
+the tool.
+
+### Fixed — a hook that re-enters `set_root_dir` / `adopt_client_root` is refused instead of deadlocking
+
+After 0.4.3's `root_swap` lock, an activation hook that called back into
+`set_root_dir` deadlocked once an adoption was queued, and one that called
+`adopt_client_root` self-deadlocked unconditionally — both now executed
+and confirmed in a test with a 10 s timeout, where the earlier analysis
+had only reasoned about them. Both operations now detect that they were
+called from inside an activation hook on the same thread (an RAII
+depth marker around the hook and the commit) and return a clear error
+naming the caller instead of hanging. No in-tree caller is affected;
+the guard is per-thread, so a hook that spawns a thread to re-enter is
+not protected (and is still forbidden). The rustdoc's "has always been
+true" claim about re-entrancy was accurate only for the legacy path and
+now distinguishes the two.
+
+### Fixed — docs and a boot warning: what `workspace.kind: github` actually does
+
+Two false claims in the guides. `writing-a-manifest.md` said `root:` and
+`watch:` are ignored under `kind: github`; the loader accepts and ignores
+`root:` but rejects `watch:`, `sandbox_root:` and `adopt_client_roots:`
+with a boot error, and the guide now lists all three. The same page (and
+`operating-modes.md`'s precedence table) said `kind: github` is "the
+clone-and-track flow, same as `--workspace DIR`" — it is not: in the
+reference binary only `--workspace DIR` binds a GitHub workspace, and a
+`kind: github` manifest booted without it ran bare with no
+`repo_management` and no warning. The docs now say the key declares a
+flavour (it validates the local-only keys and keeps `repo_management`
+registered once a workspace *is* bound) and does not create one, and the
+binary emits one `WARN` naming the manifest when a `kind: github` block is
+present but no workspace is bound.
+
+### Fixed — every native Python function now has a docstring
+
+Thirty-one `#[pyfunction]` / `#[pyclass]` / `#[pymethods]` items in the
+pyo3 layer had no `///` doc, so `help(mcp_methods.read_file)` — and the
+other fourteen exported functions, `ElementCache` and its methods, and the
+`Skill` / `SkillRegistry` accessors — showed nothing. Each now carries a
+summary naming that item, its parameters and return, written against the
+Rust body (one pre-existing core rustdoc was found contradicting its own
+signature along the way). `tests/test_docstrings.py` parses the pyo3
+source and fails on any undocumented item, and checks every pure-Python
+export's `__doc__` at runtime, so this cannot silently regress.
+
+### Infrastructure — publish workflows can now fail, and re-fire
+
+Not part of the published crates, but release-relevant:
+
+- The version probe in both publish workflows reported `cut`'s exit
+  status (always 0), so an empty version could drive a green run that
+  published nothing. It now fails on an empty or non-semver value.
+- The crates.io / PyPI "is this version live?" checks defaulted to
+  `should_publish=true` on any transport or HTTP failure — the very 403
+  crates.io returns to unknown user agents. They now fail the run on a
+  non-200 (PyPI: anything but 200/404), so the publish decision is made
+  on known registry state or not at all.
+- `upload-artifact` for wheels sets `if-no-files-found: error`, so an
+  empty wheel directory fails rather than shipping a partial platform set.
+- The triggers are now `branches: [main]` with `paths:` covering
+  `Cargo.toml`, `crates/**`, `python/**`, `pyproject.toml`. A `.rs`-only
+  fix after a failed version-bump run re-fires publish automatically
+  (closing the documented manual-dispatch gap); a feature-branch push
+  fires nothing. See CLAUDE.md "Releasing".
+- `make clean` no longer deletes the `target` symlink used on the
+  maintainer's workstation; it cleans through the link and leaves a plain
+  `target/` directory behaving as before. New `make prune-target`
+  (size-gated, default 12 GiB *apparent* — the on-disk meter undercounted
+  a real ENOSPC by ~2×) runs at the start of the release gate and is a
+  free no-op on a lean tree; a failed `cargo clean` fails the target rather
+  than printing "done".
+- `make lint` and CI now run `RUSTDOCFLAGS=-D warnings cargo doc --workspace
+  --no-deps`: published doc surfaces are a gate. The first run found
+  sixteen diagnostics — eight intra-doc links from public items to private
+  ones, two unresolved links (one to a method that does not exist), five
+  unescaped `<placeholder>` tags rendering as broken HTML — all fixed; the
+  kind of rot `cargo test` never shows.
+
 ## 0.4.6 — 2026-08-21
 
 ### Added — `register_typed_tool_fallible`: tool failures can finally say so

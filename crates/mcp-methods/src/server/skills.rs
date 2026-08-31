@@ -168,7 +168,8 @@ fn default_auto_inject_hint() -> bool {
 /// All populated fields are ANDed.
 ///
 /// Adding a new predicate requires extending this struct and the
-/// matching arm in [`Registry::evaluate_clause`]. The bounded-set
+/// matching arm in `ResolvedRegistry::dispatch_clause`, reached via
+/// [`ResolvedRegistry::activation_for`]. The bounded-set
 /// design is intentional — operators get type-checked semantics
 /// instead of an open-ended DSL.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]

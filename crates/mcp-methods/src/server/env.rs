@@ -39,20 +39,37 @@ pub fn load_env_walk(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Load a specific `.env` path. Errors if the file does not exist —
-/// the explicit `env_file:` manifest key promises that path.
+/// Load a specific `.env` path. Errors if the file does not exist, or
+/// exists but cannot be read — the explicit `env_file:` manifest key
+/// promises that path, so "present but unreadable" (wrong mode, wrong
+/// owner, an I/O error) has to surface as loudly as "absent". Reading
+/// here rather than inside `apply_env_file` is what makes that
+/// possible: swallowing the read error reported a file as loaded while
+/// applying zero variables.
 pub fn load_env_explicit(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("env_file does not exist: {}", path.display()));
     }
-    apply_env_file(path);
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("env_file could not be read: {}: {e}", path.display()))?;
+    apply_env_text(&text);
     Ok(())
 }
 
+/// Read-and-apply used by the walk-up path only, where an unreadable
+/// `.env` is not a promise anybody made: warn and carry on rather than
+/// fail the boot.
 fn apply_env_file(path: &Path) {
-    let Ok(text) = fs::read_to_string(path) else {
-        return;
-    };
+    match fs::read_to_string(path) {
+        Ok(text) => apply_env_text(&text),
+        Err(e) => tracing::warn!(
+            "found {} while walking up but could not read it: {e} — no variables applied",
+            path.display()
+        ),
+    }
+}
+
+fn apply_env_text(text: &str) {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -181,6 +198,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.env");
         assert!(load_env_explicit(&missing).is_err());
+    }
+
+    /// An `env_file:` that exists but cannot be read must not report
+    /// itself as loaded. Before the fix the read error was swallowed
+    /// and this returned `Ok(())` after applying zero variables, so the
+    /// boot summary printed `env: <path>` with no WARN.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_unreadable_path_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.env");
+        fs::write(&path, "MCP_TEST_UNREADABLE=nope\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root (and any filesystem that ignores mode bits) reads it
+        // anyway, so the precondition cannot be established there —
+        // probe rather than guess, and skip if the file is still open.
+        if fs::read_to_string(&path).is_ok() {
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            eprintln!("skipping: this process can read a mode-000 file (running as root?)");
+            return;
+        }
+
+        let err = load_env_explicit(&path).expect_err("an unreadable env_file must not report ok");
+
+        // Restore before the tempdir drops so cleanup cannot trip over it.
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+
+        assert!(
+            err.contains(&path.display().to_string()),
+            "the error must name the path: {err}"
+        );
+        assert!(
+            err.contains("could not be read"),
+            "the error must say the read failed, not that the file is missing: {err}"
+        );
+        assert!(
+            std::env::var("MCP_TEST_UNREADABLE").is_err(),
+            "nothing should have been applied from a file that never opened"
+        );
     }
 
     #[test]

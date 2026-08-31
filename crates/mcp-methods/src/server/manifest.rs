@@ -263,7 +263,16 @@ impl WorkspaceKind {
     }
 }
 
+/// Parsed `workspace:` block.
+///
+/// **`#[non_exhaustive]`** — the manifest schema grows, and every added
+/// key used to break downstream struct-literal construction and
+/// exhaustive destructuring. Build one with
+/// [`WorkspaceConfig::new`] (or [`Default::default`]) plus the
+/// `with_*` builder methods; the fields stay public, so
+/// `cfg.root = Some(..)` on a `mut` binding works too.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct WorkspaceConfig {
     pub kind: WorkspaceKind,
     /// Local-mode only: path to the directory to bind as the source
@@ -330,6 +339,53 @@ pub struct WorkspaceConfig {
     /// manifest is auto-picked-up by an unrelated sibling dir. The
     /// manifest's own declaration is the opt-in.
     pub applies_to: Option<AppliesTo>,
+}
+
+impl WorkspaceConfig {
+    /// A workspace config of the given kind, every other field at its
+    /// default. The construction entry point for downstream crates,
+    /// which cannot use struct-literal syntax on a
+    /// `#[non_exhaustive]` type.
+    pub fn new(kind: WorkspaceKind) -> Self {
+        Self {
+            kind,
+            ..Self::default()
+        }
+    }
+
+    /// Set [`root`](Self::root) — the directory a `kind: local`
+    /// workspace binds as its source root.
+    pub fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
+
+    /// Set [`watch`](Self::watch) — wire the file watcher to `root`.
+    pub fn with_watch(mut self, watch: bool) -> Self {
+        self.watch = watch;
+        self
+    }
+
+    /// Set [`sandbox_root`](Self::sandbox_root) — the containment
+    /// boundary for runtime `set_root_dir` swaps.
+    pub fn with_sandbox_root(mut self, sandbox_root: impl Into<String>) -> Self {
+        self.sandbox_root = Some(sandbox_root.into());
+        self
+    }
+
+    /// Set [`adopt_client_roots`](Self::adopt_client_roots) — accept a
+    /// root advertised by the MCP client when none is configured.
+    pub fn with_adopt_client_roots(mut self, adopt: bool) -> Self {
+        self.adopt_client_roots = adopt;
+        self
+    }
+
+    /// Set [`applies_to`](Self::applies_to) — the parent-walk
+    /// auto-discovery opt-in.
+    pub fn with_applies_to(mut self, applies_to: AppliesTo) -> Self {
+        self.applies_to = Some(applies_to);
+        self
+    }
 }
 
 /// Declaration of which workspace dirs the manifest applies to for
@@ -1991,6 +2047,39 @@ mod tests {
         assert_eq!(w.kind, WorkspaceKind::Github);
         assert!(w.root.is_none());
         assert!(!w.watch);
+    }
+
+    /// `WorkspaceConfig` is `#[non_exhaustive]`, so downstream crates
+    /// cannot use struct-literal syntax (not even with
+    /// `..Default::default()`). `new` + the `with_*` chain is the
+    /// replacement — each setter must reach the field it names.
+    #[test]
+    fn workspace_config_builder_sets_each_field() {
+        let cfg = WorkspaceConfig::new(WorkspaceKind::Local)
+            .with_root("./src")
+            .with_watch(true)
+            .with_sandbox_root("./repos")
+            .with_adopt_client_roots(true)
+            .with_applies_to(AppliesTo::Pattern("repos".to_string()));
+        assert_eq!(cfg.kind, WorkspaceKind::Local);
+        assert_eq!(cfg.root.as_deref(), Some("./src"));
+        assert!(cfg.watch);
+        assert_eq!(cfg.sandbox_root.as_deref(), Some("./repos"));
+        assert!(cfg.adopt_client_roots);
+        assert_eq!(
+            cfg.applies_to,
+            Some(AppliesTo::Pattern("repos".to_string()))
+        );
+
+        // Untouched fields keep the parse-time defaults: a bare `new`
+        // must equal what `workspace: {}` yields.
+        let bare = WorkspaceConfig::new(WorkspaceKind::Github);
+        assert_eq!(bare.kind, WorkspaceKind::Github);
+        assert!(bare.root.is_none());
+        assert!(!bare.watch);
+        assert!(bare.sandbox_root.is_none());
+        assert!(!bare.adopt_client_roots);
+        assert!(bare.applies_to.is_none());
     }
 
     #[test]

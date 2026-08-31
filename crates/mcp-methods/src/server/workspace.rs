@@ -6,9 +6,12 @@
 //! workspace, and the active repo becomes the bound source root for
 //! `read_source` / `grep` / `list_source`. Idle repos auto-sweep after
 //! `--stale-after-days`. Layout:
-//!   workspace/
-//!     repos/<org>/<repo>/         — cloned source
-//!     inventory.json              — per-repo access tracking
+//!
+//! ```text
+//! workspace/
+//!   repos/<org>/<repo>/         — cloned source
+//!   inventory.json              — per-repo access tracking
+//! ```
 //!
 //! **Local mode** (`Workspace::open_local`, the manifest-driven
 //! `workspace: { kind: local, root: ... }` variant): the active source
@@ -36,6 +39,59 @@ use std::time::SystemTime;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+// ---------------------------------------------------------------------------
+// Hook re-entrancy guard
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Depth of activation-hook nesting on *this* thread. Non-zero while any
+    /// hook body (transaction prepare, transaction commit, or one of the
+    /// legacy build/summary callbacks) is running.
+    ///
+    /// A counter rather than a bool because the commit closure of a
+    /// transaction hook runs inside the same logical activation as its
+    /// prepare, and nothing forbids a consumer nesting its own bookkeeping.
+    static ACTIVATION_HOOK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII marker for "this thread is inside an activation hook".
+///
+/// Exists so [`Workspace::set_root_dir`] and [`Workspace::adopt_client_root`]
+/// can *refuse* a re-entrant call instead of deadlocking on it. See
+/// [`reject_hook_reentry`] for what each re-entry actually deadlocks on.
+struct ActivationHookGuard;
+
+impl ActivationHookGuard {
+    fn enter() -> Self {
+        ACTIVATION_HOOK_DEPTH.with(|d| d.set(d.get() + 1));
+        ActivationHookGuard
+    }
+}
+
+impl Drop for ActivationHookGuard {
+    fn drop(&mut self) {
+        ACTIVATION_HOOK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn inside_activation_hook() -> bool {
+    ACTIVATION_HOOK_DEPTH.with(|d| d.get() > 0)
+}
+
+/// The message a re-entrant root operation gets instead of a hung thread.
+///
+/// `who` names the entry point that was re-entered, matching the `who`
+/// threaded through [`Workspace::swap_root`], so the refusal reads the same
+/// way as every other rejection from that path.
+fn reject_hook_reentry(who: &str) -> String {
+    format!(
+        "{who} was called from inside an activation hook. Root operations are \
+         not re-entrant: the hook runs while its activation holds the workspace \
+         locks, so re-entering would deadlock this thread rather than swap the \
+         root. Return from the hook and drive the swap from the caller."
+    )
+}
 
 /// Repo name format: ``org/repo``. Letters, digits, dots, hyphens, underscores.
 fn validate_repo_name(name: &str) -> Result<()> {
@@ -199,6 +255,16 @@ impl PreparedActivation {
 /// intent; otherwise it is dropped and the caller receives a superseded
 /// outcome. This single callback replaces the legacy plain/revisions/summary
 /// trio for consumers that need coherent concurrent activation.
+///
+/// "Off-lock" is about the *activation state* lock only. When the activation
+/// came from [`Workspace::set_root_dir`] or
+/// [`Workspace::adopt_client_root`] the caller still holds
+/// the internal `root_swap` lock across this call, so the hook must
+/// not re-enter either of those; both refuse a re-entrant call rather than
+/// deadlock. See [`Workspace::set_root_dir`] for which lock each path hangs
+/// on. That refusal is **same-thread only** — the guard is a thread-local —
+/// so a hook that hands a root operation to another thread and waits on it
+/// still deadlocks the server permanently, and is equally forbidden.
 pub type ActivationTransactionHook =
     Arc<dyn Fn(&ActivationRequest) -> Result<PreparedActivation> + Send + Sync>;
 
@@ -208,7 +274,7 @@ pub type ActivationTransactionHook =
 /// git revspecs used verbatim. The untagged deserialization maps a JSON
 /// integer to `Count` and a JSON array of strings to `List`, so the tool
 /// arg accepts `int | [str]`. Resolution happens at activate time — see
-/// [`Workspace::resolve_revs`].
+/// `Workspace::resolve_revs`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum RevsRequest {
@@ -219,7 +285,7 @@ pub enum RevsRequest {
     /// tag families (e.g. `apache-arrow-*`, `go/v*`, `r-*`) the release
     /// line is chosen, not an unrelated package family. Prereleases (rc,
     /// alpha, beta, dev, pre, preview) and non-version tags (e.g.
-    /// `r-universe-release`) are excluded. See [`Workspace::resolve_revs`]
+    /// `r-universe-release`) are excluded. See `Workspace::resolve_revs`
     /// for the full selection + fallback semantics.
     Count(usize),
     /// Explicit git revspecs (tags, branches, or SHAs), used as given.
@@ -1398,6 +1464,12 @@ impl Workspace {
             build,
         };
 
+        // Marks this thread "inside an activation hook" from the prepare call
+        // through the commit block — every point at which consumer code runs
+        // while this frame holds workspace locks. A hook that calls back into
+        // `set_root_dir` / `adopt_client_root` is refused there with a
+        // message instead of deadlocking on those locks.
+        let _in_hook = ActivationHookGuard::enter();
         let prepared = if let Some(hook) = &self.inner.activation_transaction {
             hook(&request)
         } else {
@@ -1834,16 +1906,36 @@ impl Workspace {
     ///
     /// `revs` (optional): resolve revisions against the new root (which
     /// must be a git repo) and fire the revs-aware hook — see
-    /// [`activate`](Self::activate) / [`RevsRequest`].
+    /// the internal `activate` path / [`RevsRequest`].
     ///
     /// Concurrency: two `set_root_dir` calls may overlap — the newer
     /// activation supersedes the older one. A client-root adoption may not
     /// overlap either of them: it is exclusive with every operator swap
     /// for its whole check-swap-publish sequence, which is what makes
-    /// "the operator always wins" true rather than merely likely. Must
-    /// not be called from inside an activation hook (that has always been
-    /// true — the legacy hook path already serializes on its own lock).
+    /// "the operator always wins" true rather than merely likely.
+    ///
+    /// **Not re-entrant.** Calling this from inside an activation hook is
+    /// refused (the returned string says so) rather than attempted. The two
+    /// paths fail differently and only one of them ever "just" misbehaved:
+    ///
+    /// - **Legacy hook path** — the hook runs under
+    ///   the internal `legacy_activation` lock, a plain
+    ///   `Mutex`, so a re-entering hook self-deadlocks on that lock. This has
+    ///   always been true.
+    /// - **Transaction hook path** — the hook runs while its activation holds
+    ///   the internal `root_swap` lock *shared*. Re-entering takes
+    ///   the same shared lock again, which is a recursive read: fine when
+    ///   uncontended, but a deadlock the moment an adoption is queued for the
+    ///   write side, because `std::sync::RwLock` is writer-preferring. This is
+    ///   **new** as of the 0.4.3 `root_swap` fix — before it, that path held
+    ///   no lock across the hook and re-entry only produced supersession
+    ///   oddities.
     pub fn set_root_dir(&self, new_root: &Path, revs: Option<&RevsRequest>) -> String {
+        // Cheap thread-local check, before any lock is taken: a hook calling
+        // back in here would otherwise hang on `root_swap` (see the rustdoc).
+        if inside_activation_hook() {
+            return reject_hook_reentry("set_root_dir");
+        }
         // Held across the swap *and* the ownership publication below, so
         // an adoption cannot slip its own activation between them. Shared,
         // so concurrent operator swaps keep overlapping as before.
@@ -1877,7 +1969,19 @@ impl Workspace {
     ///
     /// `Err` is a human-readable reason for the log; adoption failure is
     /// never fatal to the server.
+    ///
+    /// **Not re-entrant**, and more sharply so than
+    /// [`set_root_dir`](Self::set_root_dir): this takes
+    /// the internal `root_swap` lock *exclusively*, so a hook
+    /// calling it during any swap is an unconditional same-thread
+    /// write-after-read self-deadlock — no queued adoption required. Re-entry
+    /// is therefore refused with `Err` rather than attempted.
     pub fn adopt_client_root(&self, new_root: &Path) -> Result<String, String> {
+        // Cheap thread-local check, before any lock is taken. Without it a
+        // hook reaching here hangs the thread outright (see the rustdoc).
+        if inside_activation_hook() {
+            return Err(reject_hook_reentry("adopt_client_root"));
+        }
         // Exclusive for the whole check → swap → publish sequence, which
         // is what makes "the operator always wins" true rather than
         // merely likely. A racing `set_root_dir` either has not started
@@ -3081,6 +3185,111 @@ mod tests {
     /// an empty directory, which is sub-millisecond work; 250ms leaves
     /// two orders of magnitude of headroom on a loaded machine, and was
     /// verified against the unfixed code.
+    /// A hook that calls back into a root operation must be **refused**, not
+    /// hung.
+    ///
+    /// Both re-entries are real deadlocks without the guard, and they are
+    /// deadlocks for different reasons:
+    ///
+    /// - `adopt_client_root` takes `root_swap` exclusively while the outer
+    ///   `set_root_dir` holds it shared on the same thread — an
+    ///   unconditional write-after-read self-deadlock.
+    /// - `set_root_dir` takes it shared again; that is a recursive read,
+    ///   which hangs as soon as any adoption is queued on the write side
+    ///   (`std::sync::RwLock` is writer-preferring).
+    ///
+    /// The whole call therefore runs on a worker thread behind a
+    /// `recv_timeout`: a regression that reintroduces either hang fails this
+    /// test instead of wedging the run. The 10s budget bounds a
+    /// canonicalize plus a fingerprint of two empty directories — sub-
+    /// millisecond work — so it is never a real wait, only a bound.
+    ///
+    /// The hook re-enters exactly once (`fired`): were the refusal to
+    /// disappear on the `set_root_dir` side, an unguarded re-entry would
+    /// recurse into `activate` → hook → `activate` and blow the stack rather
+    /// than fail an assertion.
+    #[test]
+    fn a_hook_re_entering_a_root_operation_is_refused_not_deadlocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let td = tempfile::tempdir().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        // The hook needs the workspace it is attached to; it is filled in
+        // after construction, so the first (and only) activation sees it.
+        let cell: Arc<OnceLock<Workspace>> = Arc::new(OnceLock::new());
+        let refusals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fired = Arc::new(AtomicBool::new(false));
+
+        let hook: ActivationTransactionHook = {
+            let cell = cell.clone();
+            let refusals = refusals.clone();
+            let fired = fired.clone();
+            let second = second.clone();
+            Arc::new(move |_request| {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    if let Some(ws) = cell.get() {
+                        let swap = ws.set_root_dir(&second, None);
+                        let adopt = match ws.adopt_client_root(&second) {
+                            Ok(msg) => format!("UNEXPECTED OK: {msg}"),
+                            Err(e) => e,
+                        };
+                        let mut out = refusals.lock().unwrap();
+                        out.push(swap);
+                        out.push(adopt);
+                    }
+                }
+                Ok(PreparedActivation::summary(None))
+            })
+        };
+
+        let ws = Workspace::open_local_unanchored(None)
+            .unwrap()
+            .with_activation_transaction(hook);
+        let _ = cell.set(ws.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let ws = ws.clone();
+            let first = first.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(ws.set_root_dir(&first, None));
+            })
+        };
+        let outer = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "set_root_dir never returned: a hook re-entering a root operation \
+                 deadlocked instead of being refused",
+        );
+        worker.join().unwrap();
+
+        let refusals = refusals.lock().unwrap();
+        assert_eq!(refusals.len(), 2, "the hook must have run and re-entered");
+        assert!(
+            refusals[0].contains("set_root_dir was called from inside an activation hook"),
+            "a re-entrant set_root_dir must be refused by name, got: {}",
+            refusals[0]
+        );
+        assert!(
+            refusals[1].contains("adopt_client_root was called from inside an activation hook"),
+            "a re-entrant adopt_client_root must be refused by name, got: {}",
+            refusals[1]
+        );
+
+        // The refusal is local to the re-entrant call: the outer swap still
+        // completes and still owns the root.
+        assert_eq!(
+            ws.active_repo_path().as_deref(),
+            Some(first.as_path()),
+            "the outer swap must still have committed its own root \
+             (it said: {outer})"
+        );
+        assert_eq!(ws.root_ownership(), RootOwnership::Operator);
+    }
+
     #[test]
     fn an_adoption_cannot_displace_a_concurrent_operator_swap() {
         let td = tempfile::tempdir().unwrap();

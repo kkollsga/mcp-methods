@@ -201,6 +201,46 @@ pub fn detect_git_repo(cwd: &str) -> Option<String> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/// GitHub names the exact permission set an endpoint needs in this response
+/// header whenever it 403s a token that is otherwise valid. It is the only
+/// machine-readable statement of *why* the call was refused — without it the
+/// body ("Resource not accessible by personal access token") names no cause,
+/// and the operator's first instinct is to widen the token blindly.
+const ACCEPTED_PERMISSIONS_HEADER: &str = "x-accepted-github-permissions";
+
+/// Split a 403 response into `(accepted-permissions header, body)`.
+///
+/// The header must be read *before* `into_string` consumes the response, so
+/// every 403 arm goes through here rather than reading the body directly.
+fn forbidden_parts(resp: ureq::Response) -> (Option<String>, String) {
+    let accepted = resp
+        .header(ACCEPTED_PERMISSIONS_HEADER)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(String::from);
+    let body = resp.into_string().unwrap_or_default();
+    (accepted, body)
+}
+
+/// Render a non-rate-limited 403 into an operator-actionable message.
+///
+/// When GitHub sent [`ACCEPTED_PERMISSIONS_HEADER`] its value is echoed
+/// verbatim: that is the endpoint's actual requirement, and for fine-grained
+/// PATs it is frequently *wider* than the operation looks (listing public
+/// stargazers is gated behind `contents=write`). Without the header the
+/// message is the unchanged passthrough — there is nothing extra to say.
+fn forbidden_message(accepted: Option<&str>, body: &str) -> String {
+    match accepted {
+        Some(perms) => format!(
+            "GitHub API forbidden: {body} \
+             (GitHub reports this endpoint requires {ACCEPTED_PERMISSIONS_HEADER}: \
+             {perms} — a fine-grained PAT must grant exactly those permissions, \
+             a classic token the matching scope)"
+        ),
+        None => format!("GitHub API forbidden: {body}"),
+    }
+}
+
 // Closure below returns ureq's large `Result` at the `.call()` boundary.
 #[allow(clippy::result_large_err)]
 pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
@@ -228,14 +268,14 @@ pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
             .map_err(|e| format!("JSON parse error: {}", e)),
         Err(ureq::Error::Status(404, _)) => Err(format!("Not found: {}", endpoint)),
         Err(ureq::Error::Status(403, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+            let (accepted, body) = forbidden_parts(resp);
             if body.to_lowercase().contains("rate limit") {
                 Err(
                     "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN env var for higher limits."
                         .into(),
                 )
             } else {
-                Err(format!("GitHub API forbidden: {}", body))
+                Err(forbidden_message(accepted.as_deref(), &body))
             }
         }
         Err(ureq::Error::Status(code, resp)) => {
@@ -384,14 +424,14 @@ fn gh_get_paginated_bookends(
         }) {
             Ok(r) => r,
             Err(ureq::Error::Status(403, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
+                let (accepted, body) = forbidden_parts(resp);
                 if body.to_lowercase().contains("rate limit") {
                     return Err(
                         "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN env var for higher limits."
                             .into(),
                     );
                 }
-                return Err(format!("GitHub API forbidden: {}", body));
+                return Err(forbidden_message(accepted.as_deref(), &body));
             }
             Err(e) => return Err(format!("GitHub API error: {}", e)),
         };
@@ -1379,12 +1419,12 @@ fn search_issues_internal(
             format!("GitHub search validation error: {}", body)
         }
         Err(ureq::Error::Status(403, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+            let (accepted, body) = forbidden_parts(resp);
             if body.to_lowercase().contains("rate limit") {
                 "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN for higher limits."
                     .to_string()
             } else {
-                format!("GitHub API forbidden: {}", body)
+                forbidden_message(accepted.as_deref(), &body)
             }
         }
         Err(e) => format!("GitHub search error: {}", e),
@@ -2056,6 +2096,73 @@ mod tests {
                 None => std::env::remove_var("GH_TOKEN"),
             }
         }
+    }
+
+    /// A 403 whose response carries `x-accepted-github-permissions` must
+    /// surface the header's value — that string is the only statement of
+    /// *why* the call was refused. Regression shape: dropping back to the
+    /// bare passthrough leaves `contents=write` invisible and the operator
+    /// widens the token by guesswork.
+    #[test]
+    fn forbidden_403_echoes_accepted_permissions_header() {
+        let raw = "HTTP/1.1 403 Forbidden\r\n\
+                   Content-Type: application/json\r\n\
+                   x-accepted-github-permissions: metadata=read; contents=write\r\n\
+                   \r\n\
+                   {\"message\":\"Resource not accessible by personal access token\"}";
+        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let (accepted, body) = forbidden_parts(resp);
+        assert_eq!(accepted.as_deref(), Some("metadata=read; contents=write"));
+
+        let msg = forbidden_message(accepted.as_deref(), &body);
+        assert!(
+            msg.contains("metadata=read; contents=write"),
+            "the accepted-permissions value must reach the operator: {msg}"
+        );
+        assert!(
+            msg.contains("x-accepted-github-permissions"),
+            "name the header so the value is attributable to GitHub: {msg}"
+        );
+        assert!(
+            msg.contains("Resource not accessible by personal access token"),
+            "the original body must survive: {msg}"
+        );
+    }
+
+    /// Without the header there is nothing extra to say, so the message must
+    /// stay the plain passthrough — no invented cause.
+    #[test]
+    fn forbidden_403_without_header_stays_plain() {
+        let raw = "HTTP/1.1 403 Forbidden\r\n\
+                   Content-Type: application/json\r\n\
+                   \r\n\
+                   {\"message\":\"Must have admin rights to Repository.\"}";
+        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let (accepted, body) = forbidden_parts(resp);
+        assert_eq!(accepted, None);
+
+        let msg = forbidden_message(accepted.as_deref(), &body);
+        assert_eq!(
+            msg,
+            "GitHub API forbidden: {\"message\":\"Must have admin rights to Repository.\"}"
+        );
+    }
+
+    /// An empty header value carries no information; treat it as absent
+    /// rather than emitting a dangling "requires ... :" clause.
+    #[test]
+    fn empty_accepted_permissions_header_is_treated_as_absent() {
+        let raw = "HTTP/1.1 403 Forbidden\r\n\
+                   x-accepted-github-permissions: \r\n\
+                   \r\n\
+                   {\"message\":\"nope\"}";
+        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let (accepted, body) = forbidden_parts(resp);
+        assert_eq!(accepted, None);
+        assert_eq!(
+            forbidden_message(accepted.as_deref(), &body),
+            "GitHub API forbidden: {\"message\":\"nope\"}"
+        );
     }
 
     #[test]

@@ -57,7 +57,10 @@ pub use manifest::{
     EmbedderConfig, Manifest, ManifestError, PythonTool, SkillSource, SkillsSource, TempCleanup,
     ToolSpec, TrustConfig, WorkspaceConfig, WorkspaceKind,
 };
-pub use runtime::{init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots};
+pub use runtime::{
+    init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
+    resolve_source_roots_lenient, UnresolvedSourceRoot,
+};
 pub use server::{
     serve_prompts, McpServer, RepoProvider, ResultCtx, ResultPostprocessHook, ServerOptions,
 };

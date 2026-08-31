@@ -86,7 +86,7 @@ When both CLI flags and manifest declarations are present:
 | Manifest `source_root:` / `source_roots:` (with no `--source-root` flag) | Yes |
 | CLI `--source-root` (with no manifest `source_root:`) | Yes |
 | CLI `--workspace` (with no manifest `workspace:`) | Yes |
-| Manifest `workspace.kind: github` | Equivalent to `--workspace` |
+| Manifest `workspace.kind: github` | No — it binds nothing on its own. Only `kind: local` is converted from the manifest; a github workspace comes from `--workspace DIR`, and declaring `kind: github` without that flag boots with no workspace (and a WARN saying so). |
 | Both manifest `source_root:` AND CLI `--source-root` set | Manifest wins (operator gets a warning) |
 
 This precedence is intentional: the manifest is the source of truth, and CLI flags are a convenience for operators who can't or don't want to edit a YAML file.
@@ -106,6 +106,22 @@ For each mode, the framework runs:
 9. Serve over stdio
 
 The `env_file:` resolution happens *before* anything reads env vars — so `GITHUB_TOKEN` and similar are guaranteed to be in scope by the time the GitHub tools are constructed. A token in scope is not by itself enough to register them: the GitHub tools require `builtins.github: true` in the manifest, and only then does token reachability decide whether they appear. See [Writing a Manifest](writing-a-manifest.md#builtins).
+
+### What is fatal at boot, and what degrades
+
+Only a failure that makes the server's *primary* capability impossible aborts the boot. Everything peripheral warns on stderr, records itself in the boot summary line, and lets the server reach the MCP `initialize` handshake — a server that exits before the handshake cannot tell a client anything at all, so a client sees an unexplained dead server rather than a degraded one.
+
+| Boot failure | Behaviour |
+|---|---|
+| Manifest missing or invalid | **Fatal** — there is nothing to serve |
+| `--source-root` / `--watch` flag names a missing directory | **Fatal** — the operator asked for exactly that path on the command line |
+| Workspace mode cannot open its workspace | **Fatal** — the workspace *is* the capability in those modes |
+| `workspace.sandbox_root` rejected | **Fatal, deliberately** — degrading would serve unbounded `set_root_dir` swaps after the operator asked for a containment boundary |
+| Manifest `source_root:` / `source_roots:` entry does not resolve | **Degrades** — warns per entry, serves the roots that did resolve, adds `unresolved source roots: [...]` to the boot summary |
+| Explicit `env_file:` does not exist | **Degrades** — warns, adds `env_file unavailable: …` to the boot summary; tools needing those variables report the missing credential when called |
+| Filesystem watcher will not start | **Degrades** — warns, adds `watcher unavailable: …` to the boot summary; the server serves a tree that no longer auto-refreshes |
+
+With no source root available at all, `read_source` / `grep` / `list_source` stay in `tools/list` and answer with `Cannot read source: no active source root…` — the absence is reported where an agent will actually see it.
 
 ## Manifest auto-detection
 

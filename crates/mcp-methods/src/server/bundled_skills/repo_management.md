@@ -1,6 +1,6 @@
 ---
 name: repo_management
-description: "Clone GitHub repos into the workspace, swap which repo is currently active, update clones to latest, force a rebuild, or delete a tracked repo. TRIGGER when the user wants to start work on a new repo (`set` with `name=\"org/repo\"`), pull latest on the active checkout (`update`), see the workspace inventory (`list`), drop a clone to reclaim disk (`delete`), or bypass the last-built-SHA gate (`force_rebuild`). ALSO TRIGGER for phrasings like \"switch to numpy\", \"what repos do I have?\", \"rebuild the graph\" — these map to set / list / force_rebuild. The tool only registers when the server has a workspace configured (any `workspace.kind`); sessions without one don't see it, and local-workspace deployments should prefer `set_root_dir`. SKIP for reading code (use read_source/grep — repo_management only chooses *which* checkout the source tools see), one-off GitHub API queries without cloning (use github_api or github_issues), or pointing at a directory that's not on GitHub (use a local-mode workspace with `set_root_dir`)."
+description: "Clone GitHub repos into the workspace, swap which repo is currently active, update clones to latest, force a rebuild, or delete a tracked repo. TRIGGER when the user wants to start work on a new repo (`set` with `name=\"org/repo\"`), pull latest on the active checkout (`update`), see the workspace inventory (`list`), drop a clone to reclaim disk (`delete`), or bypass the last-built-SHA gate (`force_rebuild`). ALSO TRIGGER for phrasings like \"switch to numpy\", \"what repos do I have?\", \"rebuild the graph\" — these map to set / list / force_rebuild. The tool only registers when the server has a `kind: github` workspace configured; sessions with no workspace, or with a `kind: local` one, don't see it at all — local-workspace deployments use `set_root_dir` instead. SKIP for reading code (use read_source/grep — repo_management only chooses *which* checkout the source tools see), one-off GitHub API queries without cloning (use github_api or github_issues), or pointing at a directory that's not on GitHub (use a local-mode workspace with `set_root_dir`)."
 applies_to:
   mcp_methods: ">=0.3.35"
 applies_when:
@@ -20,7 +20,7 @@ auto_inject_hint: true
 
 ## Overview
 
-`repo_management` is the workspace-mode control surface: it clones GitHub repos into a workspace directory, swaps which repo is currently active, updates clones to latest, and tears them down on a TTL. It's only registered when the server is started with a workspace configured (any `workspace.kind`); `tools/list` won't include it otherwise. In a local-mode workspace prefer `set_root_dir` — the clone/update actions are GitHub-workspace operations.
+`repo_management` is the workspace-mode control surface: it clones GitHub repos into a workspace directory, swaps which repo is currently active, updates clones to latest, and tears them down on a TTL. It's only registered when the server is started with a `kind: github` workspace; `tools/list` won't include it otherwise. A `kind: local` workspace uses `set_root_dir` instead — every action here is a GitHub-workspace operation against a clone directory local mode does not have.
 
 ## Quick Reference
 
@@ -37,9 +37,9 @@ auto_inject_hint: true
 ## Workspace types: github vs. local
 
 - **`workspace.kind: github`** (the common case): `repo_management` clones from GitHub. Repos live under the workspace root (`<workspace_dir>/clones/<org>/<repo>/`).
-- **`workspace.kind: local`**: `repo_management` is *not* the right entry point — use `set_root_dir(path)` instead to point at an existing directory on disk. The two modes are mutually exclusive at boot.
+- **`workspace.kind: local`**: `repo_management` is not registered at all — use `set_root_dir(path)` instead to point at an existing directory on disk. The two modes are mutually exclusive at boot.
 
-In a `kind: github` workspace, `tools/list` carries `repo_management` and not `set_root_dir`. In a `kind: local` workspace both appear — but `repo_management`'s clone/update actions are GitHub-workspace operations there, so `set_root_dir` is the one to use. Swapping between the two workspace kinds requires a restart.
+The two tools never appear together: `tools/list` carries `repo_management` and not `set_root_dir` in a `kind: github` workspace, `set_root_dir` and not `repo_management` in a `kind: local` one, and neither when no workspace is configured. (Earlier framework versions also listed `repo_management` in local mode, where its clone/update actions could not apply.) Swapping between the two workspace kinds requires a restart.
 
 ## SHA-gating and the post-activate hook
 

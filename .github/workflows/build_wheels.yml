@@ -1,9 +1,27 @@
 name: Build and Publish Python Wheels
 on:
   push:
+    # Release-only ref. `ci.yml` runs on push to `main` (and on PRs), so a
+    # feature-branch push finds no matching checks and `ci-gate` waits on
+    # something that never appears — with the broadened paths below that
+    # would be every `.rs` push. It also matches the documented intent:
+    # the bump must only land on the ref you intend to release from.
+    # `workflow_dispatch` stays unrestricted, so a manual re-run from any
+    # ref is still possible.
+    branches: [main]
     paths:
       # Version is single-sourced in the root [workspace.package].version.
       - 'Cargo.toml'
+      # Broadened 2026-08-31: a `Cargo.toml`-only trigger meant a version
+      # bump that failed CI and was then fixed by a commit touching only
+      # `.rs`/`.py` re-ran CI but *not* this workflow, leaving the version
+      # silently unpublished until someone fired workflow_dispatch by hand.
+      # Re-runs are idempotent: both the build and publish jobs are gated
+      # on `needs.version.outputs.should_publish`, so a push at an
+      # already-live version is a complete no-op.
+      - 'crates/**'
+      - 'python/**'
+      - 'pyproject.toml'
   workflow_dispatch:
 
 jobs:
@@ -18,22 +36,55 @@ jobs:
       - name: Extract version from Cargo.toml
         id: get_version
         run: |
+          set -euo pipefail
           # Single source of truth: [workspace.package].version in root Cargo.toml.
-          VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # `cut` is last in the pipeline, so its exit status (always 0) is the
+          # step's — a grep that matches nothing yields an empty VERSION, which
+          # interpolates into the PyPI URL as .../mcp-methods//json, 404s, and
+          # makes should_publish unconditionally true. Assert well-formedness
+          # here, before the value can reach $GITHUB_OUTPUT.
+          VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2) || VERSION=''
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::could not read a semver version from the root Cargo.toml (got '$VERSION')"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Package version: $VERSION"
       - name: Check if version exists on PyPI
         id: check_pypi
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
         run: |
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://pypi.org/pypi/mcp-methods/${{ steps.get_version.outputs.version }}/json")
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "Version ${{ steps.get_version.outputs.version }} already on PyPI"
-            echo "should_publish=false" >> $GITHUB_OUTPUT
-          else
-            echo "Version ${{ steps.get_version.outputs.version }} not on PyPI"
-            echo "should_publish=true" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          # 200 = the version is live. 404 = PyPI answered and the version is
+          # genuinely absent — the legitimate "publish it" signal. Anything
+          # else (403, 5xx, or a curl/network failure surfaced as 000) means
+          # PyPI did not answer, and the old `else` branch folded that
+          # non-answer into should_publish=true: a publish decision made on
+          # no evidence. Fail instead; a `workflow_dispatch` re-run is safe
+          # at any time because should_publish is idempotent.
+          STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+            "https://pypi.org/pypi/mcp-methods/${VERSION}/json") || STATUS=000
+          case "$STATUS" in
+            200)
+              if ! jq -e . response.json >/dev/null 2>&1; then
+                echo "::error::PyPI answered 200 for mcp-methods $VERSION but the body is not valid JSON"
+                head -c 500 response.json || true
+                exit 1
+              fi
+              echo "Version $VERSION already on PyPI"
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "Version $VERSION not on PyPI"
+              echo "should_publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::PyPI did not answer for mcp-methods $VERSION (HTTP $STATUS, 000 = curl/network failure); refusing to guess the publish state"
+              head -c 500 response.json || true
+              exit 1
+              ;;
+          esac
 
   ci-gate:
     name: Wait for CI
@@ -99,10 +150,16 @@ jobs:
           if (!(Test-Path -Path "wheels")) { New-Item -ItemType Directory -Path "wheels" }
           maturin build --release --target ${{ matrix.target }} --out wheels
         shell: pwsh
+      # `if-no-files-found` defaults to `warn`: a matrix leg that exits 0
+      # without producing a wheel would upload an empty artifact and stay
+      # green, and the publish job would then ship a partial platform set
+      # (download-artifact merges whatever it finds; `skip-existing` hides
+      # the gap). Fail the leg instead.
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: wheels/*.whl
+          if-no-files-found: error
 
   publish:
     name: Publish to PyPI

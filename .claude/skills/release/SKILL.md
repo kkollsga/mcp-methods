@@ -10,8 +10,11 @@ Ship an mcp-methods release. A release is **a version bump merged to
 `build_wheels.yml` → PyPI) re-read the version, skip if it's already live
 (`should_publish`), and otherwise publish after CI passes (`ci-gate`).
 **Publishes are immutable** — a version, once on crates.io/PyPI, can never
-be overwritten or unpublished. There is no branch guard on the workflows,
-so the bump must land only on the ref you mean to release from.
+be overwritten or unpublished. Since 2026-08-31 the workflows fire only on
+`main` (`branches: [main]`) but on any code path (`Cargo.toml`, `crates/**`,
+`python/**`, `pyproject.toml`), so every code push to `main` is a publish
+attempt for whatever version `Cargo.toml` carries — an unpublished version
+must never sit on `main`.
 
 ## Preconditions
 - **No release already staged.** `git log origin/main..HEAD --oneline`.
@@ -35,7 +38,19 @@ so the bump must land only on the ref you mean to release from.
   (KGLite hit this on 2026-08-09.)
 
 ## Steps
-0. **Doctrine sync — one file read when there is nothing to do.** Read
+0a. **Open PRs — merge every finished one, or stop for the user's decision**
+   (doctrine 0.1.8). `gh pr list --state open --json number,title,isDraft,
+   mergeable,statusCheckRollup`. A *finished* PR — ready (not draft), CI
+   green, conflict-free — is fast-forward merged into `main` before the goal
+   check so it ships in this cut. An *unfinished* one — draft, red or
+   incomplete CI, conflicts, visibly partial — **halts the run here**: report
+   its exact state and the three options (finish it as part of this run,
+   merge as-is, defer) and do not proceed until the user chooses. Skipping a
+   PR is a release-scope decision and is the user's, not a rule's; a deferred
+   PR appears in the final report with the user's recorded decision, never as
+   a bare "deferred". An empty list means continue. This stop sits before any
+   release work on purpose, so the rest of the run stays continuous.
+0b. **Doctrine sync — one file read when there is nothing to do.** Read
    `../doctrine/VERSION` and compare it against `dev-docs/.doctrine-synced`
    (this step owns that marker and creates it; **missing means never synced**,
    so read the changelog from its first entry).
@@ -57,26 +72,39 @@ so the bump must land only on the ref you mean to release from.
    just the what), matching the prose quality of recent entries. Surface
    anything dropped or deferred before bumping — don't let it vanish.
 2. **Gate — all green before continuing.**
+   - **First, `make prune-target`** (doctrine 0.1.9): the gate is this flow's
+     heaviest build, and a `target/` that grew all sprint is pruned *before*
+     it, not in end-of-run cleanup — a bound checked only at milestones is
+     not a bound (R4). The target is size-gated, so on a lean tree it is a
+     free no-op; it cleans through the `target` symlink like `make clean`.
    - Rust (always runnable here): `cargo fmt -- --check`,
      `cargo clippy --workspace --all-targets -- -D warnings`,
      `cargo test -p mcp-methods`,
      `cargo test -p mcp-methods --test deployed_manifests`,
      `cargo test -p mcp-server`.
    - Python (`make lint`'s `ruff check .` + `pytest tests/`): part of the
-     canonical gate, **but this sandbox can't run them** (ruff / pytest-cov
-     / a built `mcp_methods` are absent). Run the Rust gate locally and let
-     **CI** run the full gate (it does — `ci.yml` is the `ci-gate` the
-     publish workflows wait on). Don't claim the Python gate passed locally
-     when it was skipped.
+     canonical gate. On this workstation `pytest` runs via the lab venv —
+     `/Volumes/EksternalHome/KristianEX/labenv/bin/pytest tests/ -q -o addopts=""`
+     (the override is because pytest-cov is absent) — and **ruff does not**
+     (not installed). Run what runs; let **CI** run ruff (`ci.yml` is the
+     `ci-gate` the publish workflows wait on). Don't claim a leg passed
+     locally when it was skipped.
+   - Docs (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps`):
+     published doc surfaces are a gate since 2026-08-31 (doctrine 0.1.7
+     sweep) — an intra-doc link to a private item or an unbalanced fence
+     fails it, in CI and in `make lint`.
    - **Where the environment CAN run those legs, run them before the first
      push — not after CI reports them.** Every step a branch has never executed
      accumulates failures independently until CI sees them all at once;
      KGLite's 2026-08-09 program found four CI blockers this way on a branch
      whose fast gate was green throughout. Here the stakes are sharper than a
      red PR: `ci-gate` failing after a `Cargo.toml` bump lands leaves the
-     version **unpublished**, and the `workflow_dispatch` retry gap (CLAUDE.md,
-     "Failed-CI retry gap") means fixing it with a `.rs`-only commit does not
-     re-fire publish — both workflows must then be dispatched by hand.
+     version **unpublished** on `main`; since 2026-08-31 a `.rs`-only fix
+     commit re-fires publish automatically (the trigger covers `crates/**`),
+     so the recovery is "fix forward on `main`", and `workflow_dispatch`
+     remains for the case where the registry itself was unreachable (the
+     checks now fail the run rather than default to publish — CLAUDE.md,
+     "Consequence of the broad trigger").
    - **Review what the diff earned, against the bar** in CLAUDE.md "Review —
      report what is broken" (estate rule R15). A finding names a concrete
      failure; "no findings" is a valid outcome and does not hold the release.
@@ -125,8 +153,8 @@ so the bump must land only on the ref you mean to release from.
    stalls unattended runs.
 
    Be aware of the geometry, because it is sharper here than in kglite: the
-   push IS the publish. The workflows trigger on the root `Cargo.toml` path
-   with no branch guard, and nothing stands between the two. That is an
+   push IS the publish. The workflows trigger on any code push to `main`,
+   and nothing stands between the two. That is an
    argument for strong checks BEFORE this line — Rust gate green, surgical
    staging, on `main`, fast-forward clean — not for a prompt at it.
 

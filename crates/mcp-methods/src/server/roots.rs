@@ -12,7 +12,7 @@
 //! 1. **Fallback only.** Anything the operator configured — manifest
 //!    `workspace.root`, `--watch`, `--source-root`, `--workspace`, or a
 //!    runtime `set_root_dir` — makes the workspace
-//!    [`RootOwnership::Operator`](crate::server::workspace::RootOwnership::Operator),
+//!    [`RootOwnership::Operator`],
 //!    and adoption refuses to touch it. Forever, including across later
 //!    `roots/list_changed` notifications.
 //! 2. **Contained.** Adoption calls

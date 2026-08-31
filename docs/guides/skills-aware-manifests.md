@@ -16,7 +16,7 @@ Boot the server:
 mcp-server --mcp-config ./my_mcp.yaml
 ```
 
-Connect any MCP client. You'll now see three prompts in `prompts/list`: `grep`, `read_source`, `list_source`. Each returns methodology for the corresponding framework tool. Two more bundled skills — `github_issues` and `repo_management` — gate on their tool actually being registered (`applies_when: tool_registered:`), so they appear only when the manifest opts into `builtins.github: true` (with a token reachable) or configures a workspace, respectively.
+Connect any MCP client. You'll now see three prompts in `prompts/list`: `grep`, `read_source`, `list_source`. Each returns methodology for the corresponding framework tool. Two more bundled skills — `github_issues` and `repo_management` — gate on their tool actually being registered (`applies_when: tool_registered:`), so they appear only when the manifest opts into `builtins.github: true` (with a token reachable) or configures a `kind: github` workspace, respectively. (A `kind: local` workspace registers `set_root_dir` rather than `repo_management`, so the `repo_management` skill stays hidden there too.)
 
 That's the bundled-only path. Three lines of YAML, zero new files.
 
