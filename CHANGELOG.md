@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.8 — 2026-09-06
+
+### Fixed — unknown skill activation predicates fail closed
+
+An `applies_when:` typo such as `graph_has_node_typo` was accepted by the YAML
+parser and discarded. When it was the only key, the resulting empty predicate
+set evaluated true and exposed a skill on every graph, including domains the
+author meant to exclude. Unknown keys inside `applies_when` and its nested
+`graph_has_property` object are now invalid frontmatter. An external skill file
+with such a key is skipped under the existing per-file recovery policy, while
+its path and parser error remain available through tracing and `ParseWarning`;
+valid siblings still load. Unknown top-level frontmatter stays accepted as
+decorative metadata.
+
 ## 0.4.7 — 2026-08-31
 
 ### Fixed — a missing `source_root` no longer kills the server before `initialize`

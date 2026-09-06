@@ -173,6 +173,7 @@ fn default_auto_inject_hint() -> bool {
 /// design is intentional — operators get type-checked semantics
 /// instead of an open-ended DSL.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppliesWhen {
     /// Active when the running graph has *any* of the listed node
     /// types in its schema. Domain predicate — evaluated via the
@@ -201,6 +202,7 @@ pub struct AppliesWhen {
 
 /// Nested shape for the `graph_has_property:` predicate.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GraphPropertyCheck {
     pub node_type: String,
     pub prop_name: String,
@@ -1438,6 +1440,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unknown_applies_when_predicates_are_rejected_before_activation() {
+        for applies_when in [
+            "  graph_has_node_typo: [Function]",
+            "  graph_has_node_type: [Function]\n  graph_has_node_typo: [Function]",
+            "  graph_has_property:\n    node_type: Function\n    prop_name: module\n    property_typo: ignored",
+        ] {
+            let content = format!(
+                "---\nname: typo_gate\ndescription: Must fail closed.\napplies_when:\n{applies_when}\n---\nBody.\n"
+            );
+            let error = parse_skill(&content, Path::new("typo_gate.md")).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                matches!(error, SkillError::InvalidFrontmatter { .. }),
+                "{message}"
+            );
+            assert!(message.contains("unknown field"), "{message}");
+            assert!(message.contains("typo"), "{message}");
+        }
+    }
+
+    #[test]
+    fn unknown_predicate_file_is_skipped_with_a_visible_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "good", &minimal_skill("good"));
+        write_skill(
+            dir.path(),
+            "typo_gate",
+            "---\nname: typo_gate\ndescription: Must fail closed.\napplies_when:\n  graph_has_node_typo: [Function]\n---\nBody.\n",
+        );
+
+        let (skills, warnings) =
+            load_skills_from_dir(dir.path(), SkillProvenance::Project).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name(), "good");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].path.ends_with("typo_gate.md"));
+        assert!(warnings[0].error.contains("unknown field"));
+        assert!(warnings[0].error.contains("graph_has_node_typo"));
     }
 
     #[test]

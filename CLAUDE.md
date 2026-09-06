@@ -5,6 +5,16 @@ agent instructions are regenerated from; `AGENTS.md` and `.agents/skills/` are
 generated adapters. Edit the authority and regenerate in the same action —
 never edit an adapter.
 
+## Doctrine adoption
+
+Follow `../doctrine/learn-from-us.md` → Doctrine sync procedure at planning or
+release entry. Compare numeric semantic-version tuples. A missing marker
+requires an adoption audit; planned or deferred work does not advance
+`dev-docs/.doctrine-synced`. Merge applicable corrections into the declared
+authority, preserve local improvements, regenerate adapters, and advance the
+marker only through contiguous entries whose required actions are complete.
+Convention snapshots do not perform sync.
+
 ## Releasing
 
 GitHub Actions does the heavy lifting. A release is just **a version

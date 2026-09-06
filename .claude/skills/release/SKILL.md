@@ -50,11 +50,13 @@ must never sit on `main`.
    PR appears in the final report with the user's recorded decision, never as
    a bare "deferred". An empty list means continue. This stop sits before any
    release work on purpose, so the rest of the run stays continuous.
-0b. **Doctrine sync — one file read when there is nothing to do.** Read
+0b. **Doctrine sync — one file read when there is nothing to do.** Follow the
+   canonical procedure in `../doctrine/learn-from-us.md`. Read
    `../doctrine/VERSION` and compare it against `dev-docs/.doctrine-synced`
    (this step owns that marker and creates it; **missing means never synced**,
    so read the changelog from its first entry).
-   Equal: continue. Doctrine ahead: read `../doctrine/CHANGELOG.md` forward
+   using numeric semantic-version tuples. Equal: continue. Doctrine ahead:
+   read `../doctrine/CHANGELOG.md` forward
    from the marker and act on every entry newer than it, per its class —
    `[skills-update]` merges into this repo's declared authority (`CLAUDE.md`,
    `.claude/skills/`) and regenerates the adapters from it, never the reverse;
@@ -216,11 +218,9 @@ Two more shapes of the same trap, added from KGLite's 2026-08-09/10 program:
     stale doctrine the other harness will follow. The mirror check must pass
     afterwards.
 
-    Here that is `CLAUDE.md` → `AGENTS.md` and each `.claude/skills/<n>/SKILL.md`
-    → `.agents/skills/<n>/SKILL.md`, substituting `CLAUDE.md`→`AGENTS.md`
-    everywhere **except the authority-declaration line**, which names the
-    authority literally in every copy — a substituted declaration inverts
-    itself and tells the adapter's reader to edit the adapter.
+    Here that is the root instruction adapter and each skill adapter. Use the
+    repository's declared generator and verify every mirror; do not hand-edit
+    generated copies.
 
 ## Notes
 - **Version source of truth:** `[workspace.package] version` in the root
