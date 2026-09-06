@@ -1530,6 +1530,34 @@ Body.\n";
     }
 
     #[test]
+    fn hard_limit_counts_the_complete_file_and_accepts_exactly_16_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "---\nname: boundary\ndescription: Boundary skill.\n---\n";
+        let content = format!(
+            "{prefix}{}",
+            "x".repeat(HARD_SIZE_LIMIT_BYTES - prefix.len())
+        );
+        assert_eq!(content.len(), 16_384);
+        let path = write_skill(dir.path(), "boundary", &content);
+
+        let skill = load_skill_from_file(&path, SkillProvenance::Project)
+            .expect("a complete 16 KiB file is within the inclusive limit");
+        assert_eq!(skill.name(), "boundary");
+
+        fs::write(&path, format!("{content}x")).unwrap();
+        let error = load_skill_from_file(&path, SkillProvenance::Project)
+            .expect_err("one byte above the complete-file limit must fail");
+        assert!(matches!(
+            error,
+            SkillError::SkillTooLarge {
+                bytes: 16_385,
+                limit: HARD_SIZE_LIMIT_BYTES,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn load_skills_from_dir_walks_markdown_only() {
         let dir = tempfile::tempdir().unwrap();
         write_skill(dir.path(), "a", &minimal_skill("a"));
