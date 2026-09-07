@@ -81,7 +81,7 @@ impl RawClient {
     ///
     /// `capabilities` is passed through verbatim so a test can advertise
     /// roots, advertise roots without `listChanged`, or advertise nothing.
-    async fn handshake_at(&mut self, protocol_version: &str, capabilities: Value) {
+    async fn handshake_at(&mut self, protocol_version: &str, capabilities: Value) -> String {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({
@@ -101,8 +101,13 @@ impl RawClient {
             response.get("result").is_some(),
             "initialize failed: {response}"
         );
+        let negotiated = response["result"]["protocolVersion"]
+            .as_str()
+            .expect("initialize response names the negotiated protocol")
+            .to_owned();
         self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
             .await;
+        negotiated
     }
 
     async fn handshake(&mut self, capabilities: Value) {
@@ -244,7 +249,7 @@ fn roots_capability() -> Value {
 }
 
 #[tokio::test]
-async fn modern_protocol_serves_tools_without_emitting_removed_roots_method() {
+async fn roots_list_behavior_follows_the_negotiated_initialize_protocol() {
     let (_td, base) = tempdir_with(&[]);
     let ws = Workspace::open_local_unanchored(None)
         .unwrap()
@@ -253,15 +258,26 @@ async fn modern_protocol_serves_tools_without_emitting_removed_roots_method() {
         .with_adopt_client_roots();
     let (mut client, _server) = boot(&ws);
 
-    // Deliberately carry the legacy capability into the modern handshake.
-    // The negotiated protocol, not an obsolete capability field, decides
-    // whether the server may emit roots/list.
-    client.handshake_at("2026-07-28", roots_capability()).await;
-    client.drain_quiet().await;
-    client.assert_no_roots_list_sent();
+    // `2026-07-28` replaced initialize with inline request metadata. A client
+    // that nevertheless sends initialize may be preserved by older SDK
+    // compatibility behavior or negotiated down to a legacy, handshake-capable
+    // revision by newer SDKs; roots behavior follows the response version.
+    let negotiated = client.handshake_at("2026-07-28", roots_capability()).await;
+    if negotiated == "2026-07-28" {
+        client.drain_quiet().await;
+        client.assert_no_roots_list_sent();
+    } else {
+        assert!(negotiated.as_str() < "2026-07-28", "{negotiated}");
+        let request = client.expect_request("roots/list").await;
+        client.respond(&request, json!({ "roots": [] })).await;
+    }
     client.assert_still_serving().await;
     let result = client.call_tool("ping").await;
-    assert_eq!(result["resultType"], json!("complete"));
+    if negotiated == "2026-07-28" {
+        assert_eq!(result["resultType"], json!("complete"));
+    } else {
+        assert!(result.get("resultType").is_none(), "{result}");
+    }
 }
 
 fn file_uri(path: &Path) -> String {
