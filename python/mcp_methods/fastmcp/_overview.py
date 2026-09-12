@@ -8,12 +8,16 @@ filters) so an operator can pin custom guidance the agent always sees.
 
 from __future__ import annotations
 
+from ._response_budget import install_response_budget
+
 
 def register_overview(app, graph, *, overview_prefix: str | None = None) -> None:
     """Register a `graph_overview` tool on a FastMCP app.
 
     `graph` is any object exposing `describe(types, connections)`.
     """
+
+    install_response_budget(app)
 
     @app.tool(
         description=(

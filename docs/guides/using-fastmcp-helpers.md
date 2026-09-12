@@ -5,7 +5,7 @@
 ## Install
 
 ```bash
-pip install mcp-methods mcp
+pip install "mcp-methods[fastmcp]"
 ```
 
 ## The helpers
@@ -31,7 +31,80 @@ _server, base_url = serve_csv_via_http("temp/")  # optional
 app.run(transport="stdio")
 ```
 
-Each helper is a thin (~10-line) wrapper over the Rust PyO3 surface — there's no logic duplication between the YAML-driven binary and these helpers, so agent behaviour is identical regardless of which path booted the server.
+The helpers delegate source operations to Rust and graph operations to the supplied
+graph object. Registering a tool helper also installs the shared Rust response
+budget at the app's MCP dispatch boundary, covering its custom tools too.
+
+## Default response budgets
+
+Completed tool results default to **16,384 serialized result bytes**. Small
+results retain their original shape. Larger results carry a preview describing
+scope, known counts, omitted values, selection order, and executable follow-up
+calls. Errors keep `isError: true`. This changes the default for existing clients.
+
+For one call, add `_response` to the normal arguments:
+
+```json
+{"query": "MATCH (n) RETURN n", "_response": {"max_bytes": 32768}}
+```
+
+Or request the complete inline result:
+
+```json
+{"query": "MATCH (n) RETURN n", "_response": {"mode": "full"}}
+```
+
+`max_bytes` must be at least 4096 and cannot be combined with `mode: full`.
+Controls are removed before invoking the tool. If a tool already declares an
+`_response` argument, the framework appends underscores until the control name
+is unused; consult `tools/list` for that tool's actual name.
+
+A preview's `next` object contains calls to `expand_response`. Copy those calls
+to retrieve a page or the original complete result **without rerunning the
+operation**. Its `path` selects a JSON Pointer into the payload: structured
+content, parsed JSON from a single text block, single text, or the original
+content-block array, in that order. `offset` counts array items, ordered object
+fields, or Unicode characters. Paths on shortened nested values support focused
+inspection. An existing application tool named `expand_response` is preserved;
+the framework adds underscores to its expansion tool name.
+
+Array previews preserve result order. Object previews put status, summary,
+warning/error, diagnostics and coverage fields first, then sort lexically.
+Text previews include a beginning and tail excerpt. Counts describe the
+returned collection, not the underlying database. Query `LIMIT`, source-tool
+limits and existing graph previews still apply even in full mode. The framework
+cannot infer missing semantic groups or repair query selection.
+
+Results are retained in memory per app, accessible only to the originating MCP
+session. Storage holds at most 32 entries and 32 MiB of serialized results,
+normalized payloads and arguments; oldest entries are evicted first. Expiry is
+ten minutes, checked on access. Storage is released when the server is dropped.
+Expired/evicted handles fail explicitly and never cause automatic re-execution.
+If a result cannot fit the retention capacity, or even preview control metadata
+cannot fit the requested budget, the result is returned intact with an explicit
+budget-overage reason. This avoids losing evidence after a mutation. No files
+are created. Byte limits concern completed MCP result objects, including content,
+metadata and JSON escaping, not JSON-RPC framing or token counts. Transport
+limits, protocol control messages and asynchronous task delivery remain owned
+by the host protocol implementation.
+
+The preview uses text for its evidence and a small
+`structuredContent: {"mcp_methods_preview": true}` discriminator. Advertised
+output schemas allow that alternative. Full results preserve their original
+structured content and content blocks.
+
+The supported Python host is the official `mcp.server.fastmcp.FastMCP` from
+`mcp>=1.26,<2`. If using only application-defined tools, call
+`install_response_budget(app)` once before serving. Helpers install it
+automatically; ordinary Python calls, prompts, resource responses, and independent
+downstream CLIs are outside this adapter's tool-response boundary. Install after
+any code that replaces the host's low-level request handlers.
+
+For domain-aware guidance, a custom tool can return a `CallToolResult` carrying
+`_meta["mcp_methods/preview"]` with a summary, coverage, warnings and concrete
+follow-up queries. This guidance is itself bounded and labeled if shortened.
+Tools own domain relevance; the generic fallback only describes structure.
+
 
 ## The `graph` parameter
 

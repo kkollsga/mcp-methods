@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.9 — 2026-09-12
+
+### Changed — bounded tool results by default
+
+Large completed tool results now default to a 16 KiB serialized response budget
+on Rust `McpServer` and official FastMCP apps using our registration helpers.
+Previews expose scope, counts, omissions and executable expansion calls so an
+agent can decide which evidence it needs next. Per-call `_response` controls
+request a larger budget or full inline output; no global configuration change
+is needed. Retained-result expansion never reruns the original tool, including
+mutations, and is isolated to the originating session.
+
+This changes existing clients' default output shape and adds a discovery-visible
+expansion tool. Small results remain complete; structured-output schemas admit
+the preview alternative. Retention is bounded by count, bytes and expiry. Results
+that cannot be retained are returned intact with an explicit overage reason to
+avoid discarding mutation evidence. Domain preview guidance can explain coverage
+and better follow-up queries; the framework does not infer rows excluded by a
+query or change independent downstream CLI output.
+
 ## 0.4.8 — 2026-09-06
 
 ### Fixed — unknown skill activation predicates fail closed

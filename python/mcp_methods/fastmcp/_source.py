@@ -18,6 +18,8 @@ from collections.abc import Sequence
 
 from mcp_methods import list_dir, read_file, ripgrep_files
 
+from ._response_budget import install_response_budget
+
 
 def register_source_tools(app, *, source_roots: Sequence[str]) -> None:
     """Register `read_source`, `grep`, `list_source` on a FastMCP app.
@@ -34,6 +36,8 @@ def register_source_tools(app, *, source_roots: Sequence[str]) -> None:
         if not os.path.isdir(r):
             raise ValueError(f"source_root is not a directory: {r}")
     primary = resolved_roots[0]
+
+    install_response_budget(app)
 
     @app.tool(
         description=(

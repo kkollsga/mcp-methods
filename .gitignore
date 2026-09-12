@@ -54,21 +54,11 @@ inbox/
 # holds durable design write-ups meant to be read by consumers of the crate.
 /dev-docs/
 
-# Workstation-local agent skills. These name sibling projects and local
-# filesystem paths, so new ones stay out of this public repo.
-#
-# `.claude/skills/release/SKILL.md` is ALREADY TRACKED and stays tracked —
-# .gitignore has no effect on tracked files. It is also this repo's declared
-# authority for the release procedure (CLAUDE.md, top), which is why it is the
-# one skill worth tracking. Whether the estate should track the rest is an open
-# maintainer decision; this entry deliberately changes nothing already
-# published.
+# Workstation-local agent configuration and skills. The .claude/skills/
+# authority and .agents/skills/ adapter remain on disk, outside the public
+# repository. Shared procedures are maintained by the doctrine project;
+# untracking a previously published skill does not remove its git history.
 /.claude/
-
-# Same reason, same rule: the Codex mirror also names sibling projects and
-# local filesystem paths (read-inbox/SKILL.md carries absolute /Volumes/…
-# paths today). It was neither tracked nor ignored, so a stray `git add -A`
-# would have published them to this public repo.
 /.agents/
 
 # Bundled mcp-server binary (built by `make bundle-bin` or the wheel CI step)

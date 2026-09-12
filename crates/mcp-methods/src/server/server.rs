@@ -586,6 +586,21 @@ pub struct ScreenStargazersArgs {
     pub refresh: bool,
 }
 
+/// Domain-supplied preview guidance: tool name, original arguments, complete MCP
+/// result -> JSON summary/coverage/next-query hints. Guidance is itself budgeted;
+/// it never changes the original data or reruns a handler.
+pub type ResponsePreviewHook =
+    Arc<dyn Fn(&str, &serde_json::Value, &serde_json::Value) -> serde_json::Value + Send + Sync>;
+
+// Hold the negotiated-info Arc with retained results so an allocator cannot
+// reuse a disconnected peer's address to grant another session access.
+struct ResponseSession(Arc<InitializeRequestParams>);
+impl PartialEq for ResponseSession {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// MCP server backed by the rmcp framework.
 ///
 /// The struct is cloned per request by rmcp's handler dispatch; the
@@ -599,6 +614,8 @@ pub struct McpServer {
     /// existing zero-skills boot path so `prompts/list` returns the
     /// rmcp default (empty result, no capability advertised).
     prompt_router: PromptRouter<McpServer>,
+    responses: Arc<Mutex<crate::response_budget::ResponseStore<ResponseSession>>>,
+    response_preview: Option<ResponsePreviewHook>,
 }
 
 #[tool_router]
@@ -608,6 +625,8 @@ impl McpServer {
             options,
             tool_router: Self::tool_router(),
             prompt_router: PromptRouter::new(),
+            responses: Arc::new(Mutex::new(crate::response_budget::ResponseStore::default())),
+            response_preview: None,
         };
         server.register_github_tools_if_authorized();
         server.register_local_workspace_tools();
@@ -1519,8 +1538,172 @@ pub fn serve_prompts(registry: &ResolvedRegistry, server: &mut McpServer) {
     }
 }
 
+fn response_control_name(schema: &rmcp::model::JsonObject) -> String {
+    let mut name = "_response".to_string();
+    while schema
+        .get("properties")
+        .and_then(|v| v.get(&name))
+        .is_some()
+    {
+        name.push('_');
+    }
+    name
+}
+
+fn budgeted_tool(mut tool: Tool) -> Tool {
+    let control = response_control_name(&tool.input_schema);
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    schema
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}))[&control] =
+        crate::response_budget::options_schema();
+    let description = format!("{}\nResponses default to 16384 serialized bytes. Set {control}.mode=full for complete inline output or {control}.max_bytes for a larger per-call budget. Previews include calls to expand retained evidence without rerunning this tool.", tool.description.as_deref().unwrap_or(""));
+    tool.description = Some(description.into());
+    if let Some(output) = tool.output_schema.take() {
+        let mut output = output.as_ref().clone();
+        let definitions = output.remove("$defs");
+        let mut union = serde_json::json!({"anyOf":[output,{
+            "type":"object","required":["mcp_methods_preview"],
+            "properties":{"mcp_methods_preview":{"const":true}}
+        }]});
+        if let Some(definitions) = definitions {
+            union["$defs"] = definitions;
+        }
+        tool.output_schema = Some(Arc::new(union.as_object().unwrap().clone()));
+    }
+    tool
+}
+
+impl McpServer {
+    /// Supply domain-aware findings, coverage and follow-up queries for previews.
+    /// The generic fallback reports structure and omissions without guessing
+    /// relevance. Configure this before serving; clones share the same hook.
+    pub fn with_response_preview_hook(mut self, hook: ResponsePreviewHook) -> Self {
+        self.response_preview = Some(hook);
+        self
+    }
+
+    fn response_expansion_name(&self) -> String {
+        let mut name = "expand_response".to_string();
+        while self.tool_router.get(&name).is_some() {
+            name.push('_');
+        }
+        name
+    }
+
+    fn response_expansion_tool(&self) -> Tool {
+        let mut tool = Tool::new(self.response_expansion_name(),
+            "Inspect retained output without rerunning a tool. Use result_id from a preview; path is a JSON Pointer into its payload; offset selects items/fields/Unicode characters. response.mode=full returns the original inline result (empty path) or a complete selected value. Results are session-scoped and expire/evict as disclosed in the preview.",
+            Arc::new(crate::response_budget::expansion_schema().as_object().unwrap().clone()));
+        tool.annotations = Some(ToolAnnotations::new().read_only(true).idempotent(true));
+        tool
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
+    async fn call_tool(
+        &self,
+        mut request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        use crate::response_budget::{Expansion, ResponseOptions};
+        let expansion_tool = self.response_expansion_name();
+        let owner = ResponseSession(
+            context
+                .peer
+                .peer_info()
+                .ok_or_else(|| McpError::invalid_request("initialize is required", None))?,
+        );
+        if request.name == expansion_tool {
+            let args: Expansion =
+                serde_json::from_value(serde_json::json!(request.arguments.unwrap_or_default()))
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            let result = self
+                .responses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expand(&owner, &args, &expansion_tool)
+                .map_err(|e| McpError::invalid_params(e, None))?;
+            return serde_json::from_value::<CallToolResult>(result)
+                .map(Into::into)
+                .map_err(|e| McpError::internal_error(e.to_string(), None));
+        }
+        let tool = self
+            .tool_router
+            .get(&request.name)
+            .ok_or_else(|| McpError::invalid_params("Unknown tool", None))?;
+        let control = response_control_name(&tool.input_schema);
+        let options: ResponseOptions = request
+            .arguments
+            .as_mut()
+            .and_then(|a| a.remove(&control))
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+            .unwrap_or_default();
+        options
+            .validate()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let name = request.name.to_string();
+        let arguments = serde_json::json!(request.arguments);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        match self.tool_router.call(tcc).await? {
+            CallToolResponse::Complete(result) => {
+                let mut result = serde_json::to_value(result)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if let Some(hook) = &self.response_preview {
+                    let guidance = hook(&name, &arguments, &result);
+                    if result.get("_meta").is_none() {
+                        result["_meta"] = serde_json::json!({});
+                    }
+                    result["_meta"]["mcp_methods/preview"] = guidance;
+                }
+                let result = self
+                    .responses
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .present(owner, &name, arguments, result, &options, &expansion_tool);
+                serde_json::from_value::<CallToolResult>(result)
+                    .map(Into::into)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+            }
+            other => Ok(other),
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let mut tools: Vec<_> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(budgeted_tool)
+            .collect();
+        tools.push(self.response_expansion_tool());
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if name == self.response_expansion_name() {
+            return Some(self.response_expansion_tool());
+        }
+        self.tool_router.get(name).cloned().map(budgeted_tool)
+    }
+
     fn get_info(&self) -> ServerInfo {
         let name = self
             .options

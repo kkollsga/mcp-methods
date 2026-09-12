@@ -1128,6 +1128,99 @@ impl PySkillRegistry {
     }
 }
 
+/// Shared response-budget engine used by the FastMCP protocol adapter.
+#[pyclass(name = "ResponseBudget")]
+struct PyResponseBudget(std::sync::Mutex<mcp_methods::response_budget::ResponseStore<String>>);
+
+#[pymethods]
+impl PyResponseBudget {
+    #[new]
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(Default::default()))
+    }
+
+    /// Validate presentation controls before executing a handler.
+    #[staticmethod]
+    fn validate(options_json: &str) -> PyResult<()> {
+        let options: mcp_methods::response_budget::ResponseOptions =
+            serde_json::from_str(options_json)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        options
+            .validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// Apply a budget to a serialized complete MCP result for one session.
+    fn present(
+        &self,
+        session: String,
+        tool: &str,
+        arguments_json: &str,
+        result_json: &str,
+        options_json: &str,
+        expansion_tool: &str,
+    ) -> PyResult<String> {
+        let parse = |s: &str| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        };
+        let options: mcp_methods::response_budget::ResponseOptions =
+            serde_json::from_str(options_json)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        options
+            .validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let result = parse(result_json)?;
+        if !result.is_object() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Expected MCP result object",
+            ));
+        }
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .present(
+                session,
+                tool,
+                parse(arguments_json)?,
+                result,
+                &options,
+                expansion_tool,
+            )
+            .to_string())
+    }
+
+    /// Expand retained evidence without invoking the original handler.
+    fn expand(
+        &self,
+        session: String,
+        request_json: &str,
+        expansion_tool: &str,
+    ) -> PyResult<String> {
+        let request = serde_json::from_str(request_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expand(&session, &request, expansion_tool)
+            .map(|v| v.to_string())
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// JSON schema for the shared presentation controls.
+    #[staticmethod]
+    fn options_schema() -> String {
+        mcp_methods::response_budget::options_schema().to_string()
+    }
+
+    /// JSON schema for retained-result expansion.
+    #[staticmethod]
+    fn expansion_schema() -> String {
+        mcp_methods::response_budget::expansion_schema().to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Module init
 // ---------------------------------------------------------------------------
@@ -1157,6 +1250,7 @@ fn _mcp_methods(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_git_repo, m)?)?;
     m.add_function(wrap_pyfunction!(git_api, m)?)?;
     m.add_function(wrap_pyfunction!(github_issues, m)?)?;
+    m.add_class::<PyResponseBudget>()?;
     // cache
     m.add_class::<PyElementCache>()?;
     // skills

@@ -80,3 +80,25 @@ mcp-methods = { version = "0.4", default-features = false }
 - [Downstream Binary](../guides/downstream-binary.md) — how to wrap `McpServer::new`
 - [Architecture](../explanation/architecture.md) — three-crate layout
 - The published [crates.io page](https://crates.io/crates/mcp-methods)
+
+## Default tool response budgets
+
+`McpServer` applies the [response budget contract](../guides/using-fastmcp-helpers.md#default-response-budgets)
+to completed calls from builtin, typed and custom router tools. The reference
+`mcp-server` binary inherits it. No server option is needed to enable it.
+`tools/list` advertises `_response` controls and the retained-result expansion
+tool, including collision-safe names. Direct calls to a handler or to
+`tool_router_mut().call(...)` bypass protocol presentation.
+
+Use `McpServer::with_response_preview_hook` to provide domain-specific summary,
+coverage and next-query JSON from the tool name, original arguments and complete
+MCP result. The callback runs outside the retention lock; its guidance is
+included in previews and retained with the result. Custom routes may instead
+supply `_meta["mcp_methods/preview"]` themselves. The optional guidance hook does
+not enable the budget: the budget is already the default.
+
+The always-available `mcp_methods::response_budget` module exposes the shared
+`ResponseStore`, `ResponseOptions` and `Expansion` primitives for adapters.
+Validate controls before executing a tool, provide a unique authenticated
+session owner, and serialize the complete result before applying the budget.
+Native sessions use negotiated peer identity, never the client display name.

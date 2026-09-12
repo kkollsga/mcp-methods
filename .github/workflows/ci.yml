@@ -92,7 +92,7 @@ jobs:
       - run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-cov requests
+          pip install maturin pytest pytest-cov requests mcp==1.26.0
           maturin develop --release
           pytest tests/ -v
       - name: Test import

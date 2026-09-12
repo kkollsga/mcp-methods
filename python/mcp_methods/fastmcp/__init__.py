@@ -25,7 +25,9 @@ All helpers are thin wrappers — the implementation work lives in the Rust
 object (for graph tools). The helpers exist so each FastMCP author does
 not re-implement parameter validation, default values, and tool-description
 strings; they mirror the corresponding YAML+CLI tool one-to-one so an
-agent's behaviour is identical regardless of which path booted the server.
+agent can use familiar tool names across hosts. Registering a tool helper also
+installs the shared default response budget at the official SDK's protocol
+boundary. Direct Python calls retain their original return values.
 """
 
 from __future__ import annotations
@@ -33,11 +35,13 @@ from __future__ import annotations
 from ._csv_http import serve_csv_via_http
 from ._cypher import register_cypher_query
 from ._overview import register_overview
+from ._response_budget import install_response_budget
 from ._save import register_save_graph
 from ._skills import register_skills_as_prompts
 from ._source import register_source_tools
 
 __all__ = [
+    "install_response_budget",
     "register_cypher_query",
     "register_overview",
     "register_save_graph",

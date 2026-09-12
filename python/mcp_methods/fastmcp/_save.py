@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from ._response_budget import install_response_budget
+
 
 def register_save_graph(app, graph) -> None:
     """Register a `save_graph(path)` tool on a FastMCP app.
 
     `graph.save(path)` must exist on the supplied object.
     """
+
+    install_response_budget(app)
 
     @app.tool(
         description=(

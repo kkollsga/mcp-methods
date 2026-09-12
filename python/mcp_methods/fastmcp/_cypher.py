@@ -15,11 +15,15 @@ import os
 import uuid
 from pathlib import Path
 
+from ._response_budget import install_response_budget
+
 
 def register_cypher_query(app, graph, *, csv_dir: str | os.PathLike[str] = "temp/") -> None:
     """Register a `cypher_query` tool on a FastMCP app."""
     csv_path = Path(csv_dir)
     csv_path.mkdir(parents=True, exist_ok=True)
+
+    install_response_budget(app)
 
     @app.tool(
         description=(

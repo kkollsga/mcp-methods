@@ -62,7 +62,8 @@ pub use runtime::{
     resolve_source_roots_lenient, UnresolvedSourceRoot,
 };
 pub use server::{
-    serve_prompts, McpServer, RepoProvider, ResultCtx, ResultPostprocessHook, ServerOptions,
+    serve_prompts, McpServer, RepoProvider, ResponsePreviewHook, ResultCtx, ResultPostprocessHook,
+    ServerOptions,
 };
 pub use skills::{
     library_bundled_skills, render_skill_template, write_skill_template, AppliesWhen, BundledSkill,
