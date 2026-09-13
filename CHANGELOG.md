@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — read-only filesystem access no longer reports a source change
+
+The workspace watcher now removes typed non-mutating access events before its
+path-only debouncer. On Linux, opening or reading a watched source file could
+previously invoke the change callback and trigger a downstream rebuild even
+though no content changed. Create, modify, metadata, rename, remove and unknown
+events remain conservative change signals, as do errors from the platform
+watcher. Existing debounce timing and path skip rules are unchanged.
+
 ## 0.4.9 — 2026-09-12
 
 ### Changed — bounded tool results by default

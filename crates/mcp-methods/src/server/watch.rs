@@ -22,9 +22,10 @@
 //! list. With it, consumers see only events that could plausibly
 //! matter.
 //!
-//! Bindings that need everything (test fixtures, future consumers
-//! with a genuine reason to see every event) pass
-//! [`WatchConfig::unfiltered`] to [`watch_with_config`].
+//! Bindings that need every mutation or unknown-event path, including
+//! conventional noise paths, pass [`WatchConfig::unfiltered`] to
+//! [`watch_with_config`]. Non-mutating access events are always discarded
+//! before debounce, independently of this path filter.
 
 #![allow(dead_code)]
 
@@ -33,8 +34,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use notify_debouncer_mini::notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use notify_debouncer_mini::notify::{
+    Config as NotifyConfig, Event, EventHandler, EventKind, RecommendedWatcher, RecursiveMode,
+    Watcher, WatcherKind,
+};
+use notify_debouncer_mini::{
+    new_debouncer_opt, Config as DebounceConfig, DebounceEventHandler, DebounceEventResult,
+    Debouncer,
+};
 
 /// Callback invoked on a debounced file-change event.
 ///
@@ -107,10 +114,9 @@ impl Default for WatchConfig {
 }
 
 impl WatchConfig {
-    /// Empty skip set — every event reaches the callback. Use when
-    /// you genuinely want raw FS events (test fixtures, log-every-
-    /// change diagnostic modes, or future consumers with a reason to
-    /// see `.git/objects/...` writes).
+    /// Empty path skip set — every debounced mutation or unknown-event path
+    /// reaches the callback, including `.git/objects/...` writes. Non-mutating
+    /// access events remain filtered before debounce.
     pub fn unfiltered() -> Self {
         Self {
             skip_substrings: Vec::new(),
@@ -163,9 +169,61 @@ fn retain_unskipped(
         .collect()
 }
 
+/// Prevent non-mutating access notifications from entering the path-only
+/// debouncer, which cannot preserve their event kind.
+struct MutationWatcher<W> {
+    inner: W,
+}
+
+impl<W: Watcher> Watcher for MutationWatcher<W> {
+    fn new<F: EventHandler>(
+        mut event_handler: F,
+        config: NotifyConfig,
+    ) -> notify_debouncer_mini::notify::Result<Self> {
+        let inner = W::new(
+            move |result: notify_debouncer_mini::notify::Result<Event>| match result {
+                Ok(event) if matches!(event.kind, EventKind::Access(_)) => {}
+                result => event_handler.handle_event(result),
+            },
+            config,
+        )?;
+        Ok(Self { inner })
+    }
+
+    fn watch(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+    ) -> notify_debouncer_mini::notify::Result<()> {
+        self.inner.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify_debouncer_mini::notify::Result<()> {
+        self.inner.unwatch(path)
+    }
+
+    fn configure(&mut self, option: NotifyConfig) -> notify_debouncer_mini::notify::Result<bool> {
+        self.inner.configure(option)
+    }
+
+    fn kind() -> WatcherKind {
+        W::kind()
+    }
+}
+
+fn new_mutation_debouncer<F: DebounceEventHandler, W: Watcher>(
+    debounce: Duration,
+    event_handler: F,
+) -> notify_debouncer_mini::notify::Result<Debouncer<MutationWatcher<W>>> {
+    new_debouncer_opt(
+        DebounceConfig::default().with_timeout(debounce),
+        event_handler,
+    )
+}
+
 /// Active watcher handle. Drop to stop watching.
 pub struct WatchHandle {
-    _debouncer: Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    _debouncer: Debouncer<MutationWatcher<RecommendedWatcher>>,
 }
 
 /// Spawn a recursive debounced watcher on `dir` using the default
@@ -187,8 +245,9 @@ pub fn watch(
 
 /// Spawn a recursive debounced watcher with an explicit
 /// [`WatchConfig`]. Behaves like [`watch`] except the skip set is
-/// caller-controlled — pass [`WatchConfig::unfiltered`] to receive
-/// every event, or build a custom config to add / remove patterns.
+/// caller-controlled — pass [`WatchConfig::unfiltered`] to retain every
+/// debounced mutation or unknown-event path, or build a custom config to add /
+/// remove patterns. Non-mutating access events are always filtered first.
 pub fn watch_with_config(
     dir: &Path,
     on_change: Option<ChangeHandler>,
@@ -206,28 +265,31 @@ pub fn watch_with_config(
         })
     });
 
-    let mut debouncer = new_debouncer(debounce, move |result: DebounceEventResult| match result {
-        Ok(events) => {
-            // Drop skipped events before they're handed to the
-            // callback or counted in the log line. Empty post-filter
-            // batches (a pure-noise storm like `cargo build`'s
-            // `target/` churn) return without a callback invocation
-            // at all.
-            let paths = retain_unskipped(&config, events.into_iter().map(|e| e.path));
-            if paths.is_empty() {
-                return;
+    let mut debouncer = new_mutation_debouncer::<_, RecommendedWatcher>(
+        debounce,
+        move |result: DebounceEventResult| match result {
+            Ok(events) => {
+                // Drop skipped events before they're handed to the
+                // callback or counted in the log line. Empty post-filter
+                // batches (a pure-noise storm like `cargo build`'s
+                // `target/` churn) return without a callback invocation
+                // at all.
+                let paths = retain_unskipped(&config, events.into_iter().map(|e| e.path));
+                if paths.is_empty() {
+                    return;
+                }
+                tracing::info!(
+                    root = %dir_for_log.display(),
+                    changed = paths.len(),
+                    "watch: file change debounced"
+                );
+                on_change(&paths);
             }
-            tracing::info!(
-                root = %dir_for_log.display(),
-                changed = paths.len(),
-                "watch: file change debounced"
-            );
-            on_change(&paths);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "watch: error from notify");
-        }
-    })
+            Err(e) => {
+                tracing::warn!(error = %e, "watch: error from notify");
+            }
+        },
+    )
     .context("failed to construct file-system debouncer")?;
 
     debouncer
@@ -244,7 +306,273 @@ pub fn watch_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify_debouncer_mini::notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
+    };
+    use notify_debouncer_mini::notify::{Error as NotifyError, Result as NotifyResult};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    type ScriptStep = (Duration, NotifyResult<Event>);
+
+    fn scripted_events() -> &'static Mutex<Vec<ScriptStep>> {
+        static EVENTS: OnceLock<Mutex<Vec<ScriptStep>>> = OnceLock::new();
+        EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn scripted_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScriptedWatcher;
+
+    impl Watcher for ScriptedWatcher {
+        fn new<F: EventHandler>(mut event_handler: F, _config: NotifyConfig) -> NotifyResult<Self> {
+            let script = std::mem::take(&mut *scripted_events().lock().unwrap());
+            std::thread::spawn(move || {
+                for (delay, event) in script {
+                    std::thread::sleep(delay);
+                    event_handler.handle_event(event);
+                }
+            });
+            Ok(Self)
+        }
+
+        fn watch(&mut self, _path: &Path, _recursive_mode: RecursiveMode) -> NotifyResult<()> {
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _path: &Path) -> NotifyResult<()> {
+            Ok(())
+        }
+
+        fn kind() -> WatcherKind {
+            WatcherKind::NullWatcher
+        }
+    }
+
+    fn event(kind: EventKind, path: &str) -> Event {
+        Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    struct BoundedTestDrop<T: Send + 'static> {
+        owned: Option<T>,
+        deadline: Duration,
+        timeout_message: &'static str,
+    }
+
+    impl<T: Send + 'static> BoundedTestDrop<T> {
+        fn new(owned: T, deadline: Duration, timeout_message: &'static str) -> Self {
+            Self {
+                owned: Some(owned),
+                deadline,
+                timeout_message,
+            }
+        }
+
+        fn finish(mut self) {
+            self.stop();
+        }
+
+        fn stop(&mut self) {
+            let Some(owned) = self.owned.take() else {
+                return;
+            };
+            let (stopped_tx, stopped_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                drop(owned);
+                let _ = stopped_tx.send(());
+            });
+            let stopped = stopped_rx.recv_timeout(self.deadline);
+            if stopped.is_err() && !std::thread::panicking() {
+                panic!("{}", self.timeout_message);
+            }
+        }
+    }
+
+    impl<T: Send + 'static> Drop for BoundedTestDrop<T> {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    struct WatcherTestGuard {
+        owned: BoundedTestDrop<(WatchHandle, tempfile::TempDir)>,
+    }
+
+    impl WatcherTestGuard {
+        fn new(handle: WatchHandle, fixture: tempfile::TempDir) -> Self {
+            Self {
+                owned: BoundedTestDrop::new(
+                    (handle, fixture),
+                    Duration::from_secs(2),
+                    "watcher teardown exceeded two seconds",
+                ),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.owned.owned.as_ref().unwrap().1.path()
+        }
+
+        fn finish(self) {
+            self.owned.finish();
+        }
+    }
+
+    fn run_script(
+        script: Vec<ScriptStep>,
+        debounce: Duration,
+    ) -> (
+        mpsc::Receiver<DebounceEventResult>,
+        Debouncer<MutationWatcher<ScriptedWatcher>>,
+    ) {
+        *scripted_events().lock().unwrap() = script;
+        let (tx, rx) = mpsc::channel();
+        let debouncer = new_mutation_debouncer::<_, ScriptedWatcher>(debounce, tx).unwrap();
+        (rx, debouncer)
+    }
+
+    fn run_exact_script(
+        script: Vec<ScriptStep>,
+        debounce: Duration,
+    ) -> (
+        mpsc::Receiver<DebounceEventResult>,
+        Debouncer<MutationWatcher<ScriptedWatcher>>,
+    ) {
+        *scripted_events().lock().unwrap() = script;
+        let (tx, rx) = mpsc::channel();
+        let debouncer = new_debouncer_opt::<_, MutationWatcher<ScriptedWatcher>>(
+            DebounceConfig::default()
+                .with_timeout(debounce)
+                .with_batch_mode(false),
+            tx,
+        )
+        .unwrap();
+        (rx, debouncer)
+    }
+
+    #[test]
+    fn raw_access_events_never_enter_the_debouncer() {
+        let _guard = scripted_test_lock().lock().unwrap();
+        let access_kinds = [
+            AccessKind::Any,
+            AccessKind::Read,
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Open(AccessMode::Execute),
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Write),
+            AccessKind::Open(AccessMode::Other),
+            AccessKind::Close(AccessMode::Any),
+            AccessKind::Close(AccessMode::Execute),
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Close(AccessMode::Write),
+            AccessKind::Close(AccessMode::Other),
+            AccessKind::Other,
+        ];
+        let script = access_kinds
+            .into_iter()
+            .map(|kind| {
+                (
+                    Duration::ZERO,
+                    Ok(event(EventKind::Access(kind), "/source.rs")),
+                )
+            })
+            .collect();
+        let (rx, _debouncer) = run_script(script, Duration::from_millis(30));
+        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
+    }
+
+    #[test]
+    fn raw_mutations_unknown_events_and_errors_survive_the_debouncer() {
+        let _guard = scripted_test_lock().lock().unwrap();
+        let mutation_kinds = [
+            EventKind::Create(CreateKind::Any),
+            EventKind::Create(CreateKind::File),
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Create(CreateKind::Other),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Size)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Other)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Modify(ModifyKind::Other),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Remove(RemoveKind::Other),
+            EventKind::Any,
+            EventKind::Other,
+        ];
+        let mut script: Vec<_> = mutation_kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                (
+                    Duration::ZERO,
+                    Ok(event(kind, &format!("/source-{index}.rs"))),
+                )
+            })
+            .collect();
+        script.push((
+            Duration::ZERO,
+            Err(NotifyError::generic("raw watcher failure")),
+        ));
+        let expected = mutation_kinds.len();
+        let (rx, _debouncer) = run_script(script, Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut delivered = 0;
+        let mut saw_error = false;
+        while delivered < expected || !saw_error {
+            let result = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            match result {
+                Ok(events) => delivered += events.len(),
+                Err(error) => saw_error |= error.to_string().contains("raw watcher failure"),
+            }
+        }
+        assert_eq!(delivered, expected);
+        assert!(saw_error);
+    }
+
+    #[test]
+    fn access_storm_does_not_postpone_a_pending_mutation() {
+        let _guard = scripted_test_lock().lock().unwrap();
+        let debounce = Duration::from_millis(120);
+        let mut script = vec![(
+            Duration::ZERO,
+            Ok(event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                "/source.rs",
+            )),
+        )];
+        for _ in 0..5 {
+            script.push((
+                Duration::from_millis(30),
+                Ok(event(
+                    EventKind::Access(AccessKind::Open(AccessMode::Read)),
+                    "/source.rs",
+                )),
+            ));
+        }
+        let started = Instant::now();
+        let (rx, _debouncer) = run_exact_script(script, debounce);
+        let events = rx
+            .recv_timeout(Duration::from_millis(220))
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, PathBuf::from("/source.rs"));
+        assert!(started.elapsed() < Duration::from_millis(220));
+    }
 
     #[test]
     fn watch_rejects_non_directory() {
@@ -255,8 +583,43 @@ mod tests {
     #[test]
     fn watch_starts_and_drops_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let _handle = watch(dir.path(), None, Some(Duration::from_millis(100))).unwrap();
-        // Drop at end of scope tears it down without panicking.
+        let handle = watch(dir.path(), None, Some(Duration::from_millis(100))).unwrap();
+        WatcherTestGuard::new(handle, dir).finish();
+    }
+
+    #[test]
+    fn bounded_cleanup_preserves_the_original_test_body_panic() {
+        struct DelayedDrop {
+            dropped: mpsc::Sender<()>,
+        }
+
+        impl Drop for DelayedDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = self.dropped.send(());
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let panic = std::panic::catch_unwind(|| {
+            let _cleanup = BoundedTestDrop::new(
+                DelayedDrop {
+                    dropped: dropped_tx,
+                },
+                Duration::from_millis(1),
+                "secondary cleanup timeout",
+            );
+            panic!("original test-body failure");
+        })
+        .expect_err("test body must panic");
+
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"original test-body failure")
+        );
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup worker did not drop the owned value");
     }
 
     #[test]
@@ -268,14 +631,125 @@ mod tests {
         let cb: ChangeHandler = Arc::new(move |_paths: &[PathBuf]| {
             counter_for_cb.fetch_add(1, Ordering::SeqCst);
         });
-        let _handle = watch(dir.path(), Some(cb), Some(Duration::from_millis(100))).unwrap();
+        let handle = watch(dir.path(), Some(cb), Some(Duration::from_millis(100))).unwrap();
+        let watcher = WatcherTestGuard::new(handle, dir);
         sleep(Duration::from_millis(50)); // let watcher settle
-        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+        std::fs::write(watcher.path().join("a.txt"), "hi").unwrap();
         sleep(Duration::from_millis(400)); // debounce + buffer
         assert!(
             counter.load(Ordering::SeqCst) >= 1,
             "expected callback to fire at least once after file write"
         );
+        watcher.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_watcher_distinguishes_access_from_real_mutations() {
+        use std::fs::{self, OpenOptions};
+        use std::io::{Read, Write};
+
+        const DEBOUNCE: Duration = Duration::from_millis(100);
+        const CALLBACK_DEADLINE: Duration = Duration::from_secs(2);
+        const QUIET_WINDOW: Duration = Duration::from_millis(350);
+
+        fn receive_path(rx: &mpsc::Receiver<Vec<PathBuf>>, expected: &Path, operation: &str) {
+            let deadline = Instant::now() + CALLBACK_DEADLINE;
+            while Instant::now() < deadline {
+                let paths = rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{operation} produced no callback for {}",
+                            expected.display()
+                        )
+                    });
+                if paths.iter().any(|path| path == expected) {
+                    return;
+                }
+            }
+            panic!("{operation} never delivered {}", expected.display());
+        }
+
+        fn drain(rx: &mpsc::Receiver<Vec<PathBuf>>) {
+            const MAX_BATCHES: usize = 1024;
+            let deadline = Instant::now() + Duration::from_millis(100);
+            for _ in 0..MAX_BATCHES {
+                match rx.try_recv() {
+                    Ok(_) if Instant::now() < deadline => {}
+                    Ok(_) => panic!("watcher queue drain exceeded 100 ms"),
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+            panic!("watcher queue drain exceeded {MAX_BATCHES} batches");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.rs");
+        fs::write(&source, "initial").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let callback: ChangeHandler = Arc::new(move |paths| tx.send(paths.to_vec()).unwrap());
+        let handle = watch(dir.path(), Some(callback), Some(DEBOUNCE)).unwrap();
+        let watcher = WatcherTestGuard::new(handle, dir);
+
+        let mut contents = String::new();
+        fs::File::open(&source)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "initial");
+        assert!(
+            rx.recv_timeout(QUIET_WINDOW).is_err(),
+            "read/open triggered callback"
+        );
+
+        let writable = OpenOptions::new().write(true).open(&source).unwrap();
+        drop(writable);
+        assert!(
+            rx.recv_timeout(QUIET_WINDOW).is_err(),
+            "writable open without a write triggered callback"
+        );
+
+        fs::write(&source, "overwritten").unwrap();
+        receive_path(&rx, &source, "overwrite");
+        drain(&rx);
+
+        let mut truncated = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&source)
+            .unwrap();
+        truncated.write_all(b"short").unwrap();
+        truncated.sync_all().unwrap();
+        drop(truncated);
+        receive_path(&rx, &source, "truncate");
+        drain(&rx);
+
+        let renamed = watcher.path().join("renamed.rs");
+        fs::rename(&source, &renamed).unwrap();
+        let deadline = Instant::now() + CALLBACK_DEADLINE;
+        let mut saw_rename_endpoint = false;
+        while Instant::now() < deadline && !saw_rename_endpoint {
+            let paths = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("rename produced no callback");
+            saw_rename_endpoint = paths.iter().any(|path| path == &source || path == &renamed);
+        }
+        assert!(saw_rename_endpoint, "rename delivered neither endpoint");
+        drain(&rx);
+
+        fs::write(&source, "replace me").unwrap();
+        receive_path(&rx, &source, "recreate before atomic save");
+        drain(&rx);
+        let temporary = watcher.path().join("source.tmp");
+        fs::write(&temporary, "atomic replacement").unwrap();
+        fs::rename(&temporary, &source).unwrap();
+        receive_path(&rx, &source, "atomic replacement");
+        drain(&rx);
+
+        fs::remove_file(&source).unwrap();
+        receive_path(&rx, &source, "delete");
+        watcher.finish();
     }
 
     // ── skip-pattern coverage ───────────────────────────────────────
