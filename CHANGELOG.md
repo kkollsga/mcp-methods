@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.10 — 2026-09-14
 
 ### Fixed — read-only filesystem access no longer reports a source change
 
