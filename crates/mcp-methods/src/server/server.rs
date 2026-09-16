@@ -2777,7 +2777,7 @@ impl ServerHandler for McpServer {
         Some(budgeted_tool(tool))
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> InitializeResult {
         let name = self
             .options
             .name
@@ -2807,7 +2807,7 @@ impl ServerHandler for McpServer {
             prompts.list_changed = Some(true);
             caps.prompts = Some(prompts);
         }
-        let mut info = ServerInfo::new(caps)
+        let mut info = InitializeResult::new(caps)
             .with_server_info(Implementation::new(name, env!("CARGO_PKG_VERSION")))
             .with_protocol_version(ProtocolVersion::V_2024_11_05);
         if let Some(text) = &self.options.instructions {

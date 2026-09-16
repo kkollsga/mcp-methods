@@ -93,6 +93,14 @@ target and whose declared targets are all absent is now dropped from
 naming the targets. A skill that declares no targets at all is unchanged: it
 stays advertised and servable and injects nowhere.
 
+### Fixed — builds cleanly against rmcp 3.4
+
+rmcp 3.4.0 (2026-09-15) deprecated the `ServerInfo` alias in favour of
+`ServerConfig`, and this crate's `-D warnings` CI turned the two uses in
+`get_info` into errors, which held the first 0.4.11 publish. Both now name
+the underlying `InitializeResult`, which is unchanged and undeprecated across
+the declared 3.1.1 floor and 3.4.0; the floor itself does not move.
+
 ### Source compatibility
 
 Semver-relevant, shipped as a patch per this repo's policy: `SkillProvenance`
