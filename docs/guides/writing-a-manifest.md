@@ -95,6 +95,23 @@ workspace:
                                        # MCP client's advertised root when no
                                        # root is configured (default: false)
 
+# Skills — operator-authored methodology surfaced as MCP prompts. Omit the
+# field (or `skills: false`) for a deployment with no prompts surface.
+skills:
+  - true                              # compile-time bundled skills
+  - ./my_mcp.skills/                  # a directory of SKILL.md files
+  - name: house_style                 # an inline skill — no file, body in the YAML
+    description: How this deployment names and cites things.
+    body: |
+      # House style
+
+      Cite by paragraph, never by page.
+    references_tools:                 # optional
+      - cypher_query
+    delivery: lazy                    # optional; "eager" | "lazy"
+    applies_when:                     # optional; same predicates as a SKILL.md
+      graph_has_node_type: [Case]
+
 # Opaque passthrough — downstream-binary-specific config. The framework
 # validates only the top-level "extensions:" key and stores whatever is
 # under it verbatim. Use this for kglite-specific or your-binary-specific
@@ -181,6 +198,35 @@ When set, this wins over the CLI `--workspace` flag.
 - `kind: github` — declares that the workspace, once bound, is the clone-and-track flow. **It does not create one.** Unlike `kind: local`, the reference `mcp-server` binary does not turn this block into a workspace: the clone directory comes from `--workspace DIR` and nothing else, so a manifest declaring `kind: github` booted without that flag binds no workspace at all — `repo_management` is not registered, and the block's only effect is the validation below (the binary warns at boot when it finds this combination). What the key drives when a workspace *is* bound: `repo_management` stays registered (it is dropped for `kind: local`, which gets `set_root_dir` instead), and the bundled `repo_management` skill's `applies_when: tool_registered:` gate follows that registration. `root:` is accepted and ignored (the active source root is the clone, not a path you pick). `watch:`, `sandbox_root:` and `adopt_client_roots:` are **rejected at boot**, not ignored — each is a `local`-only key and setting it under `kind: github` is a manifest error.
 - `kind: local` — bind a fixed local directory. `root:` is required (path to bind) unless `adopt_client_roots: true` is set. `watch: true` enables the filesystem watcher (calls the post-activate hook on changes) and requires `root:`. `sandbox_root:` (optional) bounds the runtime `set_root_dir` swap to a subtree — see [Watch & Workspace](watch-and-workspace.md#bounding-the-swap-sandbox_root). Omitted, swaps stay unbounded, which is the default. `adopt_client_roots: true` (optional) lets the server take its root from the MCP client when the operator configured none — fallback-only, and built on an [upstream-deprecated](watch-and-workspace.md#adopting-the-clients-root-adopt_client_roots) MCP feature.
 
+### `skills:`
+
+`false` (or omitted) disables the prompts surface entirely. Otherwise the value is a source or a list of sources, each one of:
+
+| Entry | Meaning |
+|---|---|
+| `true` | The compile-time bundled skills — the framework's, plus any the downstream binary added. Also switches on runtime layers supplied via `Registry::add_layer`. |
+| a path string | A directory of `*.md` skill files, resolved like `source_root:` (`./x`, `~/x`, `/x`). |
+| a mapping | An **inline skill**: the body lives in the manifest instead of a file. |
+
+An inline skill takes `name`, `description` and `body` (all required, all non-empty), plus optional `references_tools`, `delivery` (`eager` or `lazy`) and `applies_when`. The keys mean exactly what the same-named SKILL.md frontmatter keys mean, and `body` is the markdown that would follow the closing `---`:
+
+```yaml
+skills:
+  - true
+  - name: house_style
+    description: How this deployment names and cites things.
+    body: |
+      # House style
+
+      Cite by paragraph, never by page. The corpus has no stable pagination.
+```
+
+Inline entries are collected into one layer between the runtime-supplied layer and the operator's declared directories, so **where an entry sits in the list never changes what it overrides**. A same-named file in a declared directory (or in the auto-detected `<basename>.skills/`) still wins, which is how an operator overrides an inline skill without editing the manifest.
+
+`delivery:` picks the injection tier and **defaults to `lazy`**: the tools this skill targets carry its description plus a `skill("<name>")` pointer, and the body travels only when the agent calls that tool. Set `eager` to embed the whole body in every target tool's description instead — worth it only when the body shapes the *first* call's parameters. A value that is neither is a manifest error, so a typo fails at boot rather than at the point it starts to matter.
+
+For the layering rules and authoring guidance see [Skills-Aware Manifests](skills-aware-manifests.md) and [Authoring Skills](authoring-skills.md).
+
 ### `extensions:`
 
 Anything under `extensions:` is opaque to the framework — validated only at the top level. Downstream binaries (kglite, your own) parse this block according to their own schema. Use it for domain-specific config that isn't part of the framework's surface.
@@ -190,7 +236,7 @@ Anything under `extensions:` is opaque to the framework — validated only at th
 The framework rejects:
 
 - Unknown top-level keys (`extensions:` is special — see above)
-- Unknown keys under `trust:`, `builtins:`, `workspace:`, `embedder:`, `tools[]` entries
+- Unknown keys under `trust:`, `builtins:`, `workspace:`, `embedder:`, `tools[]` entries, and inline `skills[]` mappings
 - Wrong types (e.g. `trust.allow_python_tools: "yes"` instead of `true`)
 - Both `source_root` and `source_roots` set
 - Non-existent paths under `workspace.root:` (local mode)

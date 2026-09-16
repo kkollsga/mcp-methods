@@ -68,7 +68,7 @@ The wheel also ships `mcp_methods.fastmcp` — a thin layer for building FastMCP
 
 ## Skills
 
-`SkillRegistry` and `Skill` are pyo3 wrappers around the Rust skills loader. The common path is `SkillRegistry.from_manifest(path)` — it loads a manifest, walks the three-layer composition, and returns a resolved set ready to register as MCP prompts.
+`SkillRegistry` and `Skill` are pyo3 wrappers around the Rust skills loader. The common path is `SkillRegistry.from_manifest(path)` — it loads a manifest, walks the layer composition, and returns a resolved set ready to register as MCP prompts.
 
 ```python
 from mcp_methods import SkillRegistry
@@ -83,7 +83,7 @@ register_skills_as_prompts(app, registry)  # wires every skill as a @app.prompt
 
 `SkillRegistry.from_manifest(path, include_bundled=True)` — pass `include_bundled=False` to skip framework defaults (useful in tests or when a downstream binary supplies its own bundled layer). `SkillRegistry.find_sibling(graph_path)` returns the `<stem>_mcp.yaml` next to a graph/data file, matching the convention `mcp-server` uses for auto-detection.
 
-For background on how the registry composes layers and what the frontmatter looks like, see [Authoring Skills](authoring-skills.md) and [Three-Layer Composition](../explanation/three-layer-composition.md).
+For background on how the registry composes layers and what the frontmatter looks like, see [Authoring Skills](authoring-skills.md) and [Skill Layer Composition](../explanation/three-layer-composition.md).
 
 ## Calling from a downstream Python project
 

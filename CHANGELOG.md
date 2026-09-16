@@ -1,5 +1,111 @@
 # Changelog
 
+## 0.4.11 — 2026-09-16
+
+### Changed — skills are delivered lazily by default; agents fetch bodies with `skill(name)`
+
+Until now the injection pass copied every active skill's full body into the
+description of its name-match tool and of every tool it listed in
+`references_tools`, at `tools/list` time, before any tool was used. A plain
+domain deployment paid roughly 15–22 KB of description text up front and a
+code-graph deployment with recipes roughly 60 KB, with one methodology skill
+duplicated into five tools. Clients that fetch tool definitions lazily
+amortised that per tool; clients that load the whole list paid it for tools
+the agent might never touch, and nothing re-surfaced after context compaction
+because clients do not expose `prompts/get` to the model. Reported with
+measurements by kglite (2026-09-16).
+
+Skills now carry a `delivery:` frontmatter key, `eager` or `lazy`, and **the
+default is `lazy`**. A lazy skill injects only its routing text — the
+`## When to use` block plus one line pointing at `skill("<name>")` — and no
+body. A new framework tool, `skill`, registered whenever skills are on,
+returns the body on demand; unknown or inactive names are refused with
+`isError: true` and the list of active skills. The first call in a session to
+a tool that advertises a lazy skill the agent has not fetched appends one
+footer line naming the skill; it is silent once fetched and stays silent
+for as long as the session keeps making tool calls, while a session with no
+tool call for ten minutes starts empty. The footer is composed ahead of a
+downstream `with_result_postprocess` hook so consumer footers still ride on
+the composed body. The `skill` tool is exempt from the response budget, so a
+body is always returned whole; the exemption is bounded because a skill body
+is capped at 16 KB at load, and it covers only the framework-owned loader. `eager` keeps the previous
+behaviour exactly, for skills that must shape the very first call's
+parameters. The five bundled framework skills declare `delivery: lazy`
+explicitly.
+
+This is a behaviour change for every existing deployment: tool descriptions
+shrink, a `skill` tool appears in `tools/list`, and agents are expected to
+fetch methodology before first use. Operators who want the old shape set
+`delivery: eager` per skill. The pointer-only delivery this crate abandoned
+in 0.3.37 failed because there was no tool an agent could call to fetch the
+body; the `skill` tool is what makes the lazy tier viable now. If a
+downstream binary already registers a tool named `skill`, the framework does
+not overwrite it and delivers every lazy skill eagerly with a warning.
+
+### Added — owned-body and inline skill layers
+
+`Registry::add_layer(skills, provenance)` accepts skills whose bodies are
+owned `String`s built at runtime — a graph that carries its own usage skills,
+for instance — with a caller-supplied provenance label
+(`SkillProvenance::Owned(label)`). Entries are validated like every other
+layer; a malformed, name-mismatched or oversized entry becomes a
+`ParseWarning` and the rest of the layer loads. The manifest's `skills:` list
+also accepts mapping entries (`name`, `description`, `body`,
+`references_tools`, `delivery`, `applies_when`) as inline skills
+(`SkillSource::Inline`, `SkillProvenance::Inline`). The resolved order, one
+skill per name, higher wins, is now
+`bundled < owned < inline < declared dirs < <basename>.skills/`; an inline
+entry's position in the list does not affect its precedence. Owned entries,
+like bundled ones, surface only when the `skills:` list contains `true`;
+inline entries are operator-declared and surface whenever the list is walked.
+
+### Added — rebuilding the skill layer while serving
+
+`McpServer::reinject_skills(&registry)` strips every injected skill block from
+every tool description, removes the previous skill prompt routes and re-runs
+the injection pass against a new `ResolvedRegistry`, so a downstream that
+swaps its graph at runtime can swap its skills with it. A `SkillReloader`
+handle, taken before `serve` and captured into a tool closure, is the
+intended way to reach it from a handler; `notify_skills_changed(&peer)` sends
+the `tools/list_changed` and `prompts/list_changed` notifications, and the
+server now advertises `list_changed` for tools and, when prompts are
+advertised, for prompts. Skills an agent already fetched stay fetched across
+a rebuild unless their body changed. A rebuild from inside a
+`result_postprocess` hook is refused by name rather than deadlocking; the
+guard is per-thread, so a hook that spawns a thread to re-enter is
+unprotected and remains forbidden. A server that boots with zero skills
+cannot begin advertising the prompts capability mid-session; routes added
+later are served but the capability stays absent until the next
+`initialize`.
+
+`serve_prompts` returns the active set (`Vec<ActiveSkill>`: name,
+description, tier, provenance) and `McpServer::active_skills()` exposes it
+for downstream indexes such as a bare `graph_overview()`; the `mcp-server`
+binary's `skills-list` shows the tier as a column.
+
+### Fixed — skills whose target tools are all unregistered no longer appear in `prompts/list`
+
+The injection pass registered a skill's prompt route before it looked up the
+tools the skill targets, so a skill that named only unregistered tools
+injected nowhere yet stayed advertised. A skill that declares at least one
+target and whose declared targets are all absent is now dropped from
+`prompts/list`, from `skill()` and from the active set, with an info log
+naming the targets. A skill that declares no targets at all is unchanged: it
+stays advertised and servable and injects nowhere.
+
+### Source compatibility
+
+Semver-relevant, shipped as a patch per this repo's policy: `SkillProvenance`
+gained `Owned(String)` and `Inline` and is not `#[non_exhaustive]`, so an
+exhaustive downstream `match` needs new arms; `SkillFrontmatter.delivery`
+is a typed `Delivery`; `serve_prompts` returns `Vec<ActiveSkill>` instead of
+`()`; `McpServer::active_skills()` returns an owned `Vec`;
+`tool_router_mut()` / `prompt_router_mut()` return guard types that deref to
+the rmcp routers, so call sites that bind them to an explicitly typed
+`&mut ToolRouter<_>` need the deref spelled out. `SkillSource` gained
+`Inline(InlineSkill)`. The Python `Skill` view does not yet expose
+`delivery`; that parity is a recorded follow-up.
+
 ## 0.4.10 — 2026-09-14
 
 ### Fixed — read-only filesystem access no longer reports a source change

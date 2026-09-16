@@ -83,7 +83,7 @@ The manifest `workspace:` block wins over CLI `--workspace` flag.
 
 ## `skills:` polymorphic value
 
-Opts a deployment into shipping operator-authored methodology as MCP prompts. Three-layer composition: **project layer** (auto-detected `<basename>.skills/` directory adjacent to the manifest) → **domain pack(s)** (operator-declared paths) → **bundled defaults** (framework + downstream binary's compile-time skills). Higher layers fully replace same-named entries in lower layers (no merging).
+Opts a deployment into shipping operator-authored methodology as MCP prompts. Layer composition: **project layer** (auto-detected `<basename>.skills/` directory adjacent to the manifest) → **domain pack(s)** (operator-declared paths) → **manifest-inline** (mapping entries in this list) → **owned** (bodies the host binary supplies at runtime via `Registry::add_layer`) → **bundled defaults** (framework + downstream binary's compile-time skills). Higher layers fully replace same-named entries in lower layers (no merging).
 
 Accepted shapes:
 
@@ -91,19 +91,38 @@ Accepted shapes:
 skills: false           # default — feature disabled, no prompts surface
 skills: true            # bundled framework defaults only
 skills: ./my-skills/    # one operator-declared directory
-skills:                 # mixed: bundled + domain pack(s)
+skills:                 # mixed: bundled + domain pack(s) + inline
   - true
   - ./my-skills/
   - ~/shared-mcp-skills/
+  - name: house_style
+    description: How this deployment names and cites things.
+    body: |
+      # House style
+
+      Cite by paragraph, never by page.
 ```
 
 Paths resolve relative to the manifest YAML (or against `$HOME` when prefixed with `~/`). The auto-detected project layer is *always* probed when `skills:` is any non-`false` value — operators don't list it explicitly.
 
-Each SKILL.md file under a declared directory ships YAML frontmatter (`name`, `description`, optional `applies_to`/`references_tools`/`auto_inject_hint`) plus a markdown body. The framework enforces 4 KB soft / 16 KB hard size caps per skill and 64 KB total per resolved set.
+A mapping entry is an **inline skill**. Keys:
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `name` | string | yes | The `prompts/get` lookup key; matched against the tool catalogue for description injection. |
+| `description` | string | yes | One-line summary shown in `prompts/list`. |
+| `body` | string | yes | The markdown that would follow a SKILL.md's closing `---`. |
+| `references_tools` | list&lt;string&gt; | no | Extra tools this skill teaches, beyond the name match. |
+| `delivery` | string | no | `eager` or `lazy`. Injection tier; **omitted means `lazy`**. |
+| `applies_when` | mapping | no | The same predicate block a SKILL.md carries. |
+
+Unknown keys inside the mapping are a manifest error. Inline entries form one layer wherever they appear in the list — position never changes precedence.
+
+Each SKILL.md file under a declared directory ships YAML frontmatter (`name`, `description`, optional `applies_to`/`references_tools`/`auto_inject_hint`/`delivery`) plus a markdown body. The framework enforces 4 KB soft / 16 KB hard size caps per skill and warns past 64 KB total per resolved set — counted over every resolved skill, both delivery tiers, because a lazy body is one `skill(name)` call away.
 
 A no-`skills:` deployment is a verbatim-current deploy: no `prompts/*` capability advertised in MCP `initialize`, no behavioural diff against pre-0.3.35.
 
-See [Authoring Skills](../guides/authoring-skills.md) for the walkthrough and [Three-Layer Composition](../explanation/three-layer-composition.md) for the design rationale.
+See [Authoring Skills](../guides/authoring-skills.md) for the walkthrough and [Skill Layer Composition](../explanation/three-layer-composition.md) for the design rationale.
 
 ### `applies_when:` predicate gating (per-skill, 0.3.36+)
 

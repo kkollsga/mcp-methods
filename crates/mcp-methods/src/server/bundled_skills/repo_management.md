@@ -14,6 +14,7 @@ references_arguments:
   - repo_management.expire_days
   - repo_management.revs
 auto_inject_hint: true
+delivery: lazy
 ---
 
 # `repo_management` methodology

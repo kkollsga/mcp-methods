@@ -177,9 +177,9 @@ enum Command {
         /// Directory containing SKILL.md files.
         path: PathBuf,
     },
-    /// List resolved skills for a manifest. Three-layer composition
-    /// (project → domain-pack → bundled) is applied; output shows
-    /// which layer each skill came from.
+    /// List resolved skills for a manifest. Full layer composition
+    /// (project → domain-pack → inline → owned → bundled) is applied;
+    /// output shows which layer each skill came from.
     SkillsList {
         /// Manifest YAML path.
         #[arg(long = "mcp-config")]
@@ -499,7 +499,7 @@ fn watch_or_warn(dir: Option<&Path>) -> (Option<mcp_methods::server::WatchHandle
 }
 
 /// What the skills layer contributed at boot, for the boot summary.
-/// `resolved` counts every skill the three-layer composition produced;
+/// `resolved` counts every skill the layer composition produced;
 /// `registered` counts the ones that survived their `applies_when:`
 /// predicates and became prompt routes. The difference is the number
 /// suppressed at this deployment's runtime state.
@@ -547,8 +547,9 @@ fn wire_skills(
     // Per-file parse failures are already logged by the loader; the
     // count is what the boot summary needs.
     let resolved = registry.len();
-    serve_prompts(&registry, server);
-    let registered = server.prompt_router_mut().list_all().len();
+    // `serve_prompts` already computed the post-activation set; the
+    // summary counts that rather than re-deriving it from the router.
+    let registered = serve_prompts(&registry, server).len();
     Ok(Some(SkillsSummary {
         resolved,
         registered,

@@ -9,6 +9,7 @@ references_arguments:
   - list_source.path
   - list_source.depth
 auto_inject_hint: true
+delivery: lazy
 ---
 
 # `list_source` methodology

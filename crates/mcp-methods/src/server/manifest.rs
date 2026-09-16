@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::skills::AppliesWhen;
+
 const ALLOWED_TOP_KEYS: &[&str] = &[
     "name",
     "instructions",
@@ -73,6 +75,15 @@ const ALLOWED_EMBEDDER_KEYS: &[&str] = &["module", "class", "kwargs"];
 const ALLOWED_BUILTIN_KEYS: &[&str] =
     &["save_graph", "temp_cleanup", "github", "screen_stargazers"];
 const VALID_TEMP_CLEANUP: &[&str] = &["never", "on_overview"];
+const ALLOWED_INLINE_SKILL_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "body",
+    "references_tools",
+    "delivery",
+    "applies_when",
+];
+const VALID_SKILL_DELIVERY: &[&str] = &["eager", "lazy"];
 
 #[derive(Debug, Error)]
 #[error("{path}: {message}")]
@@ -404,14 +415,20 @@ pub enum AppliesTo {
     Patterns(Vec<String>),
 }
 
-/// One source of skills declared by the manifest. Either the magic
-/// "library bundled" token (rendered as the YAML boolean `true`), or
-/// a filesystem path resolved against the manifest's parent dir.
+/// One source of skills declared by the manifest: the magic "library
+/// bundled" token (rendered as the YAML boolean `true`), a filesystem
+/// path resolved against the manifest's parent dir, or a mapping that
+/// spells a whole skill out inside the YAML.
 ///
 /// Path conventions match the rest of the manifest:
 /// - `./foo` or `foo` — relative to the manifest's parent dir
 /// - `~/foo` — home-relative (POSIX `$HOME` expansion)
 /// - `/foo` — absolute
+// `Inline` is much larger than the other two variants, so a list of
+// paths pays inline-sized slots. A `skills:` list is a handful of
+// operator-typed entries parsed once at boot — boxing would buy back
+// bytes that are never counted and cost every consumer a deref.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
     /// The compile-time bundled skills shipped with `mcp-methods` plus
@@ -423,6 +440,56 @@ pub enum SkillSource {
     /// time — `SkillSource::Path` stores the raw operator-declared
     /// string for round-tripping through `Manifest::to_json()`.
     Path(String),
+    /// A skill written out in the manifest itself — a mapping entry in
+    /// the `skills:` list. Every inline entry in the list, wherever it
+    /// appears, joins one fixed layer between the runtime-supplied
+    /// owned layer and the operator's declared directories; list
+    /// position never changes precedence.
+    Inline(InlineSkill),
+}
+
+/// A skill spelled out inside the manifest's `skills:` list, as a
+/// mapping entry. The fields are the SKILL.md frontmatter keys that
+/// make sense without a file, plus the markdown body that would
+/// follow the closing `---`.
+///
+/// The registry renders each entry back into SKILL.md text and runs it
+/// through [`crate::server::skills::parse_skill`], so an inline skill
+/// is subject to exactly the same validation and size limits as one
+/// read off disk — including the [hard size
+/// limit](crate::server::skills::HARD_SIZE_LIMIT_BYTES), which a too-
+/// long `body` trips as a parse warning rather than a boot failure.
+///
+/// Unknown keys inside the mapping are a manifest error, matching
+/// `builtins:`, `workspace:` and the rest of the manifest surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineSkill {
+    /// Skill name — the `prompts/get` lookup key and the name matched
+    /// against the tool catalogue for description injection. Required.
+    pub name: String,
+    /// One-line description shown in `prompts/list`. Required, because
+    /// [`crate::server::skills::parse_skill`] rejects a skill without
+    /// one.
+    pub description: String,
+    /// The markdown body — everything that would follow the closing
+    /// `---` in a SKILL.md file. Required; an inline entry with no
+    /// body teaches nothing.
+    pub body: String,
+    /// Tools this skill teaches, beyond the one whose name matches
+    /// `name`. Same meaning as the SKILL.md `references_tools:` key.
+    pub references_tools: Vec<String>,
+    /// The `delivery:` frontmatter key, stored verbatim.
+    ///
+    /// Validated here as `eager` or `lazy` so a typo fails at manifest
+    /// load rather than at boot, and carried into the rendered
+    /// frontmatter, where it parses into
+    /// [`Delivery`](crate::server::skills::Delivery) and selects the
+    /// injection tier. `None` leaves the frontmatter key out, which
+    /// means the default — `lazy`.
+    pub delivery: Option<String>,
+    /// The `applies_when:` predicate block, same shape and semantics
+    /// as in a SKILL.md file. `None` means "always active".
+    pub applies_when: Option<AppliesWhen>,
 }
 
 /// The parsed value of the `skills:` field in the manifest.
@@ -484,7 +551,7 @@ pub struct Manifest {
     /// loading + composition; the framework then exposes the
     /// resulting skill set via `prompts/list` and `prompts/get`.
     ///
-    /// Three-layer composition: the operator-declared sources here
+    /// Layer composition: the operator-declared sources here
     /// form the root layer; the project-local `<basename>.skills/`
     /// directory (auto-detected) preempts them. See
     /// `dev-documentation/skills-aware-mcp.md` for the full design.
@@ -576,6 +643,11 @@ impl Manifest {
     /// in their feedback. The two surfaces are intentionally
     /// distinct: this method describes the manifest, the
     /// registry method describes the runtime resolution.
+    ///
+    /// Each entry keeps the operator's form: `true` for the bundled
+    /// marker, the raw string for a path, and a mapping with all six
+    /// [`InlineSkill`] fields for an inline skill (absent optional
+    /// keys emit `null` / `[]`, so the shape is fixed).
     fn skills_to_json(&self) -> serde_json::Value {
         match &self.skills {
             SkillsSource::Disabled => serde_json::Value::Bool(false),
@@ -585,6 +657,14 @@ impl Manifest {
                     .map(|s| match s {
                         SkillSource::Bundled => serde_json::Value::Bool(true),
                         SkillSource::Path(p) => serde_json::Value::String(p.clone()),
+                        SkillSource::Inline(i) => serde_json::json!({
+                            "name": i.name,
+                            "description": i.description,
+                            "body": i.body,
+                            "references_tools": i.references_tools,
+                            "delivery": i.delivery,
+                            "applies_when": i.applies_when,
+                        }),
                     })
                     .collect();
                 serde_json::Value::Array(arr)
@@ -828,11 +908,13 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
 ///   `skills: [true]`.
 /// - **`skills: <path-string>`** → single path source. Sugar for
 ///   `skills: [<path>]`.
-/// - **`skills: [bool, string, ...]`** → ordered list. Booleans MUST
-///   be `true` (the bundled marker); `false` is rejected at parse
-///   time as nonsense in list context. Each path is stored verbatim
-///   as the operator wrote it; resolution against the manifest's
-///   parent dir happens at registry-build time, not here.
+/// - **`skills: [bool, string, mapping, ...]`** → ordered list.
+///   Booleans MUST be `true` (the bundled marker); `false` is rejected
+///   at parse time as nonsense in list context. Each path is stored
+///   verbatim as the operator wrote it; resolution against the
+///   manifest's parent dir happens at registry-build time, not here.
+///   Each mapping is an [`InlineSkill`] — a whole skill written out in
+///   the YAML; see [`build_inline_skill`] for the accepted keys.
 ///
 /// Empty lists are accepted and parsed as `SkillsSource::Sources(vec![])`;
 /// the registry treats them as "skills opted in but no root layer,"
@@ -881,12 +963,17 @@ fn build_skills(
                         }
                         sources.push(SkillSource::Path(s.clone()));
                     }
+                    Value::Mapping(map) => {
+                        sources.push(SkillSource::Inline(build_inline_skill(
+                            map, idx, yaml_path,
+                        )?));
+                    }
                     _ => {
                         return Err(ManifestError::at(
                             yaml_path,
                             format!(
-                                "skills[{idx}]: each entry must be `true` (for bundled) or a \
-                                 path string"
+                                "skills[{idx}]: each entry must be `true` (for bundled), a \
+                                 path string, or a mapping declaring an inline skill"
                             ),
                         ));
                     }
@@ -897,9 +984,118 @@ fn build_skills(
         Some(_) => Err(ManifestError::at(
             yaml_path,
             "skills must be `false`, `true`, a path string, or a list of \
-             (true | path string) entries",
+             (true | path string | inline skill mapping) entries",
         )),
     }
+}
+
+/// Parse one mapping entry of the `skills:` list into an
+/// [`InlineSkill`].
+///
+/// Accepted keys — [`ALLOWED_INLINE_SKILL_KEYS`], anything else is an
+/// error the way an unknown `workspace:` or `builtins:` key is:
+///
+/// - `name` (required, non-empty string)
+/// - `description` (required, non-empty string — `parse_skill` rejects
+///   a skill without one, so accepting it here would only move the
+///   failure to boot)
+/// - `body` (required, non-empty string — the markdown after the
+///   frontmatter)
+/// - `references_tools` (optional list of strings)
+/// - `delivery` (optional, one of [`VALID_SKILL_DELIVERY`]) — the
+///   injection tier; see [`InlineSkill::delivery`]
+/// - `applies_when` (optional mapping, the SKILL.md predicate block;
+///   its own unknown keys are rejected by `AppliesWhen`'s
+///   `deny_unknown_fields`)
+fn build_inline_skill(
+    map: &serde_yaml::Mapping,
+    idx: usize,
+    yaml_path: &Path,
+) -> Result<InlineSkill, ManifestError> {
+    check_keys(
+        map,
+        ALLOWED_INLINE_SKILL_KEYS,
+        &format!("skills[{idx}] keys"),
+        yaml_path,
+    )?;
+
+    let required_str = |key: &str| -> Result<String, ManifestError> {
+        match map.get(key) {
+            Some(serde_yaml::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+            _ => Err(ManifestError::at(
+                yaml_path,
+                format!("skills[{idx}]: inline skill `{key}` must be a non-empty string"),
+            )),
+        }
+    };
+    let name = required_str("name")?;
+    let description = required_str("description")?;
+    let body = required_str("body")?;
+
+    let references_tools = match map.get("references_tools") {
+        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            let mut tools = Vec::with_capacity(seq.len());
+            for item in seq {
+                match item {
+                    serde_yaml::Value::String(s) if !s.is_empty() => tools.push(s.clone()),
+                    _ => {
+                        return Err(ManifestError::at(
+                            yaml_path,
+                            format!(
+                                "skills[{idx}]: inline skill `references_tools` entries must \
+                                 be non-empty strings"
+                            ),
+                        ))
+                    }
+                }
+            }
+            tools
+        }
+        Some(_) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!("skills[{idx}]: inline skill `references_tools` must be a list of strings"),
+            ))
+        }
+    };
+
+    let delivery = match map.get("delivery") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) if VALID_SKILL_DELIVERY.contains(&s.as_str()) => {
+            Some(s.clone())
+        }
+        Some(other) => {
+            return Err(ManifestError::at(
+                yaml_path,
+                format!(
+                    "skills[{idx}]: inline skill `delivery` must be one of \
+                     {VALID_SKILL_DELIVERY:?}, got {other:?}"
+                ),
+            ))
+        }
+    };
+
+    let applies_when = match map.get("applies_when") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(value) => Some(
+            serde_yaml::from_value::<AppliesWhen>(value.clone()).map_err(|e| {
+                ManifestError::at(
+                    yaml_path,
+                    format!("skills[{idx}]: inline skill `applies_when` is invalid: {e}"),
+                )
+            })?,
+        ),
+    };
+
+    Ok(InlineSkill {
+        name,
+        description,
+        body,
+        references_tools,
+        delivery,
+        applies_when,
+    })
 }
 
 fn build_extensions(
@@ -2749,6 +2945,202 @@ extensions:
         let err = load(f.path()).unwrap_err();
         assert!(
             err.message.contains("non-empty string"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    // ─── Inline skills (`skills:` mapping entries) ────────────────
+
+    /// A `skills:` list with one inline mapping carrying every
+    /// accepted key, plus a `true` marker and a path around it.
+    const INLINE_MANIFEST: &str = r#"
+name: x
+skills:
+  - true
+  - name: cypher_recipes
+    description: "House recipes: start here."
+    body: |
+      # Recipes
+
+      Always project explicit columns.
+    references_tools:
+      - cypher_query
+      - graph_overview
+    delivery: lazy
+    applies_when:
+      graph_has_node_type: [Function]
+  - ./local-overrides/
+"#;
+
+    fn only_inline(m: &Manifest) -> &InlineSkill {
+        match &m.skills {
+            SkillsSource::Sources(sources) => sources
+                .iter()
+                .find_map(|s| match s {
+                    SkillSource::Inline(i) => Some(i),
+                    _ => None,
+                })
+                .expect("an inline entry"),
+            other => panic!("expected sources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_inline_mapping_parses_every_field() {
+        let f = write_tmp(INLINE_MANIFEST);
+        let m = load(f.path()).unwrap();
+        let inline = only_inline(&m);
+        assert_eq!(inline.name, "cypher_recipes");
+        assert_eq!(inline.description, "House recipes: start here.");
+        assert_eq!(
+            inline.body,
+            "# Recipes\n\nAlways project explicit columns.\n"
+        );
+        assert_eq!(inline.references_tools, ["cypher_query", "graph_overview"]);
+        assert_eq!(inline.delivery.as_deref(), Some("lazy"));
+        assert_eq!(
+            inline.applies_when,
+            Some(AppliesWhen {
+                graph_has_node_type: Some(vec!["Function".to_string()]),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn skills_inline_coexists_with_true_and_path_entries() {
+        let f = write_tmp(INLINE_MANIFEST);
+        let m = load(f.path()).unwrap();
+        let SkillsSource::Sources(sources) = &m.skills else {
+            panic!("expected sources");
+        };
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0], SkillSource::Bundled);
+        assert!(matches!(sources[1], SkillSource::Inline(_)));
+        assert_eq!(sources[2], SkillSource::Path("./local-overrides/".into()));
+    }
+
+    #[test]
+    fn skills_inline_round_trips_through_to_json() {
+        let f = write_tmp(INLINE_MANIFEST);
+        let m = load(f.path()).unwrap();
+        assert_eq!(
+            m.to_json()["skills"],
+            serde_json::json!([
+                true,
+                {
+                    "name": "cypher_recipes",
+                    "description": "House recipes: start here.",
+                    "body": "# Recipes\n\nAlways project explicit columns.\n",
+                    "references_tools": ["cypher_query", "graph_overview"],
+                    "delivery": "lazy",
+                    "applies_when": { "graph_has_node_type": ["Function"] },
+                },
+                "./local-overrides/",
+            ])
+        );
+    }
+
+    #[test]
+    fn skills_inline_optional_keys_default_and_still_round_trip() {
+        let f = write_tmp("name: x\nskills:\n  - name: n\n    description: d\n    body: b\n");
+        let m = load(f.path()).unwrap();
+        let inline = only_inline(&m);
+        assert!(inline.references_tools.is_empty());
+        assert_eq!(inline.delivery, None);
+        assert_eq!(inline.applies_when, None);
+        assert_eq!(
+            m.to_json()["skills"],
+            serde_json::json!([{
+                "name": "n",
+                "description": "d",
+                "body": "b",
+                "references_tools": [],
+                "delivery": null,
+                "applies_when": null,
+            }])
+        );
+    }
+
+    #[test]
+    fn skills_inline_unknown_key_rejected() {
+        let f = write_tmp(
+            "name: x\nskills:\n  - name: n\n    description: d\n    body: b\n    tools: [a]\n",
+        );
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("unknown skills[0] keys") && err.message.contains("tools"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_inline_unknown_applies_when_key_rejected() {
+        let f = write_tmp(
+            "name: x\nskills:\n  - name: n\n    description: d\n    body: b\n    \
+             applies_when:\n      graph_has_nodes: [Function]\n",
+        );
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("applies_when"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_inline_bad_delivery_rejected() {
+        let f = write_tmp(
+            "name: x\nskills:\n  - name: n\n    description: d\n    body: b\n    delivery: bogus\n",
+        );
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("delivery") && err.message.contains("bogus"),
+            "unexpected: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn skills_inline_missing_required_fields_rejected() {
+        for (yaml, missing) in [
+            (
+                "name: x\nskills:\n  - description: d\n    body: b\n",
+                "name",
+            ),
+            (
+                "name: x\nskills:\n  - name: n\n    body: b\n",
+                "description",
+            ),
+            (
+                "name: x\nskills:\n  - name: n\n    description: d\n",
+                "body",
+            ),
+            (
+                "name: x\nskills:\n  - name: \"\"\n    description: d\n    body: b\n",
+                "name",
+            ),
+        ] {
+            let f = write_tmp(yaml);
+            let err = load(f.path())
+                .err()
+                .unwrap_or_else(|| panic!("`{missing}` must be required, but {yaml:?} loaded"));
+            assert!(
+                err.message.contains(missing) && err.message.contains("non-empty string"),
+                "expected a `{missing}` complaint, got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn skills_non_mapping_non_string_entry_still_rejected() {
+        let f = write_tmp("name: x\nskills:\n  - 42\n");
+        let err = load(f.path()).unwrap_err();
+        assert!(
+            err.message.contains("skills[0]") && err.message.contains("inline skill"),
             "unexpected: {}",
             err.message
         );

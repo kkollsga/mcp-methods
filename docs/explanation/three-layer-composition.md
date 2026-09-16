@@ -1,6 +1,8 @@
-# Three-Layer Skill Composition
+# Skill Layer Composition
 
-Skills resolve through three layers — **project → domain pack → bundled defaults**. Each layer has a distinct authoring home, and higher layers fully replace same-named entries in lower layers. This page explains why we picked three layers (and not one, two, or four), and when each layer is the right place to author.
+Skills resolve through five layers — **project → domain pack → manifest-inline → owned → bundled defaults**. Each layer has a distinct authoring home, and higher layers fully replace same-named entries in lower layers. This page explains what each layer is for, and when it is the right place to author.
+
+Three of the five carry the weight: bundled, domain pack, project. Those are the three authorship roles — framework author, library author, deployment author — and a skill that does not obviously belong to one of the other two belongs to one of them. The inline and owned layers exist for two narrower cases, described below.
 
 ## The layers
 
@@ -21,7 +23,39 @@ When **not** to put a skill here:
 - The methodology references config or env vars that vary across deployments.
 - An operator might want to tweak it for their domain.
 
-### Layer 2 — Domain pack
+### Layer 2 — Owned (runtime-supplied bodies)
+
+Skill bodies a host binary hands to `Registry::add_layer` at boot, assembled from whatever it reads — a graph file, a database row, a downloaded pack. No file on disk, no compile-time `include_str!`.
+
+When to put a skill here:
+- The methodology belongs to an **artefact**, not to a deployment: the data the server serves should teach its own use, and should keep teaching it when the same artefact is served somewhere else.
+
+Owned skills are switched on by the same `true` marker as the bundled layer — they are, from the operator's side, another thing the binary supplies. A malformed owned body is a parse warning, not a boot failure: it is data assembled at runtime, and one bad row must not deny service.
+
+### Layer 3 — Manifest-inline
+
+Mapping entries in the manifest's `skills:` list. The body lives in the YAML:
+
+```yaml
+skills:
+  - true
+  - name: house_style
+    description: How this deployment names and cites things.
+    body: |
+      # House style
+
+      Cite by paragraph, never by page.
+```
+
+When to put a skill here:
+- The methodology is **a few lines long** and specific to this deployment, so a separate file is more bookkeeping than content.
+- You want the skill to travel with the manifest as one artefact — one file to copy, one file to review.
+
+Reach for the project layer instead as soon as the body wants its own headings, examples and edit history. An inline entry is subject to the same 16 KB hard limit as a file, and a manifest that has grown several of them is telling you they want to be files.
+
+Every inline entry joins this one layer wherever it sits in the list, so reordering the list never changes what overrides what. A same-named file in a declared directory still wins, which is how an operator overrides an inline skill without editing the manifest.
+
+### Layer 4 — Domain pack
 
 Operator-declared directories listed in the manifest's `skills:` field. Each entry is a path to a directory of SKILL.md files:
 
@@ -39,7 +73,7 @@ When to put a skill here:
 
 Domain packs let you reuse methodology across a fleet without forking the upstream binary.
 
-### Layer 3 — Project layer
+### Layer 5 — Project layer
 
 Auto-detected `<manifest_basename>.skills/` directory adjacent to the manifest YAML. For a manifest at `mcp-servers/legal_mcp.yaml`, the project layer lives at `mcp-servers/legal_mcp.skills/`.
 
@@ -50,7 +84,7 @@ When to put a skill here:
 
 The project layer is the top-priority layer: a project-layer `cypher_query.md` masks the bundled `cypher_query.md` and any domain-pack version. This is by design — operators always win.
 
-## Why three layers and not fewer
+## Why the three authorship layers, and not fewer
 
 ### One layer is too few
 
@@ -67,16 +101,13 @@ With just "bundled" and "project," there's no good home for skills that are:
 - Operator-authored (not bundled)
 - But shared across many deployments (not project-specific)
 
-Domain packs fill this hole. They let an operator maintain a single shared library and reference it from multiple manifests. Without the third layer, you'd either copy-paste or hack the project layer (e.g. symlink a shared dir into every `<name>.skills/`) — both fragile.
+Domain packs fill this hole. They let an operator maintain a single shared library and reference it from multiple manifests. Without that layer, you'd either copy-paste or hack the project layer (e.g. symlink a shared dir into every `<name>.skills/`) — both fragile.
 
-### Four layers buys you nothing
+### An "org" or "vendor" layer buys you nothing
 
-You could imagine an "org" or "vendor" layer somewhere. We don't add it because:
-- The cardinality of layers should match the cardinality of *authorship roles*, not deployment hierarchy.
-- Authorship splits cleanly into framework-author / library-author / deployment-author. That's three.
-- More layers means more rules for collision resolution, more cognitive load, more places to look when a skill behaves unexpectedly.
+The cardinality of *authorship* layers should match the cardinality of authorship roles, not deployment hierarchy — and authorship splits cleanly into framework-author / library-author / deployment-author. A layer per rung of an org chart would only add collision rules and places to look when a skill behaves unexpectedly.
 
-If a future use case needs a fourth layer, we'll revisit. For now, three is the sweet spot.
+The inline and owned layers are not counter-examples: neither adds an authorship role. Inline is the deployment author again, writing in the manifest instead of a file. Owned is the framework's way of letting an artefact carry methodology, authored by whoever authored the artefact. Both slot beneath the layer whose author could overrule them.
 
 ## Resolution rules
 
@@ -84,7 +115,9 @@ The resolver walks layers from highest to lowest priority:
 
 1. Project layer entries (highest)
 2. Domain pack entries — in declaration order (the first pack to mention a name wins among packs)
-3. Bundled defaults — both framework and downstream-binary contributions (lowest)
+3. Manifest-inline entries — one layer, regardless of list position
+4. Owned entries from `Registry::add_layer` — later calls win over earlier ones
+5. Bundled defaults — both framework and downstream-binary contributions (lowest)
 
 For each name encountered, the first occurrence wins; subsequent occurrences from lower-priority layers are masked. Masking is logged at `INFO` level via `tracing` so operators can see "your project `grep` skill overrode the bundled `grep` at boot" in their logs.
 
@@ -106,8 +139,9 @@ Operators see this once at boot, never on subsequent `prompts/get` calls (resolu
 Use this when you're unsure where to put a new skill:
 
 1. **Does it apply to every deployment of this binary?** → Bundled (framework or binary author).
-2. **Does it apply to many deployments but not all, and someone other than the binary author owns it?** → Domain pack.
-3. **Is it specific to this one deployment, or does it override something for just this server?** → Project layer.
+2. **Does it belong to the artefact the server serves rather than to any deployment?** → Owned, via `Registry::add_layer`.
+3. **Does it apply to many deployments but not all, and someone other than the binary author owns it?** → Domain pack.
+4. **Is it specific to this one deployment, or does it override something for just this server?** → Project layer — or, if it is only a few lines, inline in the manifest.
 
 If you find yourself answering #3 but the methodology might be useful to other operators, that's a signal to upstream it into a domain pack or contribute it to the bundled defaults — but the project layer is always a fine starting place.
 

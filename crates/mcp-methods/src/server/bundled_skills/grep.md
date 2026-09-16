@@ -10,6 +10,7 @@ references_arguments:
   - grep.glob
   - grep.max_results
 auto_inject_hint: true
+delivery: lazy
 ---
 
 # `grep` methodology

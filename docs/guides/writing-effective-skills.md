@@ -6,17 +6,22 @@ A companion to [Authoring Skills](authoring-skills.md). That page covers the mec
 
 Worth stating up front, because pre-0.3.37 the answer was different and operators authoring against the old assumption hit a real wall:
 
-**The primary delivery channel for a skill body is the matching tool's description.** When a skill has `auto_inject_hint: true` (the default) AND its name matches a registered tool, the framework embeds the full skill body under a `## Methodology` header inside that tool's description. The 4 KB soft / 16 KB hard size caps the framework enforces per skill bound how big this embed gets.
+**Everything reaches the agent through `tools/*`.** Real MCP clients (Claude Code, Claude Desktop, Cursor, Continue) expose only `tools/*` to the model. The MCP protocol's `prompts/*` plane was designed for human-invoked slash commands in chat UIs — agentic clients don't surface it. An agent looking for `prompts/get` finds nothing it can call.
 
-Why this matters: real MCP clients (Claude Code, Claude Desktop, Cursor, Continue) expose only `tools/*` to the agent. The MCP protocol's `prompts/*` plane was designed for human-invoked slash commands in chat UIs — agentic clients don't surface it to the model. An agent reading `tools/list` sees the embedded methodology; an agent looking for `prompts/get` finds nothing it can call.
+So a skill with `auto_inject_hint: true` (the default) is appended to the description of its name-match tool **and** every tool in its `references_tools`. What gets appended depends on `delivery:`, which **defaults to `lazy`**:
+
+- **`lazy`** — the description under `## When to use`, then one line: `Load the full methodology with skill("<name>") before first use.` The body is fetched by calling the framework's `skill(name)` tool, which is a real MCP tool the model can see. Until the agent has called it, every result from a tool carrying that skill carries a one-line reminder; after that it stays quiet while the session keeps working. A new session, ten minutes with no tool call at all, or a body that changed under the agent brings it back.
+- **`eager`** — the description, then the whole body under `## Methodology`, exactly as every skill behaved in 0.3.37–0.4.10. The 4 KB soft / 16 KB hard per-skill size caps bound how big that embed gets, and the cost is paid in every session, in every tool the skill references.
 
 Implications for authoring:
 
-- **Skill name should match a registered tool name** for the inject to fire. The five bundled framework skills (`grep`, `read_source`, `list_source`, `github_issues`, `repo_management`) all do this.
-- **Cross-cutting skills with no matching tool** (workflow guidance, methodology spanning several tools) still show up in `prompts/list` and `prompts/get` — they just don't get auto-injected anywhere. For these, consider whether the content actually belongs in the manifest's top-level `instructions:` field, which always reaches the agent.
-- **`auto_inject_hint: false`** is the per-skill escape hatch when an operator wants the smaller `tools/list` payload and is fine with the methodology being unreachable in standard clients.
+- **Write the description as the load decision.** On both tiers it is what the agent reads first; on the lazy tier it is the *only* thing it reads before deciding to fetch the body. See [The description is your discovery mechanism](#the-description-is-your-discovery-mechanism).
+- **Reach for `eager` only when the body shapes the first call's parameters** — a query language the agent has to write correctly before it has any result to learn from. The five bundled framework skills (`grep`, `read_source`, `list_source`, `github_issues`, `repo_management`) are all `lazy`: none of them changes how the very first call is written.
+- **Don't reference tools this deployment doesn't run.** A skill that names target tools and finds *every* one of them unregistered is dropped — no prompt route, no injection, and `skill()` will not serve it. Listing at least one tool that is actually registered keeps it, and is what decides where its routing appears.
+- **A skill that targets nothing is still kept.** Cross-cutting methodology with no matching tool and an empty `references_tools` stays in `prompts/list` and stays servable by `skill(name)` — it simply injects nowhere, which is what it has always done. Since no tool description points the agent at it, consider whether the content belongs in the manifest's top-level `instructions:` field, which always reaches the agent, or whether a `references_tools` entry would put the routing where the agent will see it.
+- **`auto_inject_hint: false`** keeps the skill off tool descriptions entirely. It stays reachable through `skill(name)` and `prompts/*`, but nothing points the agent at it.
 
-`prompts/list` and `prompts/get` still work for any MCP client that does surface prompts to the agent (rare today), plus CLI introspection (`mcp-server skills-show`) and operator/programmatic readers. The two channels coexist; the auto-inject is just the primary one for agentic clients.
+`prompts/list` and `prompts/get` still work for any MCP client that does surface prompts to the agent (rare today), plus CLI introspection (`mcp-server skills-show`) and operator/programmatic readers.
 
 ## The description is your discovery mechanism
 
@@ -211,13 +216,15 @@ Anthropic's frontmatter has two required fields (`name`, `description`) and an o
 | `applies_to:` | Semver gating per binary | none (skills aren't version-tied) |
 | `references_tools:` | Drives the auto-inject pass on tool descriptions | none |
 | `references_arguments:` | Lint surface for argument-name correctness | none |
-| `auto_inject_hint:` | Whether tool descriptions get a `prompts/get` pointer | none |
+| `auto_inject_hint:` | Whether the skill is appended to its tools' descriptions at all | none |
+| `delivery:` | Whether that append carries the body (`eager`) or a `skill("<name>")` pointer (`lazy`, the default) | none |
 
 These exist because our skills are *bundled with the binary* and tied to the registered tool catalogue — they're not standalone artifacts the way Anthropic's are. Use them when:
 
 - **`applies_to`** — your skill assumes a specific version of `mcp-methods` or a downstream binary.
-- **`references_tools`** — your skill name matches the tool's name; this lets the framework auto-append a pointer.
-- **`auto_inject_hint: false`** — your skill is cross-cutting (e.g. "test-driven-development") and doesn't have a single matching tool.
+- **`references_tools`** — your skill spans tools beyond the one it is named after, or is named after no tool at all. It is also the list that decides whether the skill is reachable: at least one entry must be a registered tool.
+- **`delivery: eager`** — the body has to be in front of the agent *before* the first call, because it shapes that call's parameters. Otherwise leave it alone and take the default.
+- **`auto_inject_hint: false`** — the skill is background context you don't want advertised on any tool description.
 
 ## A note on iteration
 
@@ -233,6 +240,6 @@ Anthropic's skill-creator skill automates this loop with their `evals/evals.json
 ## See also
 
 - [Authoring Skills](authoring-skills.md) — file format, where files live, the lint surface
-- [Three-Layer Composition](../explanation/three-layer-composition.md) — design rationale for project / domain-pack / bundled
+- [Skill Layer Composition](../explanation/three-layer-composition.md) — design rationale for project / domain-pack / inline / owned / bundled
 - [Anthropic's published skills](https://github.com/anthropics/skills) — the canonical examples to model on. We particularly recommend reading `webapp-testing/SKILL.md` (short, focused) and `mcp-builder/SKILL.md` (medium-length, structurally close to ours)
 - [Anthropic's skill best-practices doc](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) — official guidance, including the "build evals first" recipe

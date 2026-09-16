@@ -17,6 +17,7 @@ references_arguments:
   - github_issues.grep
   - github_issues.refresh
 auto_inject_hint: true
+delivery: lazy
 ---
 
 # `github_issues` methodology

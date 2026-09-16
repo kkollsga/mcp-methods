@@ -904,6 +904,8 @@ impl PySkill {
             SkillProvenance::DomainPack(path) => {
                 format!("domain_pack:{}", path.display())
             }
+            SkillProvenance::Owned(label) => format!("owned:{label}"),
+            SkillProvenance::Inline => "inline".to_string(),
             SkillProvenance::Bundled => "bundled".to_string(),
         };
         let applies_when = skill
@@ -957,6 +959,10 @@ impl PySkill {
     /// Where the skill came from — one of:
     /// - `"project"` — auto-detected `<basename>.skills/` adjacent to the manifest.
     /// - `"domain_pack:<path>"` — operator-declared path from the manifest's `skills:` list.
+    /// - `"owned:<label>"` — a runtime-supplied body layered in by the host binary
+    ///   (Rust `Registry::add_layer`); `<label>` is the host's name for that layer.
+    /// - `"inline"` — a mapping entry in the manifest's `skills:` list: the body
+    ///   is written out in the YAML rather than read from a file.
     /// - `"bundled"` — compile-time bundled (framework or downstream binary).
     #[getter]
     fn provenance(&self) -> &str {
@@ -1027,8 +1033,9 @@ impl PySkill {
     }
 }
 
-/// Resolved skill set — the output of three-layer composition
-/// (project → domain pack → bundled). Construct via
+/// Resolved skill set — the output of layer composition
+/// (project → domain pack → manifest-inline → owned → bundled).
+/// Construct via
 /// [`SkillRegistry.from_manifest`] for the common path; downstream
 /// binaries with more bespoke layering should call into the Rust
 /// `Registry` builder via their own pyo3 wrappers.
@@ -1041,7 +1048,8 @@ struct PySkillRegistry {
 ///
 /// Walks the manifest's `skills:` declaration (auto-detected
 /// `<basename>.skills/` project layer, operator-declared paths,
-/// optional bundled framework defaults) and returns the resolved
+/// inline skill mappings, optional bundled framework defaults) and
+/// returns the resolved
 /// set. Pass `include_bundled=False` to skip framework defaults
 /// — useful for tests or when a downstream binary supplies its
 /// own bundled layer.

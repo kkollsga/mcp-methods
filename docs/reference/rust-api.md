@@ -37,9 +37,17 @@ The most-imported types and functions, grouped:
 
 ### Skills
 
-- [`mcp_methods::server::SkillRegistry`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.Registry.html) — builder for the three-layer resolved set
+- [`mcp_methods::server::SkillRegistry`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.Registry.html) — builder for the layered resolved set
 - [`mcp_methods::server::ResolvedRegistry`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.ResolvedRegistry.html) — post-resolution skill set
-- [`mcp_methods::server::serve_prompts`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.serve_prompts.html) — wire a resolved registry into `prompts/list` / `prompts/get`
+- [`mcp_methods::server::serve_prompts`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.serve_prompts.html) — wire a resolved registry into `prompts/list` / `prompts/get`, register the `skill(name)` tool, and inject each skill into the tools it targets. Returns `Vec<ActiveSkill>`.
+- [`mcp_methods::server::ActiveSkill`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.ActiveSkill.html) — one skill that survived both activation gates: `name`, `description`, `delivery`, `provenance`
+- [`mcp_methods::server::McpServer::active_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.active_skills) — the same list, readable from a tool handler at request time. Returns an owned `Vec<ActiveSkill>`.
+- [`mcp_methods::server::McpServer::reinject_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.reinject_skills) — re-resolve a registry **after** the server is serving: strip the previous injection, replace the skill prompt routes, re-register the loader, inject again. Takes `&self`, returns `Result<Vec<ActiveSkill>, String>`. See [Rebuilding skills at runtime](../guides/authoring-skills.md#rebuilding-skills-at-runtime).
+- [`mcp_methods::server::McpServer::skill_reloader`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.skill_reloader) / [`SkillReloader`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.SkillReloader.html) — a cloneable handle a dynamic tool handler captures before `serve`, so a `Fn(T) -> Result<String, String>` closure with no `&self` can drive the rebuild
+- [`mcp_methods::server::notify_skills_changed`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.notify_skills_changed.html) — `notifications/tools/list_changed` then `notifications/prompts/list_changed` on a `Peer`. The framework stores no peers; the caller owns the notification.
+- [`mcp_methods::server::Delivery`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/enum.Delivery.html) — `Eager` | `Lazy`, the frontmatter `delivery:` key. **Absent means `Lazy`.**
+- [`mcp_methods::server::SKILL_TOOL_NAME`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/constant.SKILL_TOOL_NAME.html) / [`SkillArgs`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.SkillArgs.html) — the `skill(name)` loader tool registered by `serve_prompts`: one required string argument `name`, returns that skill's body, `isError: true` naming the active set for an unknown or inactive name. The framework-owned loader is **exempt from the default response budget** — a body is capped at `HARD_SIZE_LIMIT_BYTES` (16 KB) when it loads, so the exemption is bounded and the body is never returned as a preview excerpt. A downstream tool that took the `skill` name is not the framework loader and stays budgeted.
+- [`ResolvedRegistry::total_body_bytes`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.ResolvedRegistry.html#method.total_body_bytes) — the sum checked against `SESSION_TOTAL_LIMIT_BYTES`, counted over both delivery tiers
 - [`mcp_methods::server::library_bundled_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.library_bundled_skills.html) — framework defaults Vec
 - [`mcp_methods::server::render_skill_template`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.render_skill_template.html) / [`write_skill_template`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.write_skill_template.html) — scaffold a starter SKILL.md
 - [`mcp_methods::server::cli::skills_lint`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_lint.html) / [`skills_list`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_list.html) / [`skills_show`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_show.html) / [`skills_new`](https://docs.rs/mcp-methods/latest/mcp_methods/server/cli/fn.skills_new.html) — composable CLI helpers
@@ -87,8 +95,12 @@ mcp-methods = { version = "0.4", default-features = false }
 to completed calls from builtin, typed and custom router tools. The reference
 `mcp-server` binary inherits it. No server option is needed to enable it.
 `tools/list` advertises `_response` controls and the retained-result expansion
-tool, including collision-safe names. Direct calls to a handler or to
-`tool_router_mut().call(...)` bypass protocol presentation.
+tool, including collision-safe names — on every tool except the framework's own
+`skill(name)` loader, which is exempt from the budget and so advertises no
+controls. Direct calls to a handler bypass protocol
+presentation; so does dispatching through the router yourself
+(`tool_router_mut()` derefs to the rmcp `ToolRouter`, whose `call(...)` is the
+raw route, not the presented result).
 
 Use `McpServer::with_response_preview_hook` to provide domain-specific summary,
 coverage and next-query JSON from the tool name, original arguments and complete

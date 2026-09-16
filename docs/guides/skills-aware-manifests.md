@@ -1,6 +1,6 @@
 # Skills-Aware Manifests
 
-The shortest path from "I want to ship methodology with my MCP server" to a running deployment. For background on what skills are and why they exist, see [Three-Layer Composition](../explanation/three-layer-composition.md). For the authoring details, see [Authoring Skills](authoring-skills.md).
+The shortest path from "I want to ship methodology with my MCP server" to a running deployment. For background on what skills are and why they exist, see [Skill Layer Composition](../explanation/three-layer-composition.md). For the authoring details, see [Authoring Skills](authoring-skills.md).
 
 ## The five-minute version
 
@@ -30,6 +30,7 @@ The project layer lives at `<manifest_basename>.skills/` next to the manifest. F
 name: cypher_query
 description: Cypher patterns specific to this deployment's graph schema.
 auto_inject_hint: true
+delivery: eager
 ---
 
 # Cypher methodology
@@ -37,7 +38,12 @@ auto_inject_hint: true
 For "what calls X" questions: ...
 ```
 
-Re-boot the server. `prompts/list` now includes `cypher_query` alongside the bundled defaults active in the session (three in a default deployment; `github_issues` and `repo_management` join when their tools register). If your binary registers a tool named `cypher_query`, the framework also appends a pointer to that tool's description: "See `prompts/get` `cypher_query` for the full methodology."
+Re-boot the server. If your binary registers a tool named `cypher_query`, the framework appends the skill to that tool's description and lists it under `prompts/list`, alongside the bundled defaults active in the session (three in a default deployment; `github_issues` and `repo_management` join when their tools register). A skill that names target tools and finds every one of them unregistered is dropped — it asked for tools this deployment does not run. One that targets nothing at all (no tool shares its name, no `references_tools`) is kept: it injects nowhere, but stays listed and stays servable by `skill(name)`.
+
+`delivery:` picks how much of the skill travels with the tool description, and **omitting it means `lazy`**:
+
+- **`lazy` (default)** — the description plus `Load the full methodology with skill("cypher_query") before first use.` The body moves only when the agent calls the framework's `skill(name)` tool, once per session.
+- **`eager`** — the whole body, embedded under `## Methodology`, in every tool the skill targets. Worth it here: an agent writing its first Cypher query needs the patterns *before* it writes it, not after the first bad result. That is the test for `eager` — everything else is cheaper lazy.
 
 ## Adding a shared skill pack
 
@@ -115,4 +121,4 @@ app.run(transport="stdio")
 
 - [Manifest Schema Reference](../reference/manifest-schema.md#skills-polymorphic-value) — the `skills:` field spec
 - [Authoring Skills](authoring-skills.md) — frontmatter, size limits, the full file format
-- [Three-Layer Composition](../explanation/three-layer-composition.md) — design rationale and resolution rules
+- [Skill Layer Composition](../explanation/three-layer-composition.md) — design rationale and resolution rules

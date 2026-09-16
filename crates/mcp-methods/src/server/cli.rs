@@ -128,7 +128,15 @@ pub fn skills_lint(dir: &Path) -> Result<LintReport, SkillError> {
 
 /// Build a registry from a manifest YAML and return a one-line-per-
 /// skill summary suitable for stdout. Output columns: name, provenance,
-/// description (truncated).
+/// delivery tier, status, description (truncated).
+///
+/// The `delivery` column is what the author declared (or inherited —
+/// `lazy` is the default). Whether a skill reaches the agent at all
+/// also depends on a registered target tool, which this command cannot
+/// see: it runs without a live server, exactly as it cannot decide
+/// `tool_registered:` / `extension_enabled:` offline. Both verdicts
+/// come from `serve_prompts` at boot, and the boot log names every
+/// skill it drops for want of a target.
 ///
 /// `include_bundled` controls whether the framework defaults are
 /// merged before the operator-declared layers. Defaults to `true`
@@ -215,14 +223,15 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<28}  {:<14}  {:<12}  description",
-        "name", "provenance", "status"
+        "{:<28}  {:<14}  {:<8}  {:<12}  description",
+        "name", "provenance", "delivery", "status"
     );
     let _ = writeln!(
         out,
-        "{:<28}  {:<14}  {:<12}  {}",
+        "{:<28}  {:<14}  {:<8}  {:<12}  {}",
         "-".repeat(28),
         "-".repeat(14),
+        "-".repeat(8),
         "-".repeat(12),
         "-".repeat(40)
     );
@@ -255,9 +264,10 @@ fn format_skill_list(registry: &ResolvedRegistry) -> String {
             "conditional"
         };
         let desc: String = skill.description().chars().take(60).collect();
+        let delivery = skill.delivery().to_string();
         let _ = writeln!(
             out,
-            "{:<28}  {:<14}  {status:<12}  {desc}",
+            "{:<28}  {:<14}  {delivery:<8}  {status:<12}  {desc}",
             skill.name(),
             prov
         );
@@ -335,6 +345,8 @@ fn provenance_label(p: &SkillProvenance) -> String {
     match p {
         SkillProvenance::Project => "project".to_string(),
         SkillProvenance::DomainPack(_) => "domain_pack".to_string(),
+        SkillProvenance::Owned(label) => format!("owned:{label}"),
+        SkillProvenance::Inline => "inline".to_string(),
         SkillProvenance::Bundled => "bundled".to_string(),
     }
 }
@@ -572,6 +584,96 @@ mod tests {
         assert!(output.contains("grep"), "expected bundled grep in output");
         assert!(output.contains("project"));
         assert!(output.contains("bundled"));
+    }
+
+    #[test]
+    fn skills_list_shows_the_delivery_tier_column() {
+        // Mutation: drop the `delivery` column from the row format —
+        // the header still says `delivery` but `eager` never appears,
+        // and the tier an operator declared becomes invisible.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest, "name: t\nskills: true\n").unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("eager_one.md"),
+            "---\nname: eager_one\ndescription: d.\ndelivery: eager\n---\n\nBody.\n",
+        )
+        .unwrap();
+        write_skill(&skills_dir, "default_one", "Body.");
+
+        let output = skills_list(&manifest, false).unwrap();
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("delivery"), "{header}");
+        let eager = output
+            .lines()
+            .find(|l| l.starts_with("eager_one"))
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(eager.contains("eager"), "{eager}");
+        let lazy = output
+            .lines()
+            .find(|l| l.starts_with("default_one"))
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(
+            lazy.contains("lazy"),
+            "a skill with no `delivery:` key is lazy: {lazy}"
+        );
+    }
+
+    #[test]
+    fn owned_layer_provenance_labels_the_cli_column() {
+        use crate::server::skills::OwnedSkill;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("test_mcp.yaml");
+        fs::write(&manifest_path, "name: t\nskills: true\n").unwrap();
+        let manifest = load_manifest(&manifest_path).unwrap();
+
+        let registry = Registry::new()
+            .add_layer(
+                [OwnedSkill {
+                    name: "carried".to_string(),
+                    body: "---\nname: carried\ndescription: Carried by the artefact.\n---\ncarried body\n"
+                        .to_string(),
+                }],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&manifest.skills, &manifest_path)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        let listed = format_skill_list(&registry);
+        assert!(
+            line_for(&listed, "carried").contains("owned:graph"),
+            "provenance column must carry the layer label: {listed}"
+        );
+        assert!(format_skill_body(registry.get("carried").unwrap())
+            .starts_with("# carried (owned:graph)"));
+    }
+
+    #[test]
+    fn inline_skill_provenance_labels_the_cli_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("test_mcp.yaml");
+        fs::write(
+            &manifest_path,
+            "name: t\nskills:\n  - name: recipes\n    description: House recipes.\n    \
+             body: |\n      Project explicit columns.\n",
+        )
+        .unwrap();
+
+        let registry = Registry::from_manifest(&manifest_path, false).unwrap();
+
+        let listed = format_skill_list(&registry);
+        assert!(
+            line_for(&listed, "recipes").contains("inline"),
+            "provenance column must mark a manifest-inline skill: {listed}"
+        );
+        assert!(
+            format_skill_body(registry.get("recipes").unwrap()).starts_with("# recipes (inline)")
+        );
     }
 
     #[test]

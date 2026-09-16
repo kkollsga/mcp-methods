@@ -14,6 +14,7 @@ references_arguments:
   - read_source.max_chars
   - read_source.rev
 auto_inject_hint: true
+delivery: lazy
 ---
 
 # `read_source` methodology

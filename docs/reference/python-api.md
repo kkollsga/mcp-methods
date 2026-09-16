@@ -116,7 +116,7 @@ code = cache.retrieve("owner/repo", 123, "cb_1")
 
 ### `SkillRegistry`
 
-Resolved skill set built from a YAML manifest, applying the three-layer composition (project → domain pack → bundled defaults).
+Resolved skill set built from a YAML manifest, applying the layer composition (project → domain pack → manifest-inline → owned → bundled defaults).
 
 ```python
 from mcp_methods import SkillRegistry
@@ -160,8 +160,8 @@ Single resolved skill. Read-only attributes:
 | `name` | str | Lookup key used by `prompts/get`. |
 | `description` | str | One-line summary for `prompts/list`. |
 | `body` | str | Markdown body (frontmatter stripped). |
-| `provenance` | str | One of `"project"`, `"domain_pack:<path>"`, or `"bundled"`. |
-| `auto_inject_hint` | bool | Whether tool descriptions should get the `prompts/get` pointer. |
+| `provenance` | str | One of `"project"`, `"domain_pack:<path>"`, `"inline"`, `"owned:<label>"`, or `"bundled"`. |
+| `auto_inject_hint` | bool | Whether the Rust framework appends this skill to the descriptions of the tools it targets. The FastMCP helper registers skills as prompts only and does not inject. |
 | `references_tools` | list[str] | Tools the skill mentions in prose (per frontmatter). |
 
 ## FastMCP helpers

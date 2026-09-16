@@ -2,7 +2,7 @@
 //!
 //! The five SKILL.md files in `./bundled_skills/` ship inside the
 //! binary via `include_str!`. They form the bottom layer of the
-//! three-layer composition (project → domain pack → bundled);
+//! layer composition (project → domain pack → inline → owned → bundled);
 //! operator-authored skills always override them.
 //!
 //! Adding a new bundled skill: drop a SKILL.md into `bundled_skills/`,

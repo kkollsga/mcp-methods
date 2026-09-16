@@ -12,7 +12,10 @@ pub const DEFAULT_BYTES: usize = 16_384;
 pub const MIN_BYTES: usize = 4_096;
 const CACHE_BYTES: usize = 32 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 32;
-const TTL: Duration = Duration::from_secs(600);
+/// How long a retained response — and, on the same window, a
+/// session's record of which lazy skills it has loaded — stays alive
+/// without being touched.
+pub(crate) const TTL: Duration = Duration::from_secs(600);
 
 /// Presentation controls; validation must happen before invoking a tool.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

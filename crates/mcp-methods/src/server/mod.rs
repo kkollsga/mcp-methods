@@ -54,22 +54,23 @@ pub mod workspace;
 // without chasing the module hierarchy.
 pub use manifest::{
     find_sibling_manifest, find_workspace_manifest, load as load_manifest, BuiltinsConfig,
-    EmbedderConfig, Manifest, ManifestError, PythonTool, SkillSource, SkillsSource, TempCleanup,
-    ToolSpec, TrustConfig, WorkspaceConfig, WorkspaceKind,
+    EmbedderConfig, InlineSkill, Manifest, ManifestError, PythonTool, SkillSource, SkillsSource,
+    TempCleanup, ToolSpec, TrustConfig, WorkspaceConfig, WorkspaceKind,
 };
 pub use runtime::{
     init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
     resolve_source_roots_lenient, UnresolvedSourceRoot,
 };
 pub use server::{
-    serve_prompts, McpServer, RepoProvider, ResponsePreviewHook, ResultCtx, ResultPostprocessHook,
-    ServerOptions,
+    notify_skills_changed, serve_prompts, ActiveSkill, McpServer, PromptRouterMut, RepoProvider,
+    ResponsePreviewHook, ResultCtx, ResultPostprocessHook, ServerOptions, SkillArgs, SkillReloader,
+    ToolRouterMut, SKILL_TOOL_NAME,
 };
 pub use skills::{
     library_bundled_skills, render_skill_template, write_skill_template, AppliesWhen, BundledSkill,
-    GraphPropertyCheck, ParseWarning, PredicateClause, PredicateOutcome, Registry as SkillRegistry,
-    ResolvedRegistry, Skill, SkillActivation, SkillError, SkillFrontmatter,
-    SkillPredicateEvaluator, SkillProvenance,
+    Delivery, GraphPropertyCheck, OwnedSkill, ParseWarning, PredicateClause, PredicateOutcome,
+    Registry as SkillRegistry, ResolvedRegistry, Skill, SkillActivation, SkillError,
+    SkillFrontmatter, SkillPredicateEvaluator, SkillProvenance,
 };
 pub use source::SourceRootsProvider;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};

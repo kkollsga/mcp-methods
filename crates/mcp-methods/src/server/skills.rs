@@ -1,4 +1,4 @@
-//! Skills-aware MCP — runtime types, frontmatter parsing, three-layer
+//! Skills-aware MCP — runtime types, frontmatter parsing, layered
 //! resolution, and the [`Registry`] builder downstream binaries
 //! consume to wire skills into their MCP server.
 //!
@@ -31,17 +31,26 @@
 //! // Phase 1c wires this into `serve_prompts(&registry, &mut server)`.
 //! ```
 //!
-//! # Three-layer composition
+//! # Layer composition
 //!
 //! 1. **Project layer (top priority).** Auto-detected from
 //!    `<manifest_basename>.skills/` adjacent to the YAML. Files there
 //!    override every other layer per skill name. This is the operator's
 //!    per-deployment tweak zone.
-//! 2. **Root layer (middle).** Each entry in the manifest's `skills:`
+//! 2. **Root layer.** Each entry in the manifest's `skills:`
 //!    list, walked in declaration order. First-match-per-name wins.
 //!    This is where operator-curated domain skill-packs sit
 //!    (`kglite-skills-legal/`, etc.).
-//! 3. **Bundled layer (bottom).** Compile-time defaults shipped with
+//! 3. **Inline layer.** Mapping entries in the manifest's `skills:`
+//!    list — a whole skill written out in the YAML. One fixed layer
+//!    however the entries are interleaved with paths: position in the
+//!    list never changes precedence.
+//! 4. **Owned layer.** Runtime-supplied [`OwnedSkill`] bodies handed to
+//!    [`Registry::add_layer`] by the host binary — e.g. skills carried
+//!    inside the artefact the server serves. Overrides bundled, is
+//!    overridden by inline entries, operator-declared dirs and the
+//!    project layer.
+//! 5. **Bundled layer (bottom).** Compile-time defaults shipped with
 //!    `mcp-methods` plus any added by the downstream binary via
 //!    [`Registry::add_bundled`]. Library authors ship protocol-level
 //!    methodology here; operators inherit it.
@@ -64,9 +73,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::manifest::{load as load_manifest, SkillSource, SkillsSource};
+use super::manifest::{load as load_manifest, InlineSkill, SkillSource, SkillsSource};
 
 // ─── Public types ─────────────────────────────────────────────────
 
@@ -75,8 +84,9 @@ use super::manifest::{load as load_manifest, SkillSource, SkillsSource};
 /// construct these for their custom tools; the framework constructs
 /// them for its own (`grep`, `read_source`, etc.).
 ///
-/// Bundled skills sit at the bottom of the three-layer composition —
-/// project and root-layer entries override them when names collide.
+/// Bundled skills sit at the bottom of the layer composition —
+/// owned, root-layer and project entries override them when names
+/// collide.
 #[derive(Debug, Clone)]
 pub struct BundledSkill {
     /// Skill name. Must match the `name` field in the markdown
@@ -86,6 +96,28 @@ pub struct BundledSkill {
     /// `Registry::add_bundled` time; malformed bundled skills are
     /// errors (caught by the framework's CI tests), not warnings.
     pub body: &'static str,
+}
+
+/// A runtime-supplied skill with an **owned** body, handed to
+/// [`Registry::add_layer`]. Unlike [`BundledSkill`] — whose body must
+/// be `&'static str` and therefore compile-time — an `OwnedSkill` can
+/// be assembled at boot from whatever the host binary reads: a graph
+/// file, a database row, a downloaded pack.
+///
+/// Owned skills sit directly above the bundled layer and below the
+/// operator's declared `skills:` directories, so an operator can
+/// always override one with a file on disk. Malformed entries are
+/// [`ParseWarning`]s, never errors — a bad row in an artefact must not
+/// take the server down the way a malformed compile-time skill does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSkill {
+    /// Skill name. Must match the `name` field in `body`'s
+    /// frontmatter; a mismatch is reported as a [`ParseWarning`] and
+    /// the entry is dropped.
+    pub name: String,
+    /// The full SKILL.md content — frontmatter + body, the same shape
+    /// as [`BundledSkill::body`].
+    pub body: String,
 }
 
 /// Parsed YAML frontmatter of a SKILL.md file.
@@ -157,6 +189,55 @@ pub struct SkillFrontmatter {
     /// regardless of runtime state.
     #[serde(default)]
     pub applies_when: Option<AppliesWhen>,
+
+    /// `delivery:` — which tier the framework injects this skill on.
+    ///
+    /// [`Delivery::Lazy`] (the default) puts the description in every
+    /// target tool's description plus one routing line pointing at the
+    /// `skill(name)` tool; the body travels only when the agent asks
+    /// for it. [`Delivery::Eager`] embeds the whole body in every
+    /// target tool's description, as every skill did before 0.4.11.
+    ///
+    /// Any other value is a parse error — a warning for file, owned
+    /// and inline layers, fatal for a bundled skill.
+    #[serde(default)]
+    pub delivery: Delivery,
+}
+
+/// Which tier [`serve_prompts`](crate::server::serve_prompts) injects
+/// a skill on.
+///
+/// The choice is a budget decision, not a capability one: both tiers
+/// put the skill's `description` — the TRIGGER/SKIP routing — into
+/// every target tool's description, and both leave the full body
+/// reachable. They differ in when the body is paid for.
+///
+/// Reach for [`Eager`](Delivery::Eager) only when the body shapes the
+/// *first* call's parameters (a query language the agent has to write
+/// correctly before it has any result to learn from). Everything else
+/// is [`Lazy`](Delivery::Lazy): the agent reads the routing line, calls
+/// `skill(name)` when the routing matches, and the tool list stops
+/// scaling with skills × referenced tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// Body embedded in every target tool's description at
+    /// `tools/list` time.
+    Eager,
+    /// Body withheld; the target tool descriptions carry the routing
+    /// plus a line naming the `skill(name)` tool that fetches it.
+    /// The default for any skill that does not say otherwise.
+    #[default]
+    Lazy,
+}
+
+impl std::fmt::Display for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Delivery::Eager => "eager",
+            Delivery::Lazy => "lazy",
+        })
+    }
 }
 
 fn default_auto_inject_hint() -> bool {
@@ -172,7 +253,7 @@ fn default_auto_inject_hint() -> bool {
 /// [`ResolvedRegistry::activation_for`]. The bounded-set
 /// design is intentional — operators get type-checked semantics
 /// instead of an open-ended DSL.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AppliesWhen {
     /// Active when the running graph has *any* of the listed node
@@ -201,7 +282,7 @@ pub struct AppliesWhen {
 }
 
 /// Nested shape for the `graph_has_property:` predicate.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphPropertyCheck {
     pub node_type: String,
@@ -291,8 +372,8 @@ pub trait SkillPredicateEvaluator: Send + Sync {
 }
 
 /// Where a [`Skill`] came from. Used for the boot-time collision-
-/// resolution log and surfaced via the JSON shape kglite consumes
-/// from `to_json()` (in Phase 1d).
+/// resolution log, the `skills-list` / `skills-show` CLI columns, and
+/// the `provenance` string on the pyo3 `Skill` wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillProvenance {
     /// Auto-detected from `<basename>.skills/` adjacent to the
@@ -301,6 +382,20 @@ pub enum SkillProvenance {
     /// Loaded from an operator-declared path in the manifest's
     /// `skills:` list (a domain skill-pack or shared library).
     DomainPack(PathBuf),
+    /// Supplied at runtime as an owned body via
+    /// [`Registry::add_layer`]. The `String` is the caller's label for
+    /// the layer — free-form, domain-specific (a host serving a graph
+    /// that carries its own skills passes `"graph"`), and used only
+    /// for reporting: the collision log, the CLI provenance column and
+    /// the warning paths of malformed entries. It does not affect
+    /// resolution order.
+    Owned(String),
+    /// Declared as a mapping entry in the manifest's `skills:` list
+    /// (an [`InlineSkill`]) — the
+    /// body lives in the YAML, not in a file. No payload: every inline
+    /// skill comes from the one manifest the server was booted with,
+    /// so there is nothing to distinguish them by.
+    Inline,
     /// Compile-time bundled — shipped with `mcp-methods` (framework
     /// defaults) or with a downstream binary like `kglite-mcp-server`.
     Bundled,
@@ -325,6 +420,11 @@ impl Skill {
     /// One-line description for `prompts/list` responses.
     pub fn description(&self) -> &str {
         &self.frontmatter.description
+    }
+
+    /// Which tier the auto-inject pass delivers this skill on.
+    pub fn delivery(&self) -> Delivery {
+        self.frontmatter.delivery
     }
 }
 
@@ -437,6 +537,16 @@ pub const HARD_SIZE_LIMIT_BYTES: usize = 16 * 1024;
 /// logs a warning at `Registry::finalise` time but does not drop
 /// skills automatically — operators stay in control of which skills
 /// they want loaded.
+///
+/// **Counted at resolve time, every skill, both delivery tiers.**
+/// [`Delivery::Lazy`] changes *when* a body reaches the agent, not
+/// whether it can: one session may call `skill(name)` for every lazy
+/// skill in the registry, so the worst case this limit bounds is the
+/// same as it was when every body shipped in the tool list. Charging
+/// lazy bodies only at `skill()` time would make the number depend on
+/// agent behaviour and would let a registry that cannot fit a session
+/// resolve without a word. See
+/// [`ResolvedRegistry::total_body_bytes`].
 pub const SESSION_TOTAL_LIMIT_BYTES: usize = 64 * 1024;
 
 // ─── Frontmatter parser ───────────────────────────────────────────
@@ -676,9 +786,86 @@ pub fn project_skills_dir(yaml_path: &Path) -> PathBuf {
 /// [`bundled_skills_index`](crate::server::bundled_skills_index)
 /// submodule. Downstream binaries call this through
 /// [`Registry::merge_framework_defaults`] when they want the
-/// framework defaults at the bottom of their three-layer stack.
+/// framework defaults at the bottom of their layer stack.
 pub fn library_bundled_skills() -> Vec<BundledSkill> {
     crate::server::bundled_skills_index::library_bundled_skills()
+}
+
+// ─── Inline skills ────────────────────────────────────────────────
+
+/// Render a manifest-declared [`InlineSkill`] back into SKILL.md
+/// text — YAML frontmatter, `---`, then the body.
+///
+/// The round trip through text is deliberate: it puts inline skills
+/// through [`parse_skill`] and the size limits on exactly the same
+/// path as a file on disk, so there is one definition of what a valid
+/// skill is rather than two that can drift.
+///
+/// This is not [`render_skill_template`]'s job — that renders a
+/// starter file full of `<TODO>` placeholders for a human to fill in,
+/// with the extension keys commented out. Here every key the operator
+/// actually set has to come out live.
+///
+/// Frontmatter values go through `serde_yaml` rather than string
+/// interpolation, so a description with a colon, a body-looking
+/// `---`, or any other YAML metacharacter survives the trip.
+fn render_inline_skill(inline: &InlineSkill) -> String {
+    let mut front = serde_yaml::Mapping::new();
+    let mut put = |key: &str, value: serde_yaml::Value| {
+        front.insert(serde_yaml::Value::String(key.to_string()), value);
+    };
+    put("name", serde_yaml::Value::String(inline.name.clone()));
+    put(
+        "description",
+        serde_yaml::Value::String(inline.description.clone()),
+    );
+    if !inline.references_tools.is_empty() {
+        put(
+            "references_tools",
+            serde_yaml::Value::Sequence(
+                inline
+                    .references_tools
+                    .iter()
+                    .map(|t| serde_yaml::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(delivery) = &inline.delivery {
+        put("delivery", serde_yaml::Value::String(delivery.clone()));
+    }
+    if let Some(applies_when) = &inline.applies_when {
+        // `AppliesWhen` serialises back to the same mapping it was
+        // parsed from; an unset predicate is skipped, not emitted as
+        // null, so the re-parse sees what the operator wrote.
+        match serde_yaml::to_value(applies_when) {
+            Ok(value) => put("applies_when", value),
+            Err(e) => {
+                // Unreachable for the bounded predicate set, but a
+                // serialisation failure must not silently drop the
+                // gate and let a suppressed skill surface.
+                tracing::warn!(
+                    skill = %inline.name,
+                    error = %e,
+                    "inline skill `applies_when` failed to serialise; emitting it \
+                     unparseable so the entry is rejected rather than ungated"
+                );
+                put(
+                    "applies_when",
+                    serde_yaml::Value::String(format!("<unserialisable: {e}>")),
+                );
+            }
+        }
+    }
+
+    // Same rule as the `applies_when` arm: on the unreachable failure,
+    // emit frontmatter `parse_skill` rejects (no `description`) so the
+    // entry becomes a warning instead of a skill with a lost gate.
+    let frontmatter = serde_yaml::to_string(&serde_yaml::Value::Mapping(front))
+        .unwrap_or_else(|e| format!("name: <unserialisable: {e}>\n"));
+    let body = &inline.body;
+    let separator = if body.ends_with('\n') { "" } else { "\n" };
+    format!("---\n{frontmatter}---\n{body}{separator}")
 }
 
 // ─── Authoring template ───────────────────────────────────────────
@@ -818,7 +1005,23 @@ pub struct Registry {
     /// order. Each entry contributes a layer; later entries within
     /// the root layer have lower priority than earlier ones.
     root_dirs: Vec<(PathBuf, String)>, // (resolved_path, raw_decl_string)
-    root_includes_bundled: bool,
+    /// Whether the manifest's `skills:` list carries the `true`
+    /// marker. That marker is the operator's switch for every layer
+    /// the *binary* supplies rather than the operator: compile-time
+    /// [`BundledSkill`]s and runtime [`OwnedSkill`] layers alike. With
+    /// `skills: false` — or a list of paths that never says `true` —
+    /// neither surfaces, however many the host binary added.
+    binary_layers_enabled: bool,
+    /// Owned layers from [`Registry::add_layer`], in call order.
+    /// Later calls have higher priority than earlier ones, and the
+    /// whole set sits above bundled and below `inline_skills`.
+    owned_layers: Vec<(Vec<OwnedSkill>, SkillProvenance)>,
+    /// Inline skills declared as mapping entries in the manifest's
+    /// `skills:` list, collected by `layer_dirs` in declaration order.
+    /// They form one layer between `owned_layers` and `root_dirs`
+    /// whatever their position in the list; within the layer, a later
+    /// entry of a duplicated name wins.
+    inline_skills: Vec<InlineSkill>,
     /// Project layer — auto-detected `<basename>.skills/` adjacent
     /// to the manifest YAML. Set via `auto_detect_project_layer`.
     project_dir: Option<PathBuf>,
@@ -835,7 +1038,9 @@ impl std::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("bundled", &self.bundled)
             .field("root_dirs", &self.root_dirs)
-            .field("root_includes_bundled", &self.root_includes_bundled)
+            .field("binary_layers_enabled", &self.binary_layers_enabled)
+            .field("owned_layers", &self.owned_layers)
+            .field("inline_skills", &self.inline_skills)
             .field("project_dir", &self.project_dir)
             .field(
                 "evaluator",
@@ -919,7 +1124,7 @@ impl Registry {
     /// downstream binaries with their own `include_str!`'d skills,
     /// once per custom tool.
     ///
-    /// Bundled skills sit at the bottom of the three-layer
+    /// Bundled skills sit at the bottom of the layer
     /// composition; later layers override them when names collide.
     /// Within the bundled set, the downstream binary's skills win
     /// over framework defaults (the downstream calls `add_bundled`
@@ -952,11 +1157,63 @@ impl Registry {
         self.add_bundled_many(defaults)
     }
 
-    /// Layer in skill directories declared in the manifest's
-    /// `skills:` field, walked in declaration order. Each path
-    /// becomes a domain-pack-layer source; the bundled marker
-    /// `true` is acknowledged but its skills are already in the
-    /// bundled layer via `add_bundled`/`merge_framework_defaults`.
+    /// Add a layer of runtime-supplied [`OwnedSkill`] bodies, labelled
+    /// by `provenance`.
+    ///
+    /// The layer sits **above** the bundled layer and **below** the
+    /// operator's declared `skills:` directories and the project
+    /// layer, so a host binary can ship skills alongside the artefact
+    /// it serves while leaving the operator the final word.
+    ///
+    /// Call it as many times as there are sources; **later calls
+    /// override earlier ones** for the same skill name, the same way
+    /// the project layer overrides a domain pack. Within one call the
+    /// later entry of a duplicated name wins.
+    ///
+    /// Owned skills are only reachable when the manifest's `skills:`
+    /// list carries the `true` marker — the same switch that gates the
+    /// bundled layer. With `skills: false` nothing here surfaces.
+    ///
+    /// Unlike bundled skills, a malformed body — bad frontmatter, a
+    /// `name` that disagrees with [`OwnedSkill::name`], or a body over
+    /// [`HARD_SIZE_LIMIT_BYTES`] — is a [`ParseWarning`] on the
+    /// resolved registry and the entry is dropped; the rest of the
+    /// layer still loads. Bodies assembled at runtime are data, not
+    /// code, and a single bad row must not deny service.
+    ///
+    /// `provenance` is expected to be [`SkillProvenance::Owned`] with
+    /// the caller's label for this layer (`"graph"`, `"tenant-pack"`,
+    /// …); that is the variant this layer exists for. Any other
+    /// variant is accepted and attached to the resolved skills
+    /// verbatim — it only changes how the skills are *reported* (the
+    /// collision log, the CLI provenance column), never where the
+    /// layer sits in the resolution order. The parameter is the whole
+    /// provenance rather than a bare label so that a caller
+    /// re-materialising skills it had previously read from disk can
+    /// keep the original attribution.
+    pub fn add_layer(
+        mut self,
+        skills: impl IntoIterator<Item = OwnedSkill>,
+        provenance: SkillProvenance,
+    ) -> Self {
+        self.owned_layers
+            .push((skills.into_iter().collect(), provenance));
+        self
+    }
+
+    /// Layer in the sources declared in the manifest's `skills:`
+    /// field, walked in declaration order. Each path becomes a
+    /// domain-pack-layer source; the `true` marker adds no source of
+    /// its own — it switches on the layers the binary already holds,
+    /// from `add_bundled`/`merge_framework_defaults` and from
+    /// [`Registry::add_layer`]. Each mapping entry is an inline skill,
+    /// collected into the single inline layer that sits between the
+    /// owned layers and the declared directories.
+    ///
+    /// Inline entries are the operator's own declaration, like the
+    /// paths beside them, so they surface whether or not the list also
+    /// carries `true`; only `skills: false` (which declares no entries
+    /// at all) hides them.
     ///
     /// Path resolution uses the same conventions as the rest of the
     /// manifest (`./foo` relative to YAML dir, `~/foo` home-relative,
@@ -974,15 +1231,16 @@ impl Registry {
             SkillsSource::Disabled => {
                 // Skills disabled entirely — return the registry
                 // unchanged. Downstream may still have called
-                // add_bundled, but those won't be reachable without
-                // a layer telling us skills are enabled.
-                self.root_includes_bundled = false;
+                // add_bundled or add_layer, but those won't be
+                // reachable without a layer telling us skills are
+                // enabled.
+                self.binary_layers_enabled = false;
             }
             SkillsSource::Sources(sources) => {
                 for src in sources {
                     match src {
                         SkillSource::Bundled => {
-                            self.root_includes_bundled = true;
+                            self.binary_layers_enabled = true;
                         }
                         SkillSource::Path(raw) => {
                             let resolved = resolve_skill_path(raw, manifest_dir);
@@ -993,6 +1251,9 @@ impl Registry {
                                 });
                             }
                             self.root_dirs.push((resolved, raw.clone()));
+                        }
+                        SkillSource::Inline(inline) => {
+                            self.inline_skills.push(inline.clone());
                         }
                     }
                 }
@@ -1014,13 +1275,15 @@ impl Registry {
         self
     }
 
-    /// Resolve all three layers and return the final registry.
+    /// Resolve every layer and return the final registry.
     ///
     /// Resolution order per skill name: project > root layer
-    /// (in declaration order) > bundled. The first source that
-    /// contributes a skill with the given name wins; later sources
-    /// are ignored for that name (no merging, no inheritance —
-    /// full-file replacement).
+    /// (in declaration order) > inline manifest entries > owned layers
+    /// (later [`add_layer`](Registry::add_layer) calls first) >
+    /// bundled. The
+    /// first source that contributes a skill with the given name
+    /// wins; later sources are ignored for that name (no merging, no
+    /// inheritance — full-file replacement).
     ///
     /// At this point the framework:
     /// - Parses all skill files (frontmatter validation)
@@ -1032,7 +1295,9 @@ impl Registry {
         let Self {
             bundled,
             root_dirs,
-            root_includes_bundled,
+            binary_layers_enabled,
+            owned_layers,
+            inline_skills,
             project_dir,
             evaluator,
         } = self;
@@ -1040,7 +1305,7 @@ impl Registry {
         // Parse bundled skills first. These are the lowest-priority
         // layer; they get overridden by anything declared above.
         let mut bundled_skills: Vec<Skill> = Vec::with_capacity(bundled.len());
-        if root_includes_bundled {
+        if binary_layers_enabled {
             for b in &bundled {
                 let path = PathBuf::from(format!("<bundled:{}>", b.name));
                 let (frontmatter, body) =
@@ -1065,10 +1330,142 @@ impl Registry {
             }
         }
 
-        // Root layer: walk each declared path; first wins per name.
         // Accumulate parse warnings across all layers so the resolved
         // registry can surface them to downstream binaries.
         let mut parse_warnings: Vec<ParseWarning> = Vec::new();
+
+        // Owned layers: runtime-supplied bodies, gated by the same
+        // `skills: [true]` marker as the bundled layer. Every failure
+        // here is a warning, not an error — the bodies are data the
+        // host assembled at boot, so one bad entry drops itself and
+        // leaves the rest of the layer standing.
+        let mut owned_skills_per_layer: Vec<Vec<Skill>> = Vec::with_capacity(owned_layers.len());
+        if binary_layers_enabled {
+            for (entries, provenance) in &owned_layers {
+                let label = owned_layer_label(provenance);
+                let mut layer: Vec<Skill> = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let path = PathBuf::from(format!("<owned:{label}:{}>", entry.name));
+                    if entry.body.len() > HARD_SIZE_LIMIT_BYTES {
+                        let error = SkillError::SkillTooLarge {
+                            path: path.clone(),
+                            bytes: entry.body.len(),
+                            limit: HARD_SIZE_LIMIT_BYTES,
+                        };
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "owned skill exceeds the hard size limit; skipping"
+                        );
+                        parse_warnings.push(ParseWarning {
+                            path,
+                            error: error.to_string(),
+                        });
+                        continue;
+                    }
+                    if entry.body.len() > SOFT_SIZE_LIMIT_BYTES {
+                        tracing::warn!(
+                            path = %path.display(),
+                            bytes = entry.body.len(),
+                            soft_limit = SOFT_SIZE_LIMIT_BYTES,
+                            "owned skill exceeds the soft size limit; consider splitting"
+                        );
+                    }
+                    let (frontmatter, body) = match parse_skill(&entry.body, &path) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "failed to parse owned skill; skipping"
+                            );
+                            parse_warnings.push(ParseWarning {
+                                path,
+                                error: e.to_string(),
+                            });
+                            continue;
+                        }
+                    };
+                    if frontmatter.name != entry.name {
+                        let error = format!(
+                            "frontmatter name {:?} does not match the owned key {:?}",
+                            frontmatter.name, entry.name
+                        );
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "owned skill name mismatch; skipping"
+                        );
+                        parse_warnings.push(ParseWarning { path, error });
+                        continue;
+                    }
+                    layer.push(Skill {
+                        frontmatter,
+                        body,
+                        provenance: provenance.clone(),
+                    });
+                }
+                owned_skills_per_layer.push(layer);
+            }
+        }
+
+        // Inline layer: skills written out in the manifest's `skills:`
+        // list. Rendered back to SKILL.md text and parsed on the same
+        // path as a file, so the same validation and size limits
+        // apply. Not gated by `binary_layers_enabled`: an inline entry
+        // is the operator's own declaration, exactly like a path
+        // beside it, so it does not wait on the `- true` marker that
+        // switches on the layers the *binary* supplies.
+        let mut inline_skill_layer: Vec<Skill> = Vec::with_capacity(inline_skills.len());
+        for inline in &inline_skills {
+            let path = PathBuf::from(format!("<inline:{}>", inline.name));
+            let rendered = render_inline_skill(inline);
+            if rendered.len() > HARD_SIZE_LIMIT_BYTES {
+                let error = SkillError::SkillTooLarge {
+                    path: path.clone(),
+                    bytes: rendered.len(),
+                    limit: HARD_SIZE_LIMIT_BYTES,
+                };
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "inline skill exceeds the hard size limit; skipping"
+                );
+                parse_warnings.push(ParseWarning {
+                    path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+            if rendered.len() > SOFT_SIZE_LIMIT_BYTES {
+                tracing::warn!(
+                    path = %path.display(),
+                    bytes = rendered.len(),
+                    soft_limit = SOFT_SIZE_LIMIT_BYTES,
+                    "inline skill exceeds the soft size limit; consider splitting"
+                );
+            }
+            match parse_skill(&rendered, &path) {
+                Ok((frontmatter, body)) => inline_skill_layer.push(Skill {
+                    frontmatter,
+                    body,
+                    provenance: SkillProvenance::Inline,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to parse inline skill; skipping"
+                    );
+                    parse_warnings.push(ParseWarning {
+                        path,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Root layer: walk each declared path; first wins per name.
         let mut root_skills_per_dir: Vec<Vec<Skill>> = Vec::with_capacity(root_dirs.len());
         for (resolved, _raw) in &root_dirs {
             let provenance = SkillProvenance::DomainPack(resolved.clone());
@@ -1090,7 +1487,9 @@ impl Registry {
         // Resolve per skill name. Priority:
         //   1. Project layer
         //   2. Root layer entries in declaration order
-        //   3. Bundled (downstream entries first, then framework)
+        //   3. Inline entries from the manifest's `skills:` list
+        //   4. Owned layers (later `add_layer` calls win)
+        //   5. Bundled (downstream entries first, then framework)
         //
         // The bundled list is already in downstream-first order
         // because downstream binaries call `add_bundled` before
@@ -1099,10 +1498,29 @@ impl Registry {
         let mut resolved: HashMap<String, Skill> = HashMap::new();
         let mut collisions: HashMap<String, Vec<SkillProvenance>> = HashMap::new();
 
-        // Lowest priority first: bundled, then root in reverse
+        // Lowest priority first: bundled, then owned layers in call
+        // order, then the inline layer, then root in reverse
         // declaration order, then project. Later inserts overwrite.
         // We track collisions for the boot log.
         for skill in &bundled_skills {
+            let name = skill.name().to_string();
+            collisions
+                .entry(name.clone())
+                .or_default()
+                .push(skill.provenance.clone());
+            resolved.insert(name, skill.clone());
+        }
+        for skills in &owned_skills_per_layer {
+            for skill in skills {
+                let name = skill.name().to_string();
+                collisions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(skill.provenance.clone());
+                resolved.insert(name, skill.clone());
+            }
+        }
+        for skill in &inline_skill_layer {
             let name = skill.name().to_string();
             collisions
                 .entry(name.clone())
@@ -1148,7 +1566,8 @@ impl Registry {
             }
         }
 
-        // Check session-total size limit.
+        // Check session-total size limit. Every resolved skill counts,
+        // whatever its delivery tier — see the constant's doc comment.
         let total_bytes: usize = resolved.values().map(|s| s.body.len()).sum();
         if total_bytes > SESSION_TOTAL_LIMIT_BYTES {
             tracing::warn!(
@@ -1172,7 +1591,21 @@ fn format_provenance(p: &SkillProvenance) -> String {
     match p {
         SkillProvenance::Project => "project".to_string(),
         SkillProvenance::DomainPack(path) => format!("pack:{}", path.display()),
+        SkillProvenance::Owned(label) => format!("owned:{label}"),
+        SkillProvenance::Inline => "inline".to_string(),
         SkillProvenance::Bundled => "bundled".to_string(),
+    }
+}
+
+/// The label an owned layer's synthetic warning paths carry
+/// (`<owned:LABEL:NAME>`). For the expected
+/// [`SkillProvenance::Owned`] that is the caller's label verbatim;
+/// any other variant falls back to its collision-log rendering so the
+/// path still points at a recognisable source.
+fn owned_layer_label(p: &SkillProvenance) -> String {
+    match p {
+        SkillProvenance::Owned(label) => label.clone(),
+        other => format_provenance(other),
     }
 }
 
@@ -1237,6 +1670,17 @@ impl ResolvedRegistry {
     /// Number of resolved skills.
     pub fn len(&self) -> usize {
         self.skills.len()
+    }
+
+    /// Summed body size of every resolved skill, in bytes — the
+    /// number checked against [`SESSION_TOTAL_LIMIT_BYTES`] at
+    /// [`Registry::finalise`] time.
+    ///
+    /// Delivery tier does not enter into it: a [`Delivery::Lazy`]
+    /// body is one `skill(name)` call away, so it is part of what a
+    /// single session can pull.
+    pub fn total_body_bytes(&self) -> usize {
+        self.skills.values().map(|s| s.body.len()).sum()
     }
 
     /// Whether the registry contains any skills.
@@ -1757,7 +2201,7 @@ Body.\n";
     }
 
     #[test]
-    fn registry_three_layer_resolution_project_wins_over_bundled() {
+    fn registry_layer_resolution_project_wins_over_bundled() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = dir.path().join("test_mcp.yaml");
         fs::write(&yaml, "name: x\n").unwrap();
@@ -1844,6 +2288,702 @@ Body.\n";
             )
             .unwrap_err();
         assert!(matches!(err, SkillError::PathNotFound { .. }));
+    }
+
+    // ─── Delivery tier ────────────────────────────────────────────
+
+    #[test]
+    fn delivery_defaults_to_lazy_when_absent() {
+        // Mutation: flip `#[default]` on `Delivery` to `Eager`.
+        let content = "---\nname: foo\ndescription: A foo skill.\n---\n\nBody.\n";
+        let (frontmatter, _) = parse_skill(content, Path::new("t.md")).unwrap();
+        assert_eq!(frontmatter.delivery, Delivery::Lazy);
+    }
+
+    #[test]
+    fn delivery_parses_both_tiers_lowercase() {
+        for (yaml, expected) in [("eager", Delivery::Eager), ("lazy", Delivery::Lazy)] {
+            let content =
+                format!("---\nname: foo\ndescription: d.\ndelivery: {yaml}\n---\n\nBody.\n");
+            let (frontmatter, _) = parse_skill(&content, Path::new("t.md")).unwrap();
+            assert_eq!(frontmatter.delivery, expected);
+        }
+    }
+
+    #[test]
+    fn delivery_rejects_any_other_value() {
+        // Mutation: make `delivery` an `Option<String>` again — the
+        // parse succeeds and the bogus tier survives unchecked.
+        let content = "---\nname: foo\ndescription: d.\ndelivery: bogus\n---\n\nBody.\n";
+        let err = parse_skill(content, Path::new("t.md")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, SkillError::InvalidFrontmatter { .. }),
+            "expected a frontmatter error, got {message}"
+        );
+        assert!(
+            message.contains("bogus") && message.contains("eager"),
+            "the error should name the bad value and the valid set: {message}"
+        );
+    }
+
+    #[test]
+    fn bad_delivery_on_disk_is_a_parse_warning_not_a_failure() {
+        // Mutation: propagate the parse error with `?` in
+        // `load_skills_from_dir` — the good skill disappears too.
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_skill(&skills_dir, "good", &minimal_skill("good"));
+        write_skill(
+            &skills_dir,
+            "bad",
+            "---\nname: bad\ndescription: d.\ndelivery: bogus\n---\n\nBody.\n",
+        );
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.skill_names(), vec!["good".to_string()]);
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].error.contains("bogus"),
+            "warning should name the rejected tier: {}",
+            warnings[0].error
+        );
+    }
+
+    #[test]
+    fn bad_delivery_on_a_bundled_skill_is_fatal() {
+        // Mutation: downgrade the bundled parse arm in `finalise` to a
+        // warning — the registry resolves and the server boots with a
+        // skill nobody validated.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+        let err = Registry::new()
+            .add_bundled(BundledSkill {
+                name: "foo",
+                body: "---\nname: foo\ndescription: d.\ndelivery: bogus\n---\nbody\n",
+            })
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap_err();
+        assert!(
+            matches!(err, SkillError::BundledSkillInvalid { name: "foo", .. }),
+            "expected BundledSkillInvalid, got {err}"
+        );
+    }
+
+    #[test]
+    fn total_body_bytes_counts_lazy_bodies_too() {
+        // The session-size rule: a lazy body is one `skill()` call
+        // away, so it is charged at resolve time exactly like an eager
+        // one. Mutation: filter `total_body_bytes` to eager skills —
+        // the lazy body stops counting and the assertion fails.
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("test_mcp.skills");
+        fs::create_dir(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir,
+            "lazy_one",
+            "---\nname: lazy_one\ndescription: d.\ndelivery: lazy\n---\nLAZYBODY\n",
+        );
+        write_skill(
+            &skills_dir,
+            "eager_one",
+            "---\nname: eager_one\ndescription: d.\ndelivery: eager\n---\nEAGERBODY\n",
+        );
+        let yaml = yaml_in(dir.path());
+        let registry = Registry::new()
+            .auto_detect_project_layer(&yaml)
+            .finalise()
+            .unwrap();
+
+        let expected: usize = registry.iter().map(|(_, s)| s.body.len()).sum();
+        assert_eq!(registry.total_body_bytes(), expected);
+        assert_eq!(
+            registry.total_body_bytes(),
+            registry.get("lazy_one").unwrap().body.len()
+                + registry.get("eager_one").unwrap().body.len()
+        );
+    }
+
+    // ─── Owned layer (`add_layer`) ────────────────────────────────
+
+    /// A well-formed owned entry whose frontmatter matches `name`.
+    fn owned(name: &str, description: &str) -> OwnedSkill {
+        OwnedSkill {
+            name: name.to_string(),
+            body: format!(
+                "---\nname: {name}\ndescription: {description}\n---\n{description} body\n"
+            ),
+        }
+    }
+
+    fn yaml_in(dir: &Path) -> PathBuf {
+        let yaml = dir.join("test_mcp.yaml");
+        fs::write(&yaml, "name: x\n").unwrap();
+        yaml
+    }
+
+    #[test]
+    fn owned_layer_overrides_bundled() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_bundled(BundledSkill {
+                name: "foo",
+                body: "---\nname: foo\ndescription: from bundled.\n---\nbundled body\n",
+            })
+            .add_layer(
+                [owned("foo", "from owned.")],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from owned.");
+        assert_eq!(
+            skill.provenance,
+            SkillProvenance::Owned("graph".to_string())
+        );
+    }
+
+    #[test]
+    fn owned_layer_loses_to_declared_root_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let pack = dir.path().join("pack");
+        fs::create_dir(&pack).unwrap();
+        fs::write(
+            pack.join("foo.md"),
+            "---\nname: foo\ndescription: from pack.\n---\npack body\n",
+        )
+        .unwrap();
+
+        let registry = Registry::new()
+            .add_layer(
+                [owned("foo", "from owned.")],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(
+                &SkillsSource::Sources(vec![
+                    SkillSource::Bundled,
+                    SkillSource::Path("./pack".into()),
+                ]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from pack.");
+        assert!(matches!(skill.provenance, SkillProvenance::DomainPack(_)));
+    }
+
+    #[test]
+    fn owned_layer_later_call_overrides_earlier() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_layer(
+                [owned("foo", "from first.")],
+                SkillProvenance::Owned("first".to_string()),
+            )
+            .add_layer(
+                [owned("foo", "from second.")],
+                SkillProvenance::Owned("second".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from second.");
+        assert_eq!(
+            skill.provenance,
+            SkillProvenance::Owned("second".to_string())
+        );
+    }
+
+    #[test]
+    fn owned_layer_malformed_entry_warns_and_rest_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_layer(
+                [
+                    OwnedSkill {
+                        name: "broken".to_string(),
+                        // No frontmatter delimiters at all.
+                        body: "just a body, no frontmatter\n".to_string(),
+                    },
+                    owned("intact", "from owned."),
+                ],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert!(registry.get("broken").is_none());
+        assert_eq!(registry.get("intact").unwrap().description(), "from owned.");
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].path,
+            PathBuf::from("<owned:graph:broken>"),
+            "the warning must name the layer label and the entry"
+        );
+    }
+
+    #[test]
+    fn owned_layer_name_mismatch_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_layer(
+                [OwnedSkill {
+                    name: "declared".to_string(),
+                    body: "---\nname: actual\ndescription: mismatched.\n---\nbody\n".to_string(),
+                }],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert!(registry.is_empty(), "neither key may resolve");
+        assert!(registry.get("actual").is_none());
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, PathBuf::from("<owned:graph:declared>"));
+        assert!(
+            warnings[0].error.contains("does not match"),
+            "warning should explain the mismatch: {}",
+            warnings[0].error
+        );
+    }
+
+    #[test]
+    fn owned_layer_oversized_entry_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let huge = format!(
+            "---\nname: huge\ndescription: too big.\n---\n{}\n",
+            "x".repeat(HARD_SIZE_LIMIT_BYTES)
+        );
+        let registry = Registry::new()
+            .add_layer(
+                [OwnedSkill {
+                    name: "huge".to_string(),
+                    body: huge,
+                }],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert!(registry.is_empty());
+        assert_eq!(registry.parse_warnings().len(), 1);
+        assert!(registry.parse_warnings()[0].error.contains("hard limit"));
+    }
+
+    #[test]
+    fn owned_layer_hidden_when_skills_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_layer(
+                [owned("foo", "from owned.")],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(&SkillsSource::Disabled, &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert!(
+            registry.is_empty(),
+            "skills: false must hide owned entries the way it hides bundled"
+        );
+        assert!(
+            registry.parse_warnings().is_empty(),
+            "a disabled layer is not parsed at all"
+        );
+    }
+
+    #[test]
+    fn owned_provenance_renders_with_its_label() {
+        // The collision log, the `skills-list` provenance column and
+        // the pyo3 `Skill.provenance` string all render provenance
+        // through a match; this is the framework-side rendering.
+        assert_eq!(
+            format_provenance(&SkillProvenance::Owned("graph".to_string())),
+            "owned:graph"
+        );
+        assert_eq!(
+            owned_layer_label(&SkillProvenance::Owned("graph".to_string())),
+            "graph"
+        );
+        // A non-owned provenance passed to `add_layer` still labels
+        // its warning paths recognisably.
+        assert_eq!(owned_layer_label(&SkillProvenance::Bundled), "bundled");
+    }
+
+    #[test]
+    fn owned_layer_accepts_a_non_owned_provenance_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_bundled(BundledSkill {
+                name: "foo",
+                body: "---\nname: foo\ndescription: from bundled.\n---\nbundled body\n",
+            })
+            .add_layer([owned("foo", "from owned.")], SkillProvenance::Project)
+            .layer_dirs(&SkillsSource::Sources(vec![SkillSource::Bundled]), &yaml)
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from owned.");
+        assert_eq!(
+            skill.provenance,
+            SkillProvenance::Project,
+            "the label is reported verbatim; it does not move the layer"
+        );
+    }
+
+    // ─── Inline layer (`skills:` mapping entries) ─────────────────
+
+    /// A minimal well-formed inline entry.
+    fn inline(name: &str, description: &str) -> InlineSkill {
+        InlineSkill {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: format!("{description} body\n"),
+            references_tools: Vec::new(),
+            delivery: None,
+            applies_when: None,
+        }
+    }
+
+    #[test]
+    fn inline_layer_overrides_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_layer(
+                [owned("foo", "from owned.")],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(
+                &SkillsSource::Sources(vec![
+                    SkillSource::Bundled,
+                    SkillSource::Inline(inline("foo", "from inline.")),
+                ]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from inline.");
+        assert_eq!(skill.provenance, SkillProvenance::Inline);
+    }
+
+    #[test]
+    fn inline_layer_loses_to_declared_root_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let pack = dir.path().join("pack");
+        fs::create_dir(&pack).unwrap();
+        fs::write(
+            pack.join("foo.md"),
+            "---\nname: foo\ndescription: from pack.\n---\npack body\n",
+        )
+        .unwrap();
+
+        let registry = Registry::new()
+            .layer_dirs(
+                &SkillsSource::Sources(vec![
+                    SkillSource::Inline(inline("foo", "from inline.")),
+                    SkillSource::Path("./pack".into()),
+                ]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        let skill = registry.get("foo").unwrap();
+        assert_eq!(skill.description(), "from pack.");
+        assert!(matches!(skill.provenance, SkillProvenance::DomainPack(_)));
+    }
+
+    #[test]
+    fn inline_layer_precedence_ignores_list_position() {
+        // The inline layer is fixed between owned and the declared
+        // dirs. Writing the mapping *after* the path must not promote
+        // it above the path, and writing it before must not demote it
+        // below the owned layer. Both orders resolve identically.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let pack = dir.path().join("pack");
+        fs::create_dir(&pack).unwrap();
+        fs::write(
+            pack.join("dir_wins.md"),
+            "---\nname: dir_wins\ndescription: from pack.\n---\npack body\n",
+        )
+        .unwrap();
+
+        let path_entry = SkillSource::Path("./pack".into());
+        let dir_contested = SkillSource::Inline(inline("dir_wins", "from inline."));
+        let owned_contested = SkillSource::Inline(inline("inline_wins", "from inline."));
+
+        for (label, sources) in [
+            (
+                "inline first",
+                vec![
+                    SkillSource::Bundled,
+                    dir_contested.clone(),
+                    owned_contested.clone(),
+                    path_entry.clone(),
+                ],
+            ),
+            (
+                "inline last",
+                vec![
+                    SkillSource::Bundled,
+                    path_entry.clone(),
+                    dir_contested.clone(),
+                    owned_contested.clone(),
+                ],
+            ),
+        ] {
+            let registry = Registry::new()
+                .add_layer(
+                    [owned("inline_wins", "from owned.")],
+                    SkillProvenance::Owned("graph".to_string()),
+                )
+                .layer_dirs(&SkillsSource::Sources(sources), &yaml)
+                .unwrap()
+                .finalise()
+                .unwrap();
+
+            assert_eq!(
+                registry.get("dir_wins").unwrap().description(),
+                "from pack.",
+                "a declared dir outranks inline regardless of order ({label})"
+            );
+            assert_eq!(
+                registry.get("inline_wins").unwrap().description(),
+                "from inline.",
+                "inline outranks owned regardless of order ({label})"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_layer_surfaces_without_the_bundled_marker() {
+        // Inline entries are the operator's own declaration, like the
+        // paths beside them — they must not wait on the `- true`
+        // marker that switches on the binary-supplied layers.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .add_bundled(BundledSkill {
+                name: "framework",
+                body: "---\nname: framework\ndescription: from bundled.\n---\nbundled body\n",
+            })
+            .add_layer(
+                [owned("carried", "from owned.")],
+                SkillProvenance::Owned("graph".to_string()),
+            )
+            .layer_dirs(
+                &SkillsSource::Sources(vec![SkillSource::Inline(inline("foo", "from inline."))]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(
+            registry.skill_names(),
+            vec!["foo".to_string()],
+            "the inline entry surfaces; the binary-supplied layers stay gated"
+        );
+        assert_eq!(registry.get("foo").unwrap().description(), "from inline.");
+    }
+
+    #[test]
+    fn inline_entry_carries_its_optional_frontmatter_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let registry = Registry::new()
+            .layer_dirs(
+                &SkillsSource::Sources(vec![SkillSource::Inline(InlineSkill {
+                    name: "recipes".to_string(),
+                    // A colon in the description is the classic YAML
+                    // trap that string-interpolated frontmatter loses.
+                    description: "House recipes: start here.".to_string(),
+                    body: "# Recipes\n\nProject explicit columns.\n".to_string(),
+                    references_tools: vec!["cypher_query".to_string()],
+                    delivery: Some("lazy".to_string()),
+                    applies_when: Some(AppliesWhen {
+                        graph_has_node_type: Some(vec!["Function".to_string()]),
+                        ..Default::default()
+                    }),
+                })]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        let skill = registry.get("recipes").unwrap();
+        assert_eq!(skill.description(), "House recipes: start here.");
+        assert_eq!(skill.body, "# Recipes\n\nProject explicit columns.\n");
+        assert_eq!(skill.frontmatter.references_tools, ["cypher_query"]);
+        assert_eq!(skill.frontmatter.delivery, Delivery::Lazy);
+        assert_eq!(
+            skill.frontmatter.applies_when,
+            Some(AppliesWhen {
+                graph_has_node_type: Some(vec!["Function".to_string()]),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn inline_layer_oversized_entry_warns_and_rest_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let mut huge = inline("huge", "too big.");
+        huge.body = "x".repeat(HARD_SIZE_LIMIT_BYTES);
+
+        let registry = Registry::new()
+            .layer_dirs(
+                &SkillsSource::Sources(vec![
+                    SkillSource::Inline(huge),
+                    SkillSource::Inline(inline("intact", "from inline.")),
+                ]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert!(registry.get("huge").is_none());
+        assert_eq!(
+            registry.get("intact").unwrap().description(),
+            "from inline."
+        );
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].path,
+            PathBuf::from("<inline:huge>"),
+            "the warning must name the inline entry"
+        );
+        assert!(warnings[0].error.contains("hard limit"));
+    }
+
+    #[test]
+    fn inline_entry_rejected_by_parse_skill_warns_rather_than_failing() {
+        // The manifest parser guarantees non-empty name/description/
+        // body, but `InlineSkill`'s fields are public, so a Rust
+        // caller can hand `layer_dirs` an entry `parse_skill` refuses.
+        // That is data, like a bad file in a pack: warn and carry on.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = yaml_in(dir.path());
+
+        let mut nameless = inline("nameless", "from inline.");
+        nameless.name = String::new();
+
+        let registry = Registry::new()
+            .layer_dirs(
+                &SkillsSource::Sources(vec![
+                    SkillSource::Inline(nameless),
+                    SkillSource::Inline(inline("intact", "from inline.")),
+                ]),
+                &yaml,
+            )
+            .unwrap()
+            .finalise()
+            .unwrap();
+
+        assert_eq!(registry.skill_names(), vec!["intact".to_string()]);
+        let warnings = registry.parse_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, PathBuf::from("<inline:>"));
+        assert!(
+            warnings[0].error.contains("name"),
+            "warning should name the missing field: {}",
+            warnings[0].error
+        );
+    }
+
+    #[test]
+    fn inline_provenance_renders_as_inline() {
+        assert_eq!(format_provenance(&SkillProvenance::Inline), "inline");
+    }
+
+    #[test]
+    fn rendered_inline_skill_round_trips_through_parse_skill() {
+        // The render is only correct if `parse_skill` gives back what
+        // went in — the layer relies on that, and a body that happens
+        // to contain a `---` line is the case a naive renderer loses.
+        let entry = InlineSkill {
+            name: "tricky".to_string(),
+            description: "Body: with a rule.".to_string(),
+            body: "intro\n\n---\n\noutro\n".to_string(),
+            references_tools: vec!["a".to_string()],
+            delivery: Some("eager".to_string()),
+            applies_when: None,
+        };
+        let rendered = render_inline_skill(&entry);
+        let (frontmatter, body) = parse_skill(&rendered, Path::new("<inline:tricky>")).unwrap();
+        assert_eq!(frontmatter.name, "tricky");
+        assert_eq!(frontmatter.description, "Body: with a rule.");
+        assert_eq!(frontmatter.references_tools, ["a"]);
+        assert_eq!(frontmatter.delivery, Delivery::Eager);
+        assert_eq!(body, entry.body);
     }
 
     #[test]

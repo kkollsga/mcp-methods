@@ -21,7 +21,7 @@ This proposal: **make the MCP server itself skills-aware** rather than building 
 
 2. **Library-bundled defaults — protocol-level only.** `skills: true` gives every operator rich methodology for the framework's tools and the downstream binary's custom tools. Critical constraint: **bundled skills teach the TOOL, not the GRAPH.** They never embed domain knowledge (legal jurisdiction, o&g well_id conventions, code-tree types). Domain methodology lives in operator-curated layers, not framework or downstream-binary bundles.
 
-3. **Three-layer composition** (project → domain packs → bundled defaults). A polymorphic `skills:` field accepts `true`, paths, or a mixed list — each entry is a skill source, walked in declaration order with project-local `<basename>.skills/` always at top priority. The middle layer is **first-class for domain skill-packs**: operators with multiple deployments (e.g. legal / o&g / code servers sharing protocol-level skills but with non-overlapping domain methodology) compose them naturally.
+3. **Layered composition** (project → domain packs → inline → owned → bundled defaults). A polymorphic `skills:` field accepts `true`, paths, inline skill mappings, or a mixed list — each entry is a skill source, walked in declaration order with project-local `<basename>.skills/` always at top priority. The middle layer is **first-class for domain skill-packs**: operators with multiple deployments (e.g. legal / o&g / code servers sharing protocol-level skills but with non-overlapping domain methodology) compose them naturally.
 
 4. **Staleness prevention via versioned frontmatter.** Every skill carries `applies_to:` semver constraints, `references_tools:` declarations, and `references_arguments:` references. Boot-time validation warns loudly on mismatches; a `skills-lint` CLI subcommand catches errors at PR time. Operators run linted skill packs through CI before deploying.
 
@@ -88,7 +88,7 @@ So: **the wins we care about can come into the MCP server.** The wins we'd lose 
 
 ---
 
-## 2. The three-layer skills model
+## 2. The layered skills model
 
 ### 2.1 The schema — polymorphic `skills:` field
 
@@ -104,15 +104,28 @@ skills: true
 # Enable with a single custom path:
 skills: ./local-skills/
 
-# Enable with a list mixing library defaults and paths:
+# Enable with a list mixing library defaults, paths, and inline skills:
 skills:
   - true                          # library-bundled (mcp-methods + downstream binary defaults)
   - ./local-overrides/            # this deployment's specific tweaks
   - ~/shared-mcp-skills/          # team's shared library (in user home)
   - /etc/org-skills/              # absolute path, e.g. enterprise-managed
+  - name: house_style             # an inline skill — body lives in this YAML
+    description: How this deployment names and cites things.
+    body: |
+      # House style
+
+      Cite by paragraph, never by page.
+    references_tools:             # optional
+      - cypher_query
+    delivery: lazy                # optional; `eager` | `lazy`, default `lazy` (§2.10)
+    applies_when:                 # optional; same predicates as a SKILL.md
+      graph_has_node_type: [Case]
 ```
 
-The `true` literal in a list is the special token meaning "include library-bundled skills." Other entries are filesystem paths.
+The `true` literal in a list is the special token meaning "include library-bundled skills." String entries are filesystem paths. **Mapping entries are inline skills**: the frontmatter keys that make sense without a file, plus the markdown `body` that would follow the closing `---`. `name`, `description` and `body` are required; unknown keys in the mapping are a manifest error, like an unknown `workspace:` or `builtins:` key. Inline entries all join one fixed layer wherever they appear in the list — see §2.2.
+
+`delivery:` is validated as `eager` or `lazy` so a typo fails at manifest load, and is carried into the rendered frontmatter where the injection pass reads it: `lazy` (the default when omitted) injects routing text plus a `skill("<name>")` pointer, `eager` injects the full body — see §2.10.
 
 **Path conventions match the existing manifest fields** (`source_root:`, `workspace.root:`, `env_file:`):
 
@@ -122,10 +135,11 @@ The `true` literal in a list is the special token meaning "include library-bundl
 | `~/team/` | User home (standard shell `$HOME` expansion) |
 | `/abs/path/` | Absolute |
 | `true` (boolean, in list) | Library-bundled skills (compiled into the binary) |
+| mapping (in list) | An inline skill — no path, the body is in the YAML |
 
-### 2.2 The three layers
+### 2.2 The layers
 
-When skills are enabled, three layers contribute. Each layer has a distinct purpose and authoring audience:
+When skills are enabled, up to five layers contribute. Each layer has a distinct purpose and authoring audience:
 
 ```
 Project layer (auto-detected, top priority):
@@ -147,6 +161,22 @@ Domain skill-pack layer (operator-declared paths in the `skills:` list):
                                                 kglite-skills-og pack,
                                                 kglite-skills-code pack
 
+Inline layer (mapping entries in the `skills:` list):
+  skills:                             one fixed layer, whatever the list order
+    - name: ...                       authored by: the deployment's operator
+      body: ...                       purpose: a skill too small or too
+                                               deployment-specific to earn a file
+                                      examples: "our citation convention",
+                                                "this tenant's table names"
+
+Owned layer (runtime bodies from `Registry::add_layer`):
+  supplied by the host binary at       assembled at boot from whatever the host
+  boot, not read from disk             reads — a graph file, a database row
+                                      authored by: whoever authored the artefact
+                                      purpose: an artefact that carries its own
+                                               usage methodology
+                                      examples: skills stored inside a .kgl graph
+
 Bundled layer (the `true` token in the `skills:` list):
   compiled into the binary via         include_str! at compile time
   include_str!                          framework + downstream binary defaults
@@ -158,11 +188,15 @@ Bundled layer (the `true` token in the `skills:` list):
                                                  common errors)
 ```
 
-Per skill name, resolution walks **project → domain → bundled** in priority order. First file with the matching `name` field wins. The skill body becomes an MCP prompt the agent loads on demand via `prompts/get`.
+Per skill name, resolution walks **project → domain → inline → owned → bundled** in priority order. The first source with the matching `name` field wins. The skill body becomes an MCP prompt the agent loads on demand via `prompts/get`.
 
-The three layers correspond to three distinct authoring audiences with non-overlapping responsibilities:
+The `true` token switches on the two layers the *binary* supplies — bundled and owned. The project, domain and inline layers are the operator's own declarations, so they surface without it; only `skills: false` (which declares nothing at all) hides everything.
+
+The layers correspond to distinct authoring audiences with non-overlapping responsibilities:
 
 - **Bundled (framework + downstream binary author)** ships protocol-level methodology that's identical across deployments. The library author writes once; every operator inherits.
+- **Owned (artefact author)** ships methodology that travels with the data the server serves, so a graph can teach its own use without the operator copying files.
+- **Inline (operator)** ships a skill small enough that a separate file would be more bookkeeping than content, in the same YAML that turns the feature on.
 - **Domain pack (specialist author)** ships methodology specific to a knowledge domain (legal, oil-and-gas, code analysis, etc.) but agnostic to a specific deployment. Authored once per domain, reused across many operator deployments.
 - **Project (operator)** ships per-deployment specifics — "this legal corpus uses Canadian citation conventions," "this o&g database has a non-standard well_id format." Authored once per deployment.
 
@@ -217,16 +251,22 @@ Full skill bodies load on demand when the agent decides a skill is relevant. Thi
 
 Crucially: the SKILL.md files are **plain markdown on the filesystem** (or compiled bytes for bundled defaults). An operator can symlink `./local-overrides/` to `~/.claude/skills/` and Claude Code's native skill loader reads the same files. The skill content is portable to skills-supporting clients even though the MCP server's tools aren't.
 
-### 2.6 Skills are static — no dynamic rendering
+### 2.6 Skill bodies are static; the resolved set is not
 
-Skills are pure markdown. The framework does NOT do server-side template substitution, run shell commands, or invoke tools to splice their output into skill bodies. **Skills teach the agent how to use tools; tools provide dynamic content when the agent decides to call them.**
+Two different things get called "dynamic", and only one of them is refused.
+
+**A skill body is never rendered.** Skills are pure markdown. The framework does NOT do server-side template substitution, run shell commands, or invoke tools to splice their output into skill bodies. **Skills teach the agent how to use tools; tools provide dynamic content when the agent decides to call them.**
+
+**The resolved set can change while the server runs.** Since 0.4.11 a downstream binary can re-run the whole resolution pass against a different registry after `serve`, via `McpServer::reinject_skills` (or a `SkillReloader` handle captured into a tool closure). That is what a server whose skills come from a swappable artefact needs: kglite reads `KgliteSkill` nodes out of the `.kgl`, and `load_graph`/`reload_graph` replaces the artefact those nodes live in. The rebuild strips the previous injection from every tool description, replaces the prompt routes the pass owns, re-registers `skill(name)` with the new bodies, and injects again; the caller then sends `notifications/tools/list_changed` and `notifications/prompts/list_changed` from the peer its request context already holds (`notify_skills_changed`). Capabilities advertise `listChanged` so a client has reason to re-fetch.
+
+The distinction is the point: the *set* of skills follows the artefact, and each skill's *text* is still the file (or the graph record) an operator can read, with no runtime state required to understand it. Nothing below about caching or portability changes — a body that changed under a session is simply re-nudged, because what the agent is holding is no longer what `skill()` would serve.
 
 This is the same separation Anthropic's own skills follow. The PDF skill doesn't pre-render document contents; it teaches the agent to call `pdfplumber.open()` to read what it needs. Same pattern: skill = methodology, tool = data access.
 
 This separation has practical benefits:
 - **Skill loading is cheap and deterministic** — no per-call cost variance, no surprise context blow-up if a tool's output happens to be large that session
 - **Skills are reviewable** — operator reads the file, sees exactly what the agent sees, no runtime state required to understand the behavior
-- **Caching is trivial** — files don't change between calls; no invalidation policy needed
+- **Invalidation has exactly one trigger** — a body never changes under a call, so the only thing that can invalidate a loaded skill is a deliberate re-resolve, and the rule there is one line: a name whose body hash changed is forgotten in every session, everything else stays loaded
 - **Cross-vendor portability is preserved** — Claude Code's filesystem skill loader sees the same content the MCP server sees, no template-tag parser required
 
 For dynamic content (graph schemas, current branch state, etc.), the skill instructs the agent to call the relevant tool. E.g. kglite's `cypher_query.md` would say "When you don't know the schema, call `graph_overview()` first" — and the agent does. The skill stays small and static; the dynamic content lives in the tool's response only when needed.
@@ -312,15 +352,28 @@ mcp-server: skill cypher_query: 3 candidates resolved.
 
 Same shape as the existing manifest-load summary. Operators see exactly which file the agent ends up loading. Prevents the "I dropped a file in `./skills/` and nothing happened" debugging loop.
 
-### 2.10 Tool descriptions auto-advertise their skills
+### 2.10 Tool descriptions auto-advertise their skills — two tiers
 
-When `auto_inject_hint: true` is set in a skill's frontmatter (default) AND the skill's name matches a registered tool, the framework injects a one-line pointer into the tool's `description`:
+When `auto_inject_hint: true` (the default), the framework appends the skill to the `description` of its **name-match tool and every tool it lists in `references_tools`**. `prompts/list` is not the delivery channel: Claude Code, Claude Desktop, Cursor and Continue expose only `tools/*` to the model, so a skill that lives only on the `prompts/` plane reaches nobody.
 
-> `tools/list` → `cypher_query: "Run a Cypher query against the active graph. **See prompts/get cypher_query for full methodology, common patterns, and error handling.**"`
+What gets appended depends on the skill's `delivery:` key. **The default is `lazy`.**
 
-Without this, agents don't know to call `prompts/list` and the skill investment is wasted. With it, the existing MCP tool-discovery flow naturally points at the skill surface.
+| `delivery:` | What lands in every target tool's description |
+|---|---|
+| `lazy` (default) | `<!-- mcp-skill:NAME -->`, `## When to use` + the description, and one line: `Load the full methodology with skill("NAME") before first use.` |
+| `eager` | `<!-- mcp-skill:NAME -->`, `## When to use` + the description, and `## Methodology` + the whole body |
 
-Opt-out per-skill (`auto_inject_hint: false`) for skills that are pure background context, not workflows.
+Both tiers ship the **description** eagerly — it is the TRIGGER/SKIP routing the agent reads to decide whether the body is worth having, it is small by design, and it is not subject to the body's size caps. They differ only in when the body is paid for.
+
+The lazy tier works because of the framework's **`skill(name)` tool**, registered by `serve_prompts` whenever skills are on. It returns the skill's body and is an ordinary MCP tool, so every client shows it to the model — which is exactly what the pre-0.3.37 `prompts/get` pointer could not claim. Loading is **per session**: `skill()` records what it delivered, and until it has, every call of a tool carrying an unloaded lazy skill comes back with one footer line naming the skill and the call that fetches it. Once loaded, the nudge stops for as long as the session keeps calling tools — any tool call is what keeps the record alive, not the last `skill()` call. A new session starts empty, so does one that made no tool call for ten minutes, and a re-resolve that changed a body forgets that name everywhere (§2.6). The loader is exempt from the default response budget so the body arrives verbatim; the exemption is bounded by the 16 KB per-skill hard limit, and it is the framework-owned loader only — a downstream tool that took the `skill` name is budgeted like any other.
+
+Choose `eager` only when the body shapes the **first** call's parameters — a query language the agent has to write correctly before it has any result to learn from (`cypher_query`). Everything else, including all five framework-bundled skills, is `lazy`.
+
+Both tiers carry the same `<!-- mcp-skill:NAME -->` marker, so the injection pass stays idempotent per `(skill, tool)` pair either way.
+
+A skill that **declares** targets and finds every one of them unregistered is dropped entirely — no prompt route, no injection, not in `skill()`'s active set. It had no channel to the agent, and listing it told operators otherwise. Declared targets are the name-match tool when a tool by that name exists, plus every `references_tools` entry. A skill that declares no targets at all — no tool shares its name and `references_tools` is empty — is *not* dropped: it stays listed, `skill(name)` serves it, and it injects nowhere, exactly as it always has.
+
+Opt-out per-skill (`auto_inject_hint: false`) for skills that are pure background context, not workflows. They stay reachable through `skill(name)` and `prompts/*`.
 
 ### 2.11 Size limits — anti-bloat
 
@@ -328,9 +381,11 @@ Skill size is bounded by the framework's lint and runtime limits:
 
 | Threshold | Behavior |
 |---|---|
-| 4 KB per skill | `skills-lint` warns ("getting long, consider splitting") |
-| 16 KB per skill | `skills-lint` hard-fails |
-| 64 KB total across all skills in one session | Framework refuses to register more skills; logs which were dropped |
+| 4 KB per skill | load logs a warning ("consider splitting"); `skills-lint` warns |
+| 16 KB per skill | load rejects the file — a hard error for a bundled skill, a `ParseWarning` for every other layer; `skills-lint` hard-fails |
+| 64 KB total across all resolved skills | `Registry::finalise` logs a warning naming the total and the skill count. Nothing is dropped: which skills an operator runs is the operator's call, and a framework that silently unregistered some of them would be the worse failure. |
+
+The session total is counted **at resolve time, over every resolved skill, both delivery tiers**. `lazy` changes when a body reaches the agent, not whether it can — one session may call `skill(name)` for every skill in the registry — so the worst case the limit bounds is the same as it was when every body shipped in the tool list. `ResolvedRegistry::total_body_bytes()` is the number.
 
 Numbers are tunable; the principle is "force authors to keep skills tight as a design discipline." Prevents the "operator copies their entire onboarding doc into a skill" anti-pattern.
 
@@ -338,7 +393,7 @@ Numbers are tunable; the principle is "force authors to keep skills tight as a d
 
 ## 3. End-to-end scenarios
 
-Six concrete `skills:` declarations. Scenarios A-E illustrate the schema mechanics; Scenario F shows kglite's actual three-deployment reality where the three-layer composition pays off.
+Six concrete `skills:` declarations. Scenarios A-E illustrate the schema mechanics; Scenario F shows kglite's actual three-deployment reality where the layered composition pays off.
 
 ### Scenario A — pure-current-MCP behavior (zero declaration)
 
@@ -446,7 +501,7 @@ skill-packs/                                 # domain skill-packs (authored by d
     └── code-tree-types.md
 ```
 
-Each manifest declares the same three-layer composition pattern, just with different domain pack paths:
+Each manifest declares the same composition pattern, just with different domain pack paths:
 
 ```yaml
 # legal_mcp.yaml
@@ -528,9 +583,14 @@ Take a 13-tool MCP setup (kglite-mcp-server + Gmail/Calendar/Drive OAuth + IDE t
 |---|---|
 | Eager-loaded tool registry (pre-Tool-Search baseline) | ~2,750 tokens |
 | Tool Search deferred names only (Claude Code today) | ~130 tokens |
-| Tool Search + skills-aware MCP metadata (this proposal) | ~500-700 tokens |
+| Tool Search + skills-aware MCP, `delivery: lazy` (the default) | ~300-400 tokens |
+| Tool Search + skills-aware MCP, `delivery: eager` everywhere | ~500-700 tokens, and it scales with skills × referenced tools |
 
-Tool Search alone saves ~95%. Adding skills-aware MCP **costs** ~400-500 tokens of methodology metadata on top, in exchange for accessible operator-authored guidance.
+Tool Search alone saves ~95%. Skills-aware MCP **costs** methodology metadata on top, in exchange for accessible operator-authored guidance — and the two tiers decide how much.
+
+The eager figure is the one that grows badly: a body is copied into *every* tool it references, so a cross-tool skill listed in five tools is paid five times, up front, in every session. kglite measured ~15-22 KB for a plain domain graph and ~60 KB for a code graph with recipes before 0.4.11 flipped the default.
+
+The lazy figure is close to flat in the number of skills: each skill contributes its routing description once per target tool, and the bodies move only when the agent calls `skill(name)` — once per session per skill, and only for the skills it actually reaches for. The `skill` tool itself is one extra entry in the tool list.
 
 The proposal is additive: it doesn't reduce Tool Search's already-low upfront cost; it adds a methodology layer alongside it.
 
