@@ -271,3 +271,64 @@ async fn domain_guidance_and_colliding_names_remain_usable() {
     let expanded = client.call("expand_response_", huge_budget).await;
     assert!(expanded.get("error").is_none());
 }
+
+/// A picture has no useful excerpt: a JSON Pointer into base64 PNG data is a
+/// broken image, not a smaller one. The dispatch boundary must hand binary
+/// content back whole and keep it out of the retention store, while a
+/// text-only result over the same budget is still previewed.
+#[tokio::test]
+async fn image_content_bypasses_the_budget_while_text_is_still_previewed() {
+    let data = "iVBORw0KGgo".repeat(20_000);
+    let png = data.clone();
+    let mut server = McpServer::new(ServerOptions::default());
+    let screenshot = rmcp::model::Tool::new(
+        "screenshot",
+        "renders a picture",
+        Arc::new(json!({"type":"object"}).as_object().unwrap().clone()),
+    );
+    server
+        .tool_router_mut()
+        .add_route(rmcp::handler::server::router::tool::ToolRoute::new_dyn(
+            screenshot,
+            move |_| {
+                let png = png.clone();
+                Box::pin(async move {
+                    Ok(rmcp::model::CallToolResult::success(vec![
+                        rmcp::model::ContentBlock::image(png, "image/png"),
+                        rmcp::model::ContentBlock::text("vault graph, 412 notes"),
+                    ])
+                    .into())
+                })
+            },
+        ));
+    server.register_typed_tool("bulk", "text only", |_: Args| "line\n".repeat(20_000));
+    let mut client = boot(server).await;
+
+    let tiny = json!({"max_bytes": 4096});
+    let result = client.call("screenshot", json!({"_response": tiny})).await;
+    assert!(result.get("error").is_none(), "{result}");
+    let content = &result["result"]["content"];
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["data"], data);
+    assert_eq!(content[0]["mimeType"], "image/png");
+    assert_eq!(content[1]["text"], "vault graph, 412 notes");
+    assert!(result["result"]["structuredContent"]
+        .get("mcp_methods_preview")
+        .is_none());
+    assert!(result["result"]["_meta"]
+        .get("mcp_methods/response_budget")
+        .is_none());
+
+    // Nothing was retained: the first id the store ever mints is `r1`, and it
+    // must still be unissued after the image call.
+    let stale = client
+        .call("expand_response", json!({"result_id":"r1"}))
+        .await;
+    assert!(stale.get("error").is_some(), "{stale}");
+
+    let text = client
+        .call("bulk", json!({"value":"x","_response": tiny}))
+        .await;
+    assert!(serde_json::to_vec(&text["result"]).unwrap().len() <= 4096);
+    assert_eq!(preview(&text)["result_id"], "r1");
+}

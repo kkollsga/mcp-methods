@@ -2571,7 +2571,7 @@ fn budgeted_tool(mut tool: Tool) -> Tool {
         .entry("properties")
         .or_insert_with(|| serde_json::json!({}))[&control] =
         crate::response_budget::options_schema();
-    let description = format!("{}\nResponses default to 16384 serialized bytes. Set {control}.mode=full for complete inline output or {control}.max_bytes for a larger per-call budget. Previews include calls to expand retained evidence without rerunning this tool.", tool.description.as_deref().unwrap_or(""));
+    let description = format!("{}\nResponses default to 16384 serialized bytes, except results carrying image, audio or resource content, which are returned whole. Set {control}.mode=full for complete inline output or {control}.max_bytes for a larger per-call budget. Previews include calls to expand retained evidence without rerunning this tool.", tool.description.as_deref().unwrap_or(""));
     tool.description = Some(description.into());
     if let Some(output) = tool.output_schema.take() {
         let mut output = output.as_ref().clone();

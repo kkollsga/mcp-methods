@@ -62,7 +62,9 @@ def install_response_budget(app) -> None:
                 store.options_schema()
             )
             tool.description = (tool.description or "") + (
-                f"\nResponses default to 16384 serialized bytes. Set {control}.mode=full "
+                f"\nResponses default to 16384 serialized bytes, except results carrying "
+                f"image, audio or resource content, which are returned whole. "
+                f"Set {control}.mode=full "
                 f"or {control}.max_bytes for a larger per-call budget. Previews include "
                 "calls to expand retained evidence without rerunning this tool."
             )

@@ -96,9 +96,10 @@ impl<S: PartialEq> ResponseStore<S> {
         self.entries.retain(|e| e.created.elapsed() < TTL);
     }
 
-    /// Apply the default to a complete result. Full calls and small results
-    /// retain their original shape. An uncacheable result is returned intact
-    /// with an explicit overage reason, never silently discarded after a write.
+    /// Apply the default to a complete result. Full calls, small results and
+    /// results carrying non-text content retain their original shape. An
+    /// uncacheable result is returned intact with an explicit overage reason,
+    /// never silently discarded after a write.
     pub fn present(
         &mut self,
         owner: S,
@@ -110,7 +111,7 @@ impl<S: PartialEq> ResponseStore<S> {
     ) -> Value {
         self.expire();
         let bytes = size(&result);
-        if options.mode == Mode::Full || bytes <= options.limit() {
+        if options.mode == Mode::Full || bytes <= options.limit() || carries_non_text(&result) {
             return result;
         }
         let payload = payload(&result);
@@ -180,6 +181,20 @@ impl<S: PartialEq> ResponseStore<S> {
             expansion_tool,
         ))
     }
+}
+
+/// A picture has no useful excerpt. The preview apparatus addresses a payload
+/// by JSON Pointer and shortens strings by characters, so applied to a base64
+/// image it returns a truncated blob that still looks like a result — the
+/// caller asked for an image and gets prose about one. Blocks other than
+/// `text` (image, audio, resource, resource_link) therefore leave the budget
+/// untouched: no preview, no truncation, and no retention, since there is
+/// nothing an expansion call could usefully select. Independent of
+/// `ResponseOptions`, which cannot make a truncated image whole.
+fn carries_non_text(result: &Value) -> bool {
+    result["content"]
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] != "text"))
 }
 
 fn report_overage(result: &mut Value, limit: usize, reason: &str) {
@@ -576,9 +591,52 @@ mod tests {
         );
     }
 
+    /// (a) the whole result survives, (c) nothing is retained, and (b) a
+    /// text-only result over the same budget is still previewed — the
+    /// exemption keys on the content blocks, not on being over budget.
+    #[test]
+    fn non_text_content_blocks_bypass_the_budget_and_retention() {
+        let mut store = ResponseStore::default();
+        let mut image = text_result("screenshot of the vault graph".into(), false);
+        image["content"].as_array_mut().unwrap().insert(
+            0,
+            json!({"type":"image","data":"iVBORw0KGgo".repeat(20_000),"mimeType":"image/png"}),
+        );
+        let options = ResponseOptions {
+            mode: Mode::Bounded,
+            max_bytes: Some(MIN_BYTES),
+        };
+        let presented = store.present(
+            "owner",
+            "fetch_images",
+            json!({"name": "vault"}),
+            image.clone(),
+            &options,
+            "expand_response",
+        );
+        assert_eq!(
+            serde_json::to_vec(&presented).unwrap(),
+            serde_json::to_vec(&image).unwrap()
+        );
+        assert!(store.entries.is_empty());
+        let text_only = store.present(
+            "owner",
+            "tool",
+            json!({}),
+            large(),
+            &options,
+            "expand_response",
+        );
+        assert_eq!(text_only["structuredContent"]["mcp_methods_preview"], true);
+        assert_eq!(store.entries.len(), 1);
+    }
+
     #[test]
     fn nested_values_are_labeled_and_json_pointer_expands_original() {
-        let original = json!({"content":[{"type":"image","data":"base64".repeat(10000),"mimeType":"image/png"}],
+        // Text content on purpose: a non-text block would exempt the whole
+        // result from the budget (see `carries_non_text`) and this test would
+        // pass without ever rendering a preview.
+        let original = json!({"content":[{"type":"text","text":"base64".repeat(10000)}],
             "structuredContent":{"a/b~c":[{"id":7,"giant":"nested".repeat(20000)}],"warnings":["only write callers were queried"]},"isError":false});
         let mut store = ResponseStore::default();
         let preview = store.present(

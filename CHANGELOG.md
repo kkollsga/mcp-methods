@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased (proposed)
+
+### Fixed — results carrying non-text content bypass the response budget
+
+Every tool result passed through the budget, which replaces an over-budget
+result with a text preview — a JSON Pointer outline whose long strings are
+truncated to an excerpt — and retains the original for `expand_response`. For
+a result whose content is an `image`, `audio`, `resource` or `resource_link`
+block that apparatus addresses nothing a caller can use: a truncated base64
+PNG is not a smaller picture, it is a broken one, and the agent that asked for
+an image received a plausible-looking JSON blob about it instead. A few MiB of
+screenshot also evicted genuinely expandable text results from the 32 MiB
+store on its way through.
+
+`ResponseStore::present` now returns any result whose `content` carries a
+block other than `text` unchanged: no preview, no truncation, no `_meta`
+overage stamp, and no retention entry, so the ids other results receive are
+unaffected. The check is on the content blocks alone and is independent of
+`_response.mode` / `_response.max_bytes`, which cannot make a truncated image
+whole. Text-only results are budgeted exactly as before, including mixed
+results whose blocks are all text. Both adapters route through the same
+`present`, so the Rust server and the FastMCP wrapper change together, and the
+budget sentence appended to every tool description now states the exemption
+rather than promising a budget on all responses.
+
 ## 0.4.11 — 2026-09-16
 
 ### Changed — skills are delivered lazily by default; agents fetch bodies with `skill(name)`
