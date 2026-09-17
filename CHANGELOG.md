@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (proposed)
+## 0.4.12 — 2026-09-17
 
 ### Fixed — results carrying non-text content bypass the response budget
 
