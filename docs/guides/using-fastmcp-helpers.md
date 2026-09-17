@@ -42,6 +42,13 @@ results retain their original shape. Larger results carry a preview describing
 scope, known counts, omitted values, selection order, and executable follow-up
 calls. Errors keep `isError: true`. This changes the default for existing clients.
 
+A result whose `content` carries any block other than `text` — `image`,
+`audio`, `resource`, `resource_link` — is exempt: it is returned whole, with no
+preview, no overage metadata and no retention entry, whatever its size and
+whatever `_response` asks for. Truncating base64 yields a broken picture, not a
+smaller one, and the pointer/excerpt apparatus addresses nothing such a caller
+can use. Mixed results whose blocks are all text are budgeted normally.
+
 For one call, add `_response` to the normal arguments:
 
 ```json

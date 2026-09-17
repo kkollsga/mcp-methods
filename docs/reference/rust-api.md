@@ -97,7 +97,9 @@ to completed calls from builtin, typed and custom router tools. The reference
 `tools/list` advertises `_response` controls and the retained-result expansion
 tool, including collision-safe names — on every tool except the framework's own
 `skill(name)` loader, which is exempt from the budget and so advertises no
-controls. Direct calls to a handler bypass protocol
+controls. A second exemption is per result rather than per tool: any result
+carrying an `image`, `audio`, `resource` or `resource_link` content block is
+returned whole, since a truncated excerpt of one is unusable. Direct calls to a handler bypass protocol
 presentation; so does dispatching through the router yourself
 (`tool_router_mut()` derefs to the rmcp `ToolRouter`, whose `call(...)` is the
 raw route, not the presented result).
