@@ -58,7 +58,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.88.0
+      # Cargo.lock is not committed, so resolve the way a 1.88 user's cargo
+      # can: newest dependency versions whose rust-version still allows 1.88
+      # (a transitive crate raising its own MSRV, e.g. uuid 1.28, would
+      # otherwise fail this job while the declared floor still holds).
       - run: cargo check -p mcp-methods -p mcp-server --all-targets
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
   python-checks:
     name: Python checks
