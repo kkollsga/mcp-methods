@@ -39,6 +39,7 @@ pub mod env;
 pub mod manifest;
 pub mod roots;
 pub mod runtime;
+mod send_ledger;
 // `server` inside the `server` feature module — the inner module is
 // the rmcp `ServerHandler` impl. Rename would churn every downstream
 // import; allow the inception.

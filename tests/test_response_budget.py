@@ -98,3 +98,24 @@ def test_collision_controls_and_failed_tool_output():
             assert "operation failed\n" * 5000 in recovered.content[0].text
 
     anyio.run(scenario)
+
+
+def test_output_schema_keeps_object_type_at_the_root():
+    async def scenario():
+        app = FastMCP("schemas")
+
+        @app.tool()
+        def typed() -> CustomResult:
+            return CustomResult(rows=[1], warning="w")
+
+        install_response_budget(app)
+        async with create_connected_server_and_client_session(app) as client:
+            listing = await client.list_tools()
+            checked = 0
+            for tool in listing.tools:
+                if tool.outputSchema is not None:
+                    checked += 1
+                    assert tool.outputSchema["type"] == "object"
+            assert checked >= 1
+
+    anyio.run(scenario)

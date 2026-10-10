@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.13 — 2026-10-10
+
+### Fixed — `outputSchema` lost its root `"type": "object"`, so strict clients rejected `tools/list`
+
+Since 0.4.9 the response budget has rewritten every tool's output schema into
+`{"anyOf": [original, preview], "$defs": …}` so a preview result still
+validates. That union had no top-level `type`, and MCP (2025-06-18) requires
+`Tool.outputSchema` to be an object schema with `"type": "object"` at its
+root. Lenient clients (Claude Code, Codex) accepted the schema. The Claude
+desktop app validates strictly and refused the whole `tools/list`
+(`path: ["tools",0,"outputSchema","type"] … expected "object"`), so a server
+with even one output-schema tool, which includes every kglite deployment,
+failed to start there.
+
+The union now carries `"type": "object"` at its root, which is sound because
+both branches are objects. `$schema` is also hoisted to the root next to
+`$defs`, so `#/$defs/…` references still resolve and no dialect marker sits
+inside an `anyOf` branch. The Rust server and the FastMCP wrapper change
+together. Reported by kglite after the mcp-servers operator hit it.
+
+### Fixed — raw `ToolRoute`s never received the lazy-skill footer
+
+0.4.11's footer ("Skill "x" applies to this tool and has not been loaded this
+session — call skill("x")") was composed only by typed and builtin tools. A
+route registered with `tool_router_mut().add_route(..)`, which is the shape a
+tool needs for `with_output_schema`, stayed silent. kglite's `cypher_query`
+is such a route and is the tool lazy domain skills reference most.
+
+`ToolRouterMut::add_route` is now mcp-methods' own method; it shadows rmcp's
+`ToolRouter::add_route`, which was previously reached through `Deref`. It
+wraps the route so its results carry the same footer with the same wording
+and session bookkeeping. Existing callers need no change. If the result has
+`structured_content`, the footer is pushed as a separate text block, so a
+text block that mirrors the structured JSON still parses. Otherwise it is
+appended to the last text block, as on the typed path. Routes inserted with
+rmcp's `merge`/`+=` bypass the wrapper.
+
+### Added — opt-in send ledger: what this server put on the wire
+
+`McpServer::with_send_ledger(path)`, or `MCP_METHODS_SEND_LEDGER=<path>`
+(read in `McpServer::new`; the builder wins), appends one JSON line per
+response:
+- `initialize`: instructions and total bytes.
+- `tools/list`: per-tool description, input-schema and output-schema bytes
+  exactly as served, after skill injection and the budget rewrite.
+- `tools/call`: argument, text and structured-content bytes, the count of
+  non-text blocks, and the budget outcome (`inline` / `preview` / `exempt`).
+- `prompts/list|get`: total bytes.
+
+It records names and byte counts only, never argument values or content. It is
+off by default and costs nothing when off. A failed write is logged once and
+never affects a response. It records what the server sent; it cannot show what
+an MCP client forwarded to a model, which is client-side. It is meant as the
+server half of a token-attribution measurement (asked for by kglite).
+Rust server only. The FastMCP wrapper has no ledger.
+
 ## 0.4.12 — 2026-09-17
 
 ### Fixed — results carrying non-text content bypass the response budget

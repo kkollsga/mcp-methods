@@ -332,3 +332,53 @@ async fn image_content_bypasses_the_budget_while_text_is_still_previewed() {
     assert!(serde_json::to_vec(&text["result"]).unwrap().len() <= 4096);
     assert_eq!(preview(&text)["result_id"], "r1");
 }
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct Row {
+    id: u32,
+}
+#[derive(Serialize, schemars::JsonSchema)]
+struct Report {
+    first: Row,
+    rest: Vec<Row>,
+}
+
+#[tokio::test]
+async fn output_schemas_keep_object_type_at_the_root() {
+    let mut server = McpServer::new(ServerOptions::default());
+    let mut typed = rmcp::model::Tool::new(
+        "typed",
+        "typed output",
+        Arc::new(json!({"type":"object"}).as_object().unwrap().clone()),
+    );
+    let schema = schemars::schema_for!(Report);
+    let schema = serde_json::to_value(&schema).unwrap();
+    assert!(schema.get("$defs").is_some() && schema.get("$schema").is_some());
+    typed.output_schema = Some(Arc::new(schema.as_object().unwrap().clone()));
+    server
+        .tool_router_mut()
+        .add_route(rmcp::handler::server::router::tool::ToolRoute::new_dyn(
+            typed,
+            |_| Box::pin(async { Ok(rmcp::model::CallToolResult::structured(json!({})).into()) }),
+        ));
+    let mut client = boot(server).await;
+    let listing = client.request("tools/list", json!({})).await;
+    let mut with_schema = 0;
+    for tool in listing["result"]["tools"].as_array().unwrap() {
+        let Some(out) = tool.get("outputSchema") else {
+            continue;
+        };
+        with_schema += 1;
+        assert_eq!(out["type"], "object", "{tool}");
+    }
+    assert!(with_schema >= 1);
+    let out = listing["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "typed")
+        .unwrap()["outputSchema"]
+        .clone();
+    assert!(out.get("$defs").is_some() && out.get("$schema").is_some());
+    assert!(out["anyOf"][0].get("$schema").is_none() && out["anyOf"][0].get("$defs").is_none());
+}

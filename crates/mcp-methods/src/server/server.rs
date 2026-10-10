@@ -165,6 +165,71 @@ fn append_footer(body: String, footer: Option<String>) -> String {
     }
 }
 
+/// Append the unloaded-lazy-skill notice to a raw route's result.
+///
+/// Without `structured_content` this is how [`dispatch_typed_call`]
+/// does it for a typed tool: onto the last text block after a blank
+/// line, or as a new text block when the result carries none. With
+/// `structured_content`, the notice is instead pushed as a new, separate
+/// text block at the end and every existing block stays byte-identical:
+/// an output-schema tool commonly follows the MCP back-compat
+/// convention that `content[0].text` is the JSON serialization of
+/// `structured_content`, and appending prose to that block would break
+/// the parse. `structured_content` itself is never touched. Applies to
+/// error results too.
+fn append_notice_to_result(result: &mut rmcp::model::CallToolResult, notice: Option<String>) {
+    let Some(notice) = notice.filter(|n| !n.is_empty()) else {
+        return;
+    };
+    if result.structured_content.is_some() {
+        result.content.push(rmcp::model::ContentBlock::text(notice));
+        return;
+    }
+    let last_text = result
+        .content
+        .iter_mut()
+        .rev()
+        .find_map(|block| match block {
+            rmcp::model::ContentBlock::Text(t) => Some(t),
+            _ => None,
+        });
+    match last_text {
+        Some(t) => t.text = append_footer(std::mem::take(&mut t.text), Some(notice)),
+        None => result.content.push(rmcp::model::ContentBlock::text(notice)),
+    }
+}
+
+/// Wrap a raw rmcp route so its completed results carry the same
+/// unloaded-lazy-skill notice typed and builtin tools get. The notice
+/// is computed from the call context's serving instance, inside the
+/// dispatch scope that holds the session, and added before the
+/// response budget sees the result — the order typed tools use. See
+/// [`append_notice_to_result`] for where it lands (a separate block when
+/// the result has `structured_content`, else the last text block).
+/// [`ToolRouterMut::add_route`] applies this; the loader and typed
+/// routes already compose the notice themselves and do not go through
+/// it.
+fn with_skill_notice(
+    mut route: rmcp::handler::server::router::tool::ToolRoute<McpServer>,
+) -> rmcp::handler::server::router::tool::ToolRoute<McpServer> {
+    let inner = route.call.clone();
+    let name = route.attr.name.to_string();
+    route.call = Arc::new(
+        move |ctx: rmcp::handler::server::tool::ToolCallContext<'_, McpServer>| {
+            let inner = inner.clone();
+            let notice = ctx.service.unloaded_skill_notice(&name);
+            Box::pin(async move {
+                let mut response = inner(ctx).await?;
+                if let CallToolResponse::Complete(result) = &mut response {
+                    append_notice_to_result(result, notice);
+                }
+                Ok(response)
+            })
+        },
+    );
+    route
+}
+
 /// The per-call body of a dynamically registered typed tool:
 /// deserialise the arguments, run the handler, apply the consumer's
 /// result-postprocess hook, and pick the MCP envelope. Both
@@ -965,8 +1030,33 @@ struct SkillState {
 /// [`ToolRouter`] itself, so `server.tool_router_mut().add_route(..)`
 /// reads the same as it did when the router was a plain field. Holds
 /// the state lock for as long as it lives — keep it to one statement.
+///
+/// [`add_route`](Self::add_route) is the one method that is not rmcp's:
+/// it wraps the route so a raw route gets the unloaded-lazy-skill
+/// notice like every other tool. Other `ToolRouter` methods that insert
+/// routes (`merge`, `+=`) reach rmcp directly and add them unwrapped.
 pub struct ToolRouterMut<'a> {
     guard: std::sync::RwLockWriteGuard<'a, SkillState>,
+}
+
+impl ToolRouterMut<'_> {
+    /// Register a raw rmcp route, replacing any route of the same name.
+    ///
+    /// Shadows [`ToolRouter::add_route`] so a hand-built route (one that
+    /// needs `with_output_schema`, say) gets the same bookkeeping as a
+    /// [`register_typed_tool`](McpServer::register_typed_tool) tool:
+    /// every call of a tool a lazy skill references carries the "call
+    /// `skill(name)`" line until the session loads the skill (it returns
+    /// if the skill body changes or the session idles past the TTL;
+    /// errors included). The line is appended to the last text block, or,
+    /// when the result has `structured_content`, pushed as a separate
+    /// text block so a JSON-mirror `content[0]` still parses.
+    /// `structured_content` is left untouched. The route's
+    /// own name decides which skills apply, so it must match the name
+    /// the skill's `references_tools` uses.
+    pub fn add_route(&mut self, route: rmcp::handler::server::router::tool::ToolRoute<McpServer>) {
+        Arc::make_mut(&mut self.guard.tools).add_route(with_skill_notice(route));
+    }
 }
 
 impl std::ops::Deref for ToolRouterMut<'_> {
@@ -1017,6 +1107,9 @@ pub struct McpServer {
     /// Behind an `Arc` because every clone of the server serves the
     /// same sessions.
     loaded_skills: Arc<Mutex<LoadedSkills>>,
+    /// Opt-in record of what this server sent; `None` (the default)
+    /// means every hook is a no-op that serializes nothing.
+    send_ledger: Option<Arc<crate::server::send_ledger::SendLedger>>,
 }
 
 #[tool_router]
@@ -1036,6 +1129,7 @@ impl McpServer {
             responses: Arc::new(Mutex::new(crate::response_budget::ResponseStore::default())),
             response_preview: None,
             loaded_skills: Arc::new(Mutex::new(LoadedSkills::default())),
+            send_ledger: crate::server::send_ledger::SendLedger::from_env().map(Arc::new),
         };
         server.register_github_tools_if_authorized();
         server.register_local_workspace_tools();
@@ -1532,7 +1626,9 @@ impl McpServer {
         F: Fn(T) -> Result<String, String> + Send + Sync + 'static,
     {
         let route = typed_route(name, description, handler, &self.options);
-        self.tool_router_mut().add_route(route);
+        // Straight onto rmcp's router: a typed route composes the
+        // notice itself, and wrapping it again would print it twice.
+        Arc::make_mut(&mut self.skill_state_mut().tools).add_route(route);
     }
 
     /// The skills that survived activation in the resolution pass, in
@@ -2576,12 +2672,18 @@ fn budgeted_tool(mut tool: Tool) -> Tool {
     if let Some(output) = tool.output_schema.take() {
         let mut output = output.as_ref().clone();
         let definitions = output.remove("$defs");
-        let mut union = serde_json::json!({"anyOf":[output,{
+        let dialect = output.remove("$schema");
+        // MCP requires `type: object` at the outputSchema root; both
+        // branches are objects, and `$defs`/`$schema` live at the root.
+        let mut union = serde_json::json!({"type":"object","anyOf":[output,{
             "type":"object","required":["mcp_methods_preview"],
             "properties":{"mcp_methods_preview":{"const":true}}
         }]});
         if let Some(definitions) = definitions {
             union["$defs"] = definitions;
+        }
+        if let Some(dialect) = dialect {
+            union["$schema"] = dialect;
         }
         tool.output_schema = Some(Arc::new(union.as_object().unwrap().clone()));
     }
@@ -2595,6 +2697,98 @@ impl McpServer {
     pub fn with_response_preview_hook(mut self, hook: ResponsePreviewHook) -> Self {
         self.response_preview = Some(hook);
         self
+    }
+
+    /// Record every initialize, `tools/list`, `tools/call` and
+    /// prompt response this server sends as one JSON line appended to
+    /// `path`, so a deployment can see exactly what it put on the wire.
+    ///
+    /// Off by default and free when off: with no ledger, nothing extra is
+    /// serialized. The `MCP_METHODS_SEND_LEDGER=<path>` environment
+    /// variable enables the same ledger without a code change; this
+    /// builder wins over it.
+    ///
+    /// This records what this server sent; it does not show what an MCP
+    /// client forwarded to a model. Records hold names and byte counts
+    /// only (never argument values or result content), plus a `ts`
+    /// (unix milliseconds), a `method`, and a `session` tag where one
+    /// exists. Byte counts are `serde_json` serialized lengths, except
+    /// `text_bytes`, which is the UTF-8 length of the text blocks'
+    /// strings. `arguments_bytes` excludes the `_response` budget control
+    /// (for `expand_response`, which has none, it is the raw arguments as
+    /// sent). `budget` is `inline`, `preview`, or `exempt`; `exempt` means
+    /// the result was not passed through the response budget again:
+    /// `expand_response` output is bounded by its own paging, and the skill
+    /// loader and results carrying non-text content are returned whole. The
+    /// `initialize` record measures the `InitializeResult` this server builds
+    /// (`get_info`), which is what rmcp sends.
+    /// An open or write failure is logged once with `tracing::warn!` and
+    /// never alters or fails an MCP response.
+    pub fn with_send_ledger(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.send_ledger = Some(Arc::new(crate::server::send_ledger::SendLedger::new(
+            path.into(),
+        )));
+        self
+    }
+
+    /// Ledger session tag: the negotiated session's identity (an
+    /// in-process pointer, not client-supplied data).
+    fn ledger_session(owner: &ResponseSession) -> String {
+        format!("{:x}", Arc::as_ptr(&owner.0) as usize)
+    }
+
+    fn response_len(sent: &CallToolResponse, legacy: bool) -> usize {
+        use crate::server::send_ledger::wire_len;
+        match sent {
+            CallToolResponse::Complete(r) => wire_len(r, legacy),
+            CallToolResponse::InputRequired(r) => wire_len(r, legacy),
+            CallToolResponse::Task(r) => wire_len(r, legacy),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    fn ledger_call(
+        ledger: &crate::server::send_ledger::SendLedger,
+        owner: &ResponseSession,
+        tool: &str,
+        arguments_bytes: usize,
+        sent: &CallToolResponse,
+        budget: &str,
+        legacy: bool,
+    ) {
+        let before = match sent {
+            CallToolResponse::Complete(r) => serde_json::to_value(r).unwrap_or_default(),
+            _ => serde_json::Value::Null,
+        };
+        let blocks = before["content"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let text_bytes: usize = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .map(|b| b["text"].as_str().map_or(0, str::len))
+            .sum();
+        let other_blocks = blocks.iter().filter(|b| b["type"] != "text").count();
+        let structured_bytes = before
+            .get("structuredContent")
+            .filter(|v| !v.is_null())
+            .map_or(0, crate::server::send_ledger::json_len);
+        ledger.record(
+            "tools/call",
+            Some(Self::ledger_session(owner)),
+            serde_json::json!({
+                "tool": tool,
+                "arguments_bytes": arguments_bytes,
+                "is_error": before["isError"] == true,
+                "text_bytes": text_bytes,
+                "structured_bytes": structured_bytes,
+                "other_blocks": other_blocks,
+                "budget": budget,
+                "total_bytes": Self::response_len(sent, legacy),
+            }),
+        );
     }
 
     fn response_expansion_name(&self) -> String {
@@ -2629,6 +2823,7 @@ impl ServerHandler for McpServer {
     ) -> Result<CallToolResponse, McpError> {
         use crate::response_budget::{Expansion, ResponseOptions};
         let expansion_tool = self.response_expansion_name();
+        let legacy = crate::server::send_ledger::is_legacy(context.protocol_version());
         let owner = ResponseSession(
             context
                 .peer
@@ -2643,18 +2838,31 @@ impl ServerHandler for McpServer {
             .unwrap_or_else(|e| e.into_inner())
             .touch(&owner);
         if request.name == expansion_tool {
-            let args: Expansion =
-                serde_json::from_value(serde_json::json!(request.arguments.unwrap_or_default()))
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            let raw_args = serde_json::json!(request.arguments.unwrap_or_default());
+            let args_bytes = crate::server::send_ledger::json_len(&raw_args);
+            let args: Expansion = serde_json::from_value(raw_args)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
             let result = self
                 .responses
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .expand(&owner, &args, &expansion_tool)
                 .map_err(|e| McpError::invalid_params(e, None))?;
-            return serde_json::from_value::<CallToolResult>(result)
-                .map(Into::into)
-                .map_err(|e| McpError::internal_error(e.to_string(), None));
+            let sent = serde_json::from_value::<CallToolResult>(result)
+                .map(CallToolResponse::from)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if let Some(ledger) = &self.send_ledger {
+                Self::ledger_call(
+                    ledger,
+                    &owner,
+                    &expansion_tool,
+                    args_bytes,
+                    &sent,
+                    "exempt",
+                    legacy,
+                );
+            }
+            return Ok(sent);
         }
         // One snapshot for the whole call: the lock is released here,
         // and the `Arc` keeps this call's view of the router alive
@@ -2679,6 +2887,10 @@ impl ServerHandler for McpServer {
             .map_err(|e| McpError::invalid_params(e, None))?;
         let name = request.name.to_string();
         let arguments = serde_json::json!(request.arguments);
+        let arguments_bytes = self
+            .send_ledger
+            .as_ref()
+            .map(|_| crate::server::send_ledger::json_len(&arguments));
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         // Scope the session across the whole dispatch: the `skill()`
         // handler records what it delivered, and every other tool's
@@ -2714,19 +2926,64 @@ impl ServerHandler for McpServer {
                 // downstream tool that took the `skill` name is an
                 // ordinary tool with no such bound and stays budgeted.
                 let exempt = Some(name.as_str()) == self.framework_skill_loader();
+                // Ledger only: keep the pre-budget result to classify
+                // what `present` did. Nothing is cloned when off.
+                let before = self.send_ledger.as_ref().map(|_| result.clone());
+                let non_text = before.as_ref().is_some_and(|b| {
+                    b["content"]
+                        .as_array()
+                        .is_some_and(|c| c.iter().any(|x| x["type"] != "text"))
+                });
                 let result = if exempt {
                     result
                 } else {
                     self.responses
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .present(owner, &name, arguments, result, &options, &expansion_tool)
+                        .present(
+                            owner.clone(),
+                            &name,
+                            arguments,
+                            result,
+                            &options,
+                            &expansion_tool,
+                        )
                 };
-                serde_json::from_value::<CallToolResult>(result)
-                    .map(Into::into)
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+                let budget = before.as_ref().map(|b| {
+                    if exempt || non_text {
+                        "exempt"
+                    } else if *b == result
+                        || result["_meta"]["mcp_methods/response_budget"]["budget_exceeded"] == true
+                    {
+                        "inline"
+                    } else {
+                        "preview"
+                    }
+                });
+                let sent = serde_json::from_value::<CallToolResult>(result)
+                    .map(CallToolResponse::from)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if let (Some(ledger), Some(budget), Some(args)) =
+                    (&self.send_ledger, budget, arguments_bytes)
+                {
+                    Self::ledger_call(ledger, &owner, &name, args, &sent, budget, legacy);
+                }
+                Ok(sent)
             }
-            other => Ok(other),
+            other => {
+                if let (Some(ledger), Some(args)) = (&self.send_ledger, arguments_bytes) {
+                    ledger.record(
+                        "tools/call",
+                        Some(Self::ledger_session(&owner)),
+                        serde_json::json!({
+                            "tool": name,
+                            "arguments_bytes": args,
+                            "total_bytes": Self::response_len(&other, legacy),
+                        }),
+                    );
+                }
+                Ok(other)
+            }
         }
     }
 
@@ -2756,14 +3013,39 @@ impl ServerHandler for McpServer {
             })
             .collect();
         tools.push(self.response_expansion_tool());
-        Ok(ListToolsResult {
+        let listed = ListToolsResult {
             result_type: Some(ResultType::COMPLETE),
             tools,
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
             cache_scope: supports_cache_hints.then_some(CacheScope::Public),
-        })
+        };
+        if let Some(ledger) = &self.send_ledger {
+            use crate::server::send_ledger::json_len;
+            let per_tool: Vec<_> = listed
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description_bytes": t.description.as_ref().map_or(0, json_len),
+                        "input_schema_bytes": json_len(&*t.input_schema),
+                        "output_schema_bytes": t.output_schema.as_ref().map_or(0, |o| json_len(&**o)),
+                    })
+                })
+                .collect();
+            let session = context
+                .peer
+                .peer_info()
+                .map(|i| format!("{:x}", Arc::as_ptr(&i) as usize));
+            ledger.record(
+                "tools/list",
+                session,
+                serde_json::json!({"total_bytes": crate::server::send_ledger::wire_len(&listed, !supports_cache_hints), "tools": per_tool}),
+            );
+        }
+        Ok(listed)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -2813,6 +3095,17 @@ impl ServerHandler for McpServer {
         if let Some(text) = &self.options.instructions {
             info = info.with_instructions(text.clone());
         }
+        if let Some(ledger) = &self.send_ledger {
+            use crate::server::send_ledger::json_len;
+            ledger.record(
+                "initialize",
+                None,
+                serde_json::json!({
+                    "instructions_bytes": info.instructions.as_ref().map_or(0, |i| i.len()),
+                    "total_bytes": json_len(&info),
+                }),
+            );
+        }
         info
     }
 
@@ -2849,12 +3142,23 @@ impl ServerHandler for McpServer {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        Ok(ListPromptsResult {
+        let listed = ListPromptsResult {
             prompts: self.prompts_snapshot().list_all(),
             ..Default::default()
-        })
+        };
+        if let Some(ledger) = &self.send_ledger {
+            ledger.record(
+                "prompts/list",
+                None,
+                serde_json::json!({"total_bytes": crate::server::send_ledger::wire_len(
+                    &listed,
+                    crate::server::send_ledger::is_legacy(context.protocol_version()),
+                )}),
+            );
+        }
+        Ok(listed)
     }
 
     async fn get_prompt(
@@ -2862,6 +3166,7 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
+        let legacy_version = context.protocol_version();
         let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
             self,
             request.name,
@@ -2871,7 +3176,24 @@ impl ServerHandler for McpServer {
         // Snapshot, then await: the same rule the tool path follows, so
         // a rebuild cannot queue behind a prompt handler.
         let prompts = self.prompts_snapshot();
-        prompts.get_prompt(prompt_context).await
+        let got = prompts.get_prompt(prompt_context).await?;
+        if let Some(ledger) = &self.send_ledger {
+            let legacy = crate::server::send_ledger::is_legacy(legacy_version);
+            let total = match &got {
+                GetPromptResponse::Complete(r) => crate::server::send_ledger::wire_len(r, legacy),
+                GetPromptResponse::InputRequired(r) => {
+                    crate::server::send_ledger::wire_len(r, legacy)
+                }
+                #[allow(unreachable_patterns)]
+                _ => 0,
+            };
+            ledger.record(
+                "prompts/get",
+                None,
+                serde_json::json!({"total_bytes": total}),
+            );
+        }
+        Ok(got)
     }
 }
 

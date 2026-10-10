@@ -70,7 +70,10 @@ def install_response_budget(app) -> None:
             )
             if tool.outputSchema is not None:
                 original = tool.outputSchema
+                # MCP requires `type: object` at the outputSchema root;
+                # `$defs`/`$schema` are hoisted to the root with it.
                 tool.outputSchema = {
+                    "type": "object",
                     "anyOf": [
                         original,
                         {
@@ -78,10 +81,12 @@ def install_response_budget(app) -> None:
                             "required": ["mcp_methods_preview"],
                             "properties": {"mcp_methods_preview": {"const": True}},
                         },
-                    ]
+                    ],
                 }
                 if "$defs" in original:
                     tool.outputSchema["$defs"] = original.pop("$defs")
+                if "$schema" in original:
+                    tool.outputSchema["$schema"] = original.pop("$schema")
         tools.append(
             types.Tool(
                 name=name,

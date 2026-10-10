@@ -591,3 +591,97 @@ async fn server_echoing_the_same_body_is_still_budgeted(body: &str) {
     );
     assert!(served.contains("response_budget"), "{served}");
 }
+
+/// A hand-built rmcp route with an output schema, the shape kglite's
+/// `cypher_query` has. It cannot go through `register_typed_tool`, so
+/// it reaches the router via `add_route` — which must give it the same
+/// unloaded-skill footer. Fails without the wrapper: the raw route's
+/// result is the handler's text and nothing else.
+#[tokio::test]
+async fn a_raw_route_with_an_output_schema_gets_the_footer_until_the_skill_loads() {
+    use mcp_methods::server::SkillRegistry;
+    use rmcp::handler::server::router::tool::ToolRoute;
+    use rmcp::model::{CallToolResult, ContentBlock, Tool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("raw_mcp.yaml");
+    std::fs::write(&yaml, "name: t\nskills: true\n").unwrap();
+    let skills = dir.path().join("raw_mcp.skills");
+    std::fs::create_dir(&skills).unwrap();
+    std::fs::write(
+        skills.join("lazy_raw.md"),
+        "---\nname: lazy_raw\ndescription: Lazy raw.\nreferences_tools: [raw_query, raw_prose]\n\
+         ---\n\nRAW-BODY\n",
+    )
+    .unwrap();
+    let registry = SkillRegistry::new()
+        .auto_detect_project_layer(&yaml)
+        .finalise()
+        .unwrap();
+
+    let schema = json!({"type":"object","properties":{"rows":{"type":"integer"}},
+                        "required":["rows"]});
+    let schema = schema.as_object().unwrap().clone();
+    let tool = Tool::new("raw_query", "Raw route.", Arc::new(Default::default()))
+        .with_raw_output_schema(Arc::new(schema));
+    let mut server = McpServer::new(ServerOptions::default());
+    server
+        .tool_router_mut()
+        .add_route(ToolRoute::new_dyn(tool, |_ctx| {
+            Box::pin(async {
+                let mut result = CallToolResult::success(vec![ContentBlock::text(r#"{"rows":3}"#)]);
+                result.structured_content = Some(json!({"rows": 3}));
+                Ok(result.into())
+            })
+        }));
+    // A prose-only raw route: no structured content, so the footer is
+    // appended to the text exactly as for a typed tool.
+    server.tool_router_mut().add_route(ToolRoute::new_dyn(
+        Tool::new("raw_prose", "Raw prose.", Arc::new(Default::default())),
+        |_ctx| {
+            Box::pin(async {
+                Ok(CallToolResult::success(vec![ContentBlock::text("plain")]).into())
+            })
+        },
+    ));
+    serve_prompts(&registry, &mut server);
+    let mut client = boot(server, "raw").await;
+
+    let notice = "Skill \"lazy_raw\" applies to this tool and has not been loaded \
+                  this session — call skill(\"lazy_raw\").";
+    let first = client.call("raw_query", json!({})).await;
+    let blocks = first["result"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{first}");
+    // The JSON-mirror block is byte-identical and still parses to the
+    // structured content; the footer is its own block.
+    let mirror: serde_json::Value =
+        serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mirror, first["result"]["structuredContent"], "{first}");
+    assert_eq!(blocks[0]["text"], r#"{"rows":3}"#, "{first}");
+    assert_eq!(blocks[1]["text"], notice, "{first}");
+    assert_eq!(
+        first["result"]["structuredContent"],
+        json!({"rows": 3}),
+        "{first}"
+    );
+
+    // Without structured content the footer joins the last text block.
+    let prose = client.call("raw_prose", json!({})).await;
+    assert_eq!(text(&prose), format!("plain\n\n{notice}"), "{prose}");
+    assert_eq!(prose["result"]["content"].as_array().unwrap().len(), 1);
+
+    let loaded = client.call("skill", json!({"name":"lazy_raw"})).await;
+    assert!(text(&loaded).contains("RAW-BODY"), "{loaded}");
+    let after = client.call("raw_query", json!({})).await;
+    assert_eq!(
+        after["result"]["content"].as_array().unwrap().len(),
+        1,
+        "{after}"
+    );
+    assert_eq!(text(&after), r#"{"rows":3}"#, "{after}");
+    assert_eq!(
+        after["result"]["structuredContent"],
+        json!({"rows": 3}),
+        "{after}"
+    );
+}

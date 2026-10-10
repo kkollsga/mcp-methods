@@ -111,6 +111,17 @@ included in previews and retained with the result. Custom routes may instead
 supply `_meta["mcp_methods/preview"]` themselves. The optional guidance hook does
 not enable the budget: the budget is already the default.
 
+`McpServer::with_send_ledger(path)` (or `MCP_METHODS_SEND_LEDGER=<path>`; the
+builder wins) appends one JSON line per `initialize`, `tools/list`,
+`tools/call` and prompt response with names and `serde_json` byte counts only
+(no argument values or result content). It is off by default, and write
+failures never affect a response. A tool-call record's `budget` is `inline`,
+`preview` or `exempt`; `exempt` means the result was not passed through the
+response budget again (`expand_response` output is bounded by its own paging;
+the skill loader and non-text results are returned whole). The `initialize`
+record measures the `InitializeResult` the server builds. It records what this server sent; it does not
+show what an MCP client forwarded to a model.
+
 The always-available `mcp_methods::response_budget` module exposes the shared
 `ResponseStore`, `ResponseOptions` and `Expansion` primitives for adapters.
 Validate controls before executing a tool, provide a unique authenticated
