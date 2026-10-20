@@ -1408,12 +1408,9 @@ pub fn fetch_readme(repo: &str) -> Result<String, String> {
         .get("download_url")
         .and_then(Value::as_str)
         .ok_or("no README found")?;
-    let body = ureq::get(url)
-        .set("User-Agent", "mcp-methods")
-        .call()
-        .map_err(|e| format!("README fetch error: {e}"))?
-        .into_string()
-        .map_err(|e| format!("README decode error: {e}"))?;
+    let resp = github::classify(ureq::get(url).header("User-Agent", "mcp-methods").call())
+        .map_err(|e| format!("README fetch error: {e}"))?;
+    let body = github::response_text(resp).map_err(|e| format!("README decode error: {e}"))?;
     Ok(compact_readme(&body))
 }
 
@@ -1732,12 +1729,8 @@ pub fn find_adopters(
 /// token (rejecting substring collisions), or None.
 fn verify_dependency(full_name: &str, path: &str, pkg: &str) -> Option<String> {
     let url = format!("https://raw.githubusercontent.com/{full_name}/HEAD/{path}");
-    let body = ureq::get(&url)
-        .set("User-Agent", "mcp-methods")
-        .call()
-        .ok()?
-        .into_string()
-        .ok()?;
+    let resp = github::classify(ureq::get(&url).header("User-Agent", "mcp-methods").call()).ok()?;
+    let body = github::response_text(resp).ok()?;
     let pkg_lc = pkg.to_lowercase();
     for line in body.lines() {
         let l = line.to_lowercase();

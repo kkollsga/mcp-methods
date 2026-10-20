@@ -34,10 +34,72 @@ static GIT_HTTPS_RE: LazyLock<Regex> =
 
 /// Shared HTTP agent with connection pooling (keep-alive).
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        // ureq 2 surfaced 4xx/5xx as `Error::Status(code, response)` and
+        // did not read proxy env vars; `HttpError` + `proxy(None)` keep both.
+        .http_status_as_error(false)
+        .proxy(None)
         .build()
+        .into()
 });
+
+/// Response type returned by ureq 3 requests.
+pub(crate) type Response = ureq::http::Response<ureq::Body>;
+
+/// Mirror of ureq 2's `Error`: a non-2xx/3xx answer keeps its response (body
+/// and headers feed the call sites' error mapping); anything else is a
+/// transport-level failure.
+pub(crate) enum HttpError {
+    Status(u16, Response),
+    Transport(ureq::Error),
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Status(code, _) => write!(f, "status code {code}"),
+            HttpError::Transport(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Read a response body as JSON (10 MB cap, the same as ureq 2's `into_json`).
+fn response_json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T, ureq::Error> {
+    resp.into_body()
+        .with_config()
+        .limit(BODY_LIMIT_BYTES)
+        .read_json::<T>()
+}
+
+/// Read a response body as text (10 MB cap, the same as ureq 2's `into_string`).
+pub(crate) fn response_text(resp: Response) -> Result<String, ureq::Error> {
+    resp.into_body()
+        .with_config()
+        .limit(BODY_LIMIT_BYTES)
+        .read_to_string()
+}
+
+const BODY_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Header value as trimmed-nothing `&str`, or `None` when absent / non-UTF-8.
+fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Send a request and fold 4xx/5xx answers into [`HttpError::Status`].
+// `HttpError::Status` carries the whole response (body + headers) for the
+// call sites' error mapping; boxing it would break their match arms.
+#[allow(clippy::result_large_err)]
+pub(crate) fn classify(result: Result<Response, ureq::Error>) -> Result<Response, HttpError> {
+    match result {
+        Ok(resp) if resp.status().as_u16() >= 400 => {
+            Err(HttpError::Status(resp.status().as_u16(), resp))
+        }
+        Ok(resp) => Ok(resp),
+        Err(e) => Err(HttpError::Transport(e)),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Retry / backoff for transient GitHub API failures
@@ -77,10 +139,10 @@ fn status_is_transient(code: u16) -> bool {
 /// Classify a raw ureq error. Transport errors (DNS / connect / TLS /
 /// timeout) are always transient; status errors defer to
 /// [`status_is_transient`].
-fn is_transient(err: &ureq::Error) -> bool {
+fn is_transient(err: &HttpError) -> bool {
     match err {
-        ureq::Error::Status(code, _) => status_is_transient(*code),
-        ureq::Error::Transport(_) => true,
+        HttpError::Status(code, _) => status_is_transient(*code),
+        HttpError::Transport(_) => true,
     }
 }
 
@@ -103,16 +165,16 @@ fn next_backoff_ms(current: u64) -> u64 {
 /// GET / idempotent requests only — never wrap a POST or mutation.
 // `ureq::Error` is a large enum (~272 B); returning it in a `Result`
 // trips `result_large_err`. Boxing it would force every call site's
-// `ureq::Error::Status(code, resp)` match arm into a deref pattern, so
+// `HttpError::Status(code, resp)` match arm into a deref pattern, so
 // we accept the large `Err` variant at this ureq API boundary instead.
 #[allow(clippy::result_large_err)]
-fn call_with_retry<F>(build: F) -> Result<ureq::Response, ureq::Error>
+fn call_with_retry<F>(build: F) -> Result<Response, HttpError>
 where
-    F: Fn() -> Result<ureq::Response, ureq::Error>,
+    F: Fn() -> Result<Response, ureq::Error>,
 {
     let mut delay_ms = BASE_BACKOFF_MS;
     for attempt in 0..=RETRY_COUNT {
-        match build() {
+        match classify(build()) {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 if !is_transient(&e) || attempt == RETRY_COUNT {
@@ -212,13 +274,12 @@ const ACCEPTED_PERMISSIONS_HEADER: &str = "x-accepted-github-permissions";
 ///
 /// The header must be read *before* `into_string` consumes the response, so
 /// every 403 arm goes through here rather than reading the body directly.
-fn forbidden_parts(resp: ureq::Response) -> (Option<String>, String) {
-    let accepted = resp
-        .header(ACCEPTED_PERMISSIONS_HEADER)
+fn forbidden_parts(resp: Response) -> (Option<String>, String) {
+    let accepted = response_header(&resp, ACCEPTED_PERMISSIONS_HEADER)
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .map(String::from);
-    let body = resp.into_string().unwrap_or_default();
+    let body = response_text(resp).unwrap_or_default();
     (accepted, body)
 }
 
@@ -253,21 +314,19 @@ pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
     let result = call_with_retry(|| {
         let mut req = AGENT
             .get(&url)
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", "mcp-methods");
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "mcp-methods");
 
         if let Some(token) = auth_token() {
-            req = req.set("Authorization", &format!("Bearer {}", token));
+            req = req.header("Authorization", &format!("Bearer {}", token));
         }
         req.call()
     });
 
     match result {
-        Ok(resp) => resp
-            .into_json::<Value>()
-            .map_err(|e| format!("JSON parse error: {}", e)),
-        Err(ureq::Error::Status(404, _)) => Err(format!("Not found: {}", endpoint)),
-        Err(ureq::Error::Status(403, resp)) => {
+        Ok(resp) => response_json(resp).map_err(|e| format!("JSON parse error: {}", e)),
+        Err(HttpError::Status(404, _)) => Err(format!("Not found: {}", endpoint)),
+        Err(HttpError::Status(403, resp)) => {
             let (accepted, body) = forbidden_parts(resp);
             if body.to_lowercase().contains("rate limit") {
                 Err(
@@ -278,8 +337,8 @@ pub(crate) fn gh_get(endpoint: &str) -> Result<Value, String> {
                 Err(forbidden_message(accepted.as_deref(), &body))
             }
         }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+        Err(HttpError::Status(code, resp)) => {
+            let body = response_text(resp).unwrap_or_default();
             Err(format!("GitHub API error ({}): {}", code, body))
         }
         Err(e) => Err(format!("GitHub API error: {}", e)),
@@ -299,23 +358,22 @@ fn gh_graphql(query: &str, variables: Value) -> Result<Value, String> {
 
     let resp = AGENT
         .post("https://api.github.com/graphql")
-        .set("Authorization", &format!("Bearer {}", token))
-        .set("User-Agent", "mcp-methods")
-        .send_json(&body)
-        .map_err(|e| match e {
-            ureq::Error::Status(401, _) => {
-                "GitHub token is invalid or expired. Check GITHUB_TOKEN / GH_TOKEN.".to_string()
-            }
-            ureq::Error::Status(code, resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                format!("GitHub GraphQL error ({}): {}", code, body)
-            }
-            other => format!("GitHub GraphQL error: {}", other),
-        })?;
+        .header("Authorization", &format!("Bearer {}", token))
+        .header("User-Agent", "mcp-methods")
+        .send_json(&body);
+    let resp = classify(resp).map_err(|e| match e {
+        HttpError::Status(401, _) => {
+            "GitHub token is invalid or expired. Check GITHUB_TOKEN / GH_TOKEN.".to_string()
+        }
+        HttpError::Status(code, resp) => {
+            let body = response_text(resp).unwrap_or_default();
+            format!("GitHub GraphQL error ({}): {}", code, body)
+        }
+        other => format!("GitHub GraphQL error: {}", other),
+    })?;
 
-    let result: Value = resp
-        .into_json()
-        .map_err(|e| format!("GraphQL JSON parse error: {}", e))?;
+    let result: Value =
+        response_json(resp).map_err(|e| format!("GraphQL JSON parse error: {}", e))?;
 
     // GraphQL returns errors in {"errors": [...]} even on HTTP 200
     if let Some(errors) = result.get("errors").and_then(|v| v.as_array()) {
@@ -375,17 +433,15 @@ fn gh_get_page(url: &str) -> Result<Vec<Value>, String> {
     let resp = call_with_retry(|| {
         let mut req = AGENT
             .get(url)
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", "mcp-methods");
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "mcp-methods");
         if let Some(token) = auth_token() {
-            req = req.set("Authorization", &format!("Bearer {}", token));
+            req = req.header("Authorization", &format!("Bearer {}", token));
         }
         req.call()
     })
     .map_err(|e| format!("GitHub API error: {}", e))?;
-    let items: Value = resp
-        .into_json()
-        .map_err(|e| format!("JSON parse error: {}", e))?;
+    let items: Value = response_json(resp).map_err(|e| format!("JSON parse error: {}", e))?;
     match items {
         Value::Array(arr) => Ok(arr),
         _ => Ok(vec![]),
@@ -414,16 +470,16 @@ fn gh_get_paginated_bookends(
         let resp = match call_with_retry(|| {
             let mut req = AGENT
                 .get(&url)
-                .set("Accept", "application/vnd.github+json")
-                .set("User-Agent", "mcp-methods");
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "mcp-methods");
 
             if let Some(token) = auth_token() {
-                req = req.set("Authorization", &format!("Bearer {}", token));
+                req = req.header("Authorization", &format!("Bearer {}", token));
             }
             req.call()
         }) {
             Ok(r) => r,
-            Err(ureq::Error::Status(403, resp)) => {
+            Err(HttpError::Status(403, resp)) => {
                 let (accepted, body) = forbidden_parts(resp);
                 if body.to_lowercase().contains("rate limit") {
                     return Err(
@@ -436,10 +492,8 @@ fn gh_get_paginated_bookends(
             Err(e) => return Err(format!("GitHub API error: {}", e)),
         };
 
-        let link_header: Option<String> = resp.header("link").map(String::from);
-        let items: Value = resp
-            .into_json()
-            .map_err(|e| format!("JSON parse error: {}", e))?;
+        let link_header: Option<String> = response_header(&resp, "link").map(String::from);
+        let items: Value = response_json(resp).map_err(|e| format!("JSON parse error: {}", e))?;
 
         if let Value::Array(arr) = items {
             all_items.extend(arr);
@@ -1390,10 +1444,10 @@ fn search_issues_internal(
     let result = call_with_retry(|| {
         let mut req = AGENT
             .get(&format!("{}/search/issues", GITHUB_API))
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", "mcp-methods")
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "mcp-methods")
             .query("q", &q)
-            .query("per_page", &per_page.to_string());
+            .query("per_page", per_page.to_string());
 
         if let Some(s) = sort {
             req = req.query("sort", s);
@@ -1401,24 +1455,24 @@ fn search_issues_internal(
         // When sort is None, GitHub defaults to "best match" (relevance)
 
         if let Some(token) = auth_token() {
-            req = req.set("Authorization", &format!("Bearer {}", token));
+            req = req.header("Authorization", &format!("Bearer {}", token));
         }
         req.call()
     });
 
     match result {
         Ok(resp) => {
-            let data: Value = match resp.into_json() {
+            let data: Value = match response_json(resp) {
                 Ok(v) => v,
                 Err(e) => return format!("JSON parse error: {}", e),
             };
             format_search_results(repo, user_query, &data)
         }
-        Err(ureq::Error::Status(422, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+        Err(HttpError::Status(422, resp)) => {
+            let body = response_text(resp).unwrap_or_default();
             format!("GitHub search validation error: {}", body)
         }
-        Err(ureq::Error::Status(403, resp)) => {
+        Err(HttpError::Status(403, resp)) => {
             let (accepted, body) = forbidden_parts(resp);
             if body.to_lowercase().contains("rate limit") {
                 "GitHub API rate limit exceeded. Set GITHUB_TOKEN or GH_TOKEN for higher limits."
@@ -2032,6 +2086,74 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    /// Serve `raw` as the reply to every connection on a loopback port and
+    /// return the base URL. The listener thread ends with the test process.
+    fn serve_raw(raw: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(raw.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/x")
+    }
+
+    /// Fetch `raw` over loopback and return the classified response.
+    fn fixture_response(raw: &'static str) -> Response {
+        let url = serve_raw(raw);
+        match classify(AGENT.get(&url).call()) {
+            Err(HttpError::Status(_, resp)) | Ok(resp) => resp,
+            Err(HttpError::Transport(e)) => panic!("fixture request failed: {e}"),
+        }
+    }
+
+    fn reply(status: &str, body: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    #[test]
+    fn gh_get_maps_404_to_not_found() {
+        let url = serve_raw(reply("404 Not Found", "{\"message\":\"Not Found\"}"));
+        assert_eq!(gh_get(&url).unwrap_err(), format!("Not found: {url}"));
+    }
+
+    #[test]
+    fn gh_get_maps_403_rate_limit_and_plain_forbidden() {
+        let url = serve_raw(reply("403 Forbidden", "API rate limit exceeded"));
+        assert!(gh_get(&url)
+            .unwrap_err()
+            .starts_with("GitHub API rate limit exceeded."));
+        let url = serve_raw(reply("403 Forbidden", "nope"));
+        assert_eq!(gh_get(&url).unwrap_err(), "GitHub API forbidden: nope");
+    }
+
+    #[test]
+    fn gh_get_maps_other_status_with_body() {
+        let url = serve_raw(reply("400 Bad Request", "bad things"));
+        assert_eq!(
+            gh_get(&url).unwrap_err(),
+            "GitHub API error (400): bad things"
+        );
+    }
+
+    #[test]
+    fn gh_get_decodes_json_on_success() {
+        let url = serve_raw(reply("200 OK", "{\"a\":1}"));
+        assert_eq!(gh_get(&url).unwrap()["a"], 1);
+    }
 
     #[test]
     fn transient_status_classification() {
@@ -2110,7 +2232,7 @@ mod tests {
                    x-accepted-github-permissions: metadata=read; contents=write\r\n\
                    \r\n\
                    {\"message\":\"Resource not accessible by personal access token\"}";
-        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let resp = fixture_response(raw);
         let (accepted, body) = forbidden_parts(resp);
         assert_eq!(accepted.as_deref(), Some("metadata=read; contents=write"));
 
@@ -2137,7 +2259,7 @@ mod tests {
                    Content-Type: application/json\r\n\
                    \r\n\
                    {\"message\":\"Must have admin rights to Repository.\"}";
-        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let resp = fixture_response(raw);
         let (accepted, body) = forbidden_parts(resp);
         assert_eq!(accepted, None);
 
@@ -2156,7 +2278,7 @@ mod tests {
                    x-accepted-github-permissions: \r\n\
                    \r\n\
                    {\"message\":\"nope\"}";
-        let resp: ureq::Response = raw.parse().expect("fixture parses as an HTTP response");
+        let resp = fixture_response(raw);
         let (accepted, body) = forbidden_parts(resp);
         assert_eq!(accepted, None);
         assert_eq!(

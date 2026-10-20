@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1 — 2026-10-20
+
+### Security — HTTP client moved to ureq 3 (RUSTSEC-2026-0381)
+
+`ureq` 2.x pins `webpki-roots` 0.26, which is affected by RUSTSEC-2026-0381
+and has no fixed release on that line. The GitHub and screen tools now use
+`ureq` 3, which depends on `webpki-roots` 1.x. TLS stays on rustls.
+
+Behaviour is unchanged: 30 s overall timeout, the same headers, 4xx/5xx
+statuses mapped to the same messages, a 10 MB body cap, and no proxy
+environment variables. Only the text of low-level transport errors (DNS,
+connect, TLS) differs, because it now comes from ureq 3.
+
 ## 0.5.0 — 2026-10-20
 
 ### Changed — `get_info` reports the consumer's running version when `SelfCheck` is set
