@@ -20,7 +20,9 @@
 //!    `isError: true` on the MCP result. (For lower-level control, use
 //!    [`server::McpServer::tool_router_mut`] and rmcp's `ToolRoute`
 //!    directly.)
-//! 4. `server.serve(rmcp::transport::stdio()).await`.
+//! 4. `server.serve(server::stdio::StdioTransport::stdio()).await` — the
+//!    framework's stdio transport, which retains each request's exact
+//!    text for raw routes (rmcp's own `transport::stdio()` does not).
 //!
 //! See `kglite-mcp-server` for a real example: it adds `cypher_query`,
 //! `graph_overview`, and `save_graph` tools that close over an active
@@ -48,6 +50,7 @@ mod send_ledger;
 pub mod server;
 pub mod skills;
 pub mod source;
+pub mod stdio;
 pub mod watch;
 pub mod workspace;
 

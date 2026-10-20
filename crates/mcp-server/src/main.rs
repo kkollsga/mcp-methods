@@ -51,7 +51,7 @@ mod self_update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmcp::transport::stdio;
+use mcp_methods::server::stdio::StdioTransport;
 use rmcp::ServiceExt;
 
 use mcp_methods::server::manifest::{
@@ -852,7 +852,7 @@ async fn main() -> Result<()> {
     });
 
     let service = server
-        .serve(stdio())
+        .serve(StdioTransport::stdio())
         .await
         .context("failed to start MCP service over stdio")?;
     service.waiting().await?;

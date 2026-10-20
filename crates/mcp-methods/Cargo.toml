@@ -41,6 +41,8 @@ server = [
     "dep:tracing-subscriber",
     "dep:notify",
     "dep:notify-debouncer-mini",
+    "dep:futures",
+    "dep:tokio-util",
 ]
 
 [dependencies]
@@ -67,7 +69,7 @@ ignore = "0.4.15"
 globset = "0.4"
 
 # --- server feature ---
-rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io", "schemars"], optional = true }
+rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time"], optional = true }
 serde_yaml = { version = "0.9", optional = true }
 schemars = { version = "1", optional = true }
@@ -78,6 +80,10 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 notify = { version = "8", optional = true }
 notify-debouncer-mini = { version = "0.6", optional = true }
+# Framing for the stdio transport (`server::stdio`): the same codec stack
+# rmcp's own async-rw transport uses.
+futures = { version = "0.3", optional = true }
+tokio-util = { version = "0.7.9", features = ["codec"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
