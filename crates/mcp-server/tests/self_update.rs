@@ -15,6 +15,32 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_mcp-server");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Serialises every fork in this test binary against every executable it
+/// writes. Tests run on parallel threads: a child forked while another thread
+/// still holds a copied binary open for writing inherits that descriptor, and
+/// on Linux exec'ing the copy then fails with ETXTBSY ("Text file busy") until
+/// the child execs. Holding one lock across writes and spawns closes the window.
+static EXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn exec_lock() -> std::sync::MutexGuard<'static, ()> {
+    EXEC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn install(src: impl AsRef<Path>, dst: impl AsRef<Path>) {
+    let _guard = exec_lock();
+    std::fs::copy(src, dst).unwrap();
+}
+
+#[cfg(unix)]
+fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = exec_lock();
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -35,16 +61,19 @@ impl Session {
     }
 
     fn spawn_with(exe: &Path, cwd: &Path, args: &[&str]) -> Session {
-        let mut child = Command::new(exe)
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_TOKEN")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn mcp-server copy");
+        let spawned = {
+            let _guard = exec_lock();
+            Command::new(exe)
+                .args(args)
+                .current_dir(cwd)
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("GH_TOKEN")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let mut child = spawned.expect("failed to spawn mcp-server copy");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         // Watchdog: a wedged server would block `read_line` forever; killing
@@ -55,6 +84,7 @@ impl Session {
             let start = Instant::now();
             while !watch.load(Ordering::Acquire) {
                 if start.elapsed() > HANG_BOUND {
+                    let _guard = exec_lock();
                     let _ = Command::new("kill")
                         .args(["-KILL", &pid.to_string()])
                         .status();
@@ -116,6 +146,7 @@ impl Session {
     }
 
     fn alive(&mut self) -> bool {
+        let _guard = exec_lock();
         self.child.try_wait().unwrap().is_none()
             && Command::new("kill")
                 .args(["-0", &self.child.id().to_string()])
@@ -152,7 +183,10 @@ impl Drop for Session {
 
 #[test]
 fn version_flag_prints_the_crate_version() {
-    let out = Command::new(BIN).arg("--version").output().unwrap();
+    let out = {
+        let _guard = exec_lock();
+        Command::new(BIN).arg("--version").output().unwrap()
+    };
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(text.trim(), format!("mcp-server {VERSION}"));
@@ -162,7 +196,7 @@ fn version_flag_prints_the_crate_version() {
 fn replacing_the_binary_makes_later_results_carry_the_stale_notice() {
     let td = tempfile::tempdir().unwrap();
     let exe = td.path().join("mcp-server-copy");
-    std::fs::copy(BIN, &exe).unwrap();
+    install(BIN, &exe);
 
     let mut session = Session::spawn(&exe, td.path());
     session.initialize();
@@ -177,7 +211,7 @@ fn replacing_the_binary_makes_later_results_carry_the_stale_notice() {
 
     // What an installer does: a new file renamed over the old name.
     let fresh = td.path().join("mcp-server-new");
-    std::fs::copy(BIN, &fresh).unwrap();
+    install(BIN, &fresh);
     std::fs::rename(&fresh, &exe).unwrap();
 
     let after = session.ping();
@@ -215,11 +249,11 @@ fn stale_session(td: &Path) -> (Session, std::path::PathBuf) {
 #[cfg(unix)]
 fn stale_session_with(td: &Path, args: &[&str]) -> (Session, std::path::PathBuf) {
     let exe = td.join("mcp-server-copy");
-    std::fs::copy(BIN, &exe).unwrap();
+    install(BIN, &exe);
     let mut session = Session::spawn_with(&exe, td, args);
     session.initialize();
     let fresh = td.join("mcp-server-new");
-    std::fs::copy(BIN, &fresh).unwrap();
+    install(BIN, &fresh);
     std::fs::rename(&fresh, &exe).unwrap();
     (session, exe)
 }
@@ -275,7 +309,7 @@ fn ping_reload_replaces_the_process_in_place_and_resumes_the_session() {
     // The new image can reload again once it is stale itself.
     let exe = td.path().join("mcp-server-copy");
     let fresh = td.path().join("mcp-server-newer");
-    std::fs::copy(BIN, &fresh).unwrap();
+    install(BIN, &fresh);
     std::fs::rename(&fresh, &exe).unwrap();
     let again = session.request(
         "tools/call",
@@ -330,13 +364,11 @@ fn a_result_id_retained_before_the_reload_expands_after_it() {
 #[cfg(unix)]
 #[test]
 fn ping_reload_is_refused_when_the_new_build_fails_its_selftest() {
-    use std::os::unix::fs::PermissionsExt;
     let td = tempfile::tempdir().unwrap();
     let (mut session, exe) = stale_session(td.path());
     // The installer delivered something that cannot start.
     let broken = td.path().join("broken");
-    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
-    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&broken, "#!/bin/sh\nexit 1\n");
     std::fs::rename(&broken, &exe).unwrap();
 
     let refused = session.request(
@@ -361,6 +393,7 @@ fn ping_reload_is_refused_when_the_new_build_fails_its_selftest() {
 fn reload_preflight_exits_zero_on_a_clean_boot_and_nonzero_on_rejected_input() {
     let td = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {
+        let _guard = exec_lock();
         Command::new(BIN)
             .args(args)
             .current_dir(td.path())
@@ -392,16 +425,13 @@ fn reload_preflight_exits_zero_on_a_clean_boot_and_nonzero_on_rejected_input() {
 #[cfg(unix)]
 #[test]
 fn ping_reload_is_refused_when_the_new_build_passes_version_but_fails_preflight() {
-    use std::os::unix::fs::PermissionsExt;
     let td = tempfile::tempdir().unwrap();
     let (mut session, exe) = stale_session(td.path());
     let flaky = td.path().join("flaky");
-    std::fs::write(
+    write_script(
         &flaky,
         "#!/bin/sh\ncase \"$*\" in *--reload-preflight*) exit 2;; esac\necho 'mcp-server 9.9.9'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&flaky, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     std::fs::rename(&flaky, &exe).unwrap();
 
     let refused = session.request(
