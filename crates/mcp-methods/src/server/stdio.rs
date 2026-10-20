@@ -14,13 +14,14 @@
 //! string) is logged and skipped, while well-formed JSON that is not a valid
 //! message is answered with an `invalid_request` error carrying a null id.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::SinkExt;
-use rmcp::model::{ErrorData, GetExtensions, JsonRpcMessage};
+use rmcp::model::{ClientNotification, ErrorData, GetExtensions, JsonRpcMessage, RequestId};
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::async_rw::{JsonRpcMessageCodec, JsonRpcMessageCodecError};
 use rmcp::transport::Transport;
@@ -145,6 +146,8 @@ pub(crate) struct InputBuffer {
     #[cfg_attr(not(unix), allow(dead_code))]
     unfrozen: Notify,
     pump_active: AtomicBool,
+    /// Why no pump feeds this buffer, when `stdio()` tried and failed.
+    unpumped: StdMutex<Option<String>>,
     #[cfg(unix)]
     pump: StdMutex<Option<crate::server::stdin_pump::PumpHandle>>,
 }
@@ -160,6 +163,7 @@ impl InputBuffer {
             ready: Notify::new(),
             unfrozen: Notify::new(),
             pump_active: AtomicBool::new(false),
+            unpumped: StdMutex::new(None),
             #[cfg(unix)]
             pump: StdMutex::new(None),
         })
@@ -172,6 +176,16 @@ impl InputBuffer {
     /// Whether the non-consuming stdin pump feeds this buffer.
     pub(crate) fn pump_active(&self) -> bool {
         self.pump_active.load(Ordering::Acquire)
+    }
+
+    /// Why the pump could not be used, or a generic reason when none was
+    /// attempted (a transport built with `from_io`).
+    pub(crate) fn unpumped_reason(&self) -> String {
+        self.unpumped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| "stdin is not pollable (not read through the framework pump)".into())
     }
 
     fn push(&self, bytes: &[u8]) {
@@ -301,6 +315,77 @@ impl InputBuffer {
     }
 }
 
+/// Inbound requests whose response or error has not yet been written.
+///
+/// A request is outstanding from the moment the transport decodes it until
+/// the transport has written (and flushed) its answer, which is later than
+/// the handler returning: rmcp hands the answer to a spawned task. A reload
+/// uses this to know no answer is still on its way out.
+pub(crate) struct Outstanding {
+    ids: StdMutex<HashSet<RequestId>>,
+    changed: Notify,
+}
+
+impl Outstanding {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ids: StdMutex::new(HashSet::new()),
+            changed: Notify::new(),
+        })
+    }
+
+    fn ids(&self) -> std::sync::MutexGuard<'_, HashSet<RequestId>> {
+        self.ids.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn begin(&self, id: RequestId) {
+        self.ids().insert(id);
+    }
+
+    fn finish(&self, id: &RequestId) {
+        self.ids().remove(id);
+        self.changed.notify_waiters();
+    }
+
+    /// Track a decoded inbound message: a request becomes outstanding, and a
+    /// cancellation retires its request (rmcp need not answer a cancelled one).
+    fn observe_inbound(&self, message: &RxJsonRpcMessage<RoleServer>) {
+        match message {
+            JsonRpcMessage::Request(request) => self.begin(request.id.clone()),
+            JsonRpcMessage::Notification(notification) => {
+                if let ClientNotification::CancelledNotification(cancelled) =
+                    &notification.notification
+                {
+                    if let Some(id) = &cancelled.params.request_id {
+                        self.finish(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Wait until no request other than `own` is outstanding; `false` when
+    /// `within` elapses first. Answers keep flowing meanwhile: nothing here
+    /// holds the writer.
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn wait_until_only(&self, own: Option<&RequestId>, within: Duration) -> bool {
+        let settled = async {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.ids().iter().all(|id| Some(id) == own) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(within, settled).await.is_ok()
+    }
+}
+
 /// Pause point after a request that must be handled before any later input is
 /// decoded (a reload): the transport stops delivering messages until the
 /// handler calls [`release`](Self::release), so everything after that
@@ -383,6 +468,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WriterHold for SharedWriter<W> {
 pub(crate) struct TransportLink {
     pub(crate) input: Arc<InputBuffer>,
     pub(crate) gate: Arc<Gate>,
+    pub(crate) outstanding: Arc<Outstanding>,
     // Held by the unix reload path only.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) writer: Arc<dyn WriterHold>,
@@ -403,6 +489,7 @@ pub struct StdioTransport<R, W> {
     reader: Option<R>,
     input: Arc<InputBuffer>,
     gate: Arc<Gate>,
+    outstanding: Arc<Outstanding>,
     pause_after: Option<PauseAfter>,
     decoder: RawLineCodec<RxJsonRpcMessage<RoleServer>>,
     write: SharedWriter<W>,
@@ -414,16 +501,34 @@ impl StdioTransport<tokio::io::Stdin, tokio::io::Stdout> {
     ///
     /// On unix, inside a tokio runtime, stdin is polled by a pump that never
     /// consumes more than it buffers, which is what makes
-    /// `ping(reload=true)` available. When fd 0 cannot be registered (a
-    /// regular file, a terminal) or there is no runtime, input is read with
-    /// tokio's blocking stdin and reload reports itself unavailable.
+    /// `ping(reload=true)` available. The pump switches fd 0 to
+    /// `O_NONBLOCK`, a flag shared with every process holding the same open
+    /// file description, so it is not used on a terminal (a signal death
+    /// would leave the user's shell nonblocking). When fd 0 is a terminal or
+    /// cannot be registered (a regular file), or there is no runtime, input
+    /// is read with tokio's blocking stdin and reload reports itself
+    /// unavailable.
     pub fn stdio() -> Self {
         #[cfg(unix)]
-        match Self::pumped(0, tokio::io::stdout()) {
-            Ok(transport) => return transport,
-            Err(error) => tracing::info!("stdin pump unavailable, reload disabled: {error}"),
+        {
+            match Self::pumped(0, tokio::io::stdout()) {
+                Ok(transport) => transport,
+                Err(error) => {
+                    tracing::info!("stdin pump unavailable, reload disabled: {error}");
+                    let transport = Self::from_io(tokio::io::stdin(), tokio::io::stdout());
+                    *transport
+                        .input
+                        .unpumped
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                    transport
+                }
+            }
         }
-        Self::from_io(tokio::io::stdin(), tokio::io::stdout())
+        #[cfg(not(unix))]
+        {
+            Self::from_io(tokio::io::stdin(), tokio::io::stdout())
+        }
     }
 }
 
@@ -437,6 +542,7 @@ where
             reader,
             input,
             gate: Gate::new(),
+            outstanding: Outstanding::new(),
             pause_after: None,
             decoder: RawLineCodec::default(),
             write: Arc::new(Mutex::new(Some(FramedWrite::new(
@@ -496,6 +602,7 @@ where
         TransportLink {
             input: self.input.clone(),
             gate: self.gate.clone(),
+            outstanding: self.outstanding.clone(),
             writer: Arc::new(self.write.clone()),
         }
     }
@@ -553,15 +660,27 @@ where
         item: TxJsonRpcMessage<RoleServer>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let write = self.write.clone();
+        let outstanding = self.outstanding.clone();
+        let answered = match &item {
+            JsonRpcMessage::Response(response) => Some(response.id.clone()),
+            JsonRpcMessage::Error(error) => error.id.clone(),
+            _ => None,
+        };
         async move {
-            let mut guard = write.lock().await;
-            match guard.as_mut() {
-                Some(writer) => writer.send(item).await.map_err(Into::into),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "Transport is closed",
-                )),
+            let sent = {
+                let mut guard = write.lock().await;
+                match guard.as_mut() {
+                    Some(writer) => writer.send(item).await.map_err(Into::into),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Transport is closed",
+                    )),
+                }
+            };
+            if let Some(id) = answered {
+                outstanding.finish(&id);
             }
+            sent
         }
     }
 
@@ -580,6 +699,7 @@ where
             match decoded {
                 Ok(Some((mut message, raw))) => {
                     attach_raw(&mut message, raw, false);
+                    self.outstanding.observe_inbound(&message);
                     if self.pause_after.as_ref().is_some_and(|pred| pred(&message)) {
                         self.gate.pause();
                     }
@@ -590,6 +710,7 @@ where
                     if let (Some(raw), Some(recover)) = (raw, &self.recover) {
                         if let Some(mut message) = recover(&raw) {
                             attach_raw(&mut message, raw, true);
+                            self.outstanding.observe_inbound(&message);
                             return Some(message);
                         }
                     }
@@ -873,6 +994,58 @@ mod tests {
         assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, second);
     }
 
+    #[tokio::test]
+    async fn requests_stay_outstanding_until_their_answer_is_written() {
+        use rmcp::model::{NumberOrString, ServerResult};
+        let (mut t, mut tx, _rx) = pair();
+        let link = t.link();
+        let own = NumberOrString::Number(1);
+        tx.write_all(format!("{PING}\n").as_bytes()).await.unwrap();
+        t.receive().await.unwrap();
+        let short = Duration::from_millis(60);
+        assert!(!link.outstanding.wait_until_only(None, short).await);
+        assert!(link.outstanding.wait_until_only(Some(&own), short).await);
+
+        // A waiter is woken by the answer being written, not by the handler.
+        let outstanding = link.outstanding.clone();
+        let waiter = tokio::spawn(async move {
+            outstanding
+                .wait_until_only(None, Duration::from_secs(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        let reply = TxJsonRpcMessage::<RoleServer>::response(ServerResult::empty(()), own);
+        t.send(reply).await.unwrap();
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_error_answer_and_a_cancellation_each_retire_their_request() {
+        let (mut t, mut tx, _rx) = pair();
+        let link = t.link();
+        let second = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        tx.write_all(format!("{PING}\n{second}\n").as_bytes())
+            .await
+            .unwrap();
+        t.receive().await.unwrap();
+        t.receive().await.unwrap();
+        let reply = TxJsonRpcMessage::<RoleServer>::error(
+            ErrorData::internal_error("boom", None),
+            Some(rmcp::model::NumberOrString::Number(1)),
+        );
+        t.send(reply).await.unwrap();
+        let short = Duration::from_millis(60);
+        assert!(!link.outstanding.wait_until_only(None, short).await);
+        tx.write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#,
+        )
+        .await
+        .unwrap();
+        tx.write_all(b"\n").await.unwrap();
+        t.receive().await.unwrap();
+        assert!(link.outstanding.wait_until_only(None, short).await);
+    }
+
     #[cfg(unix)]
     mod pump {
         use super::*;
@@ -960,6 +1133,42 @@ mod tests {
                 0,
                 "dropping the transport restores stdin"
             );
+        }
+
+        #[tokio::test]
+        async fn a_terminal_is_never_pumped_and_keeps_its_blocking_mode() {
+            let (mut master, mut slave) = (0i32, 0i32);
+            // SAFETY: both out-pointers are valid; the optional arguments are null.
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    // The termios/winsize pointer mutability differs by libc target.
+                    std::ptr::null::<u8>() as _,
+                    std::ptr::null::<u8>() as _,
+                )
+            };
+            assert_eq!(opened, 0, "openpty");
+            // SAFETY: openpty returned two fresh descriptors nobody else owns.
+            let (_master, slave) = unsafe {
+                (
+                    std::os::fd::OwnedFd::from_raw_fd(master),
+                    std::os::fd::OwnedFd::from_raw_fd(slave),
+                )
+            };
+            let fd = slave.as_raw_fd();
+            assert!(crate::server::stdin_pump::is_terminal(fd));
+            let before = flags(fd);
+            assert_eq!(before & libc::O_NONBLOCK, 0);
+            let (server_tx, _client_rx) = duplex(64);
+            let error = StdioTransport::<tokio::io::Empty, _>::pumped(fd, server_tx)
+                .err()
+                .expect("a terminal is refused");
+            assert!(error.to_string().contains("terminal"), "{error}");
+            assert_eq!(flags(fd), before, "never switched to O_NONBLOCK");
+            let (_write, read) = pipe();
+            assert!(!crate::server::stdin_pump::is_terminal(read.as_raw_fd()));
         }
 
         #[tokio::test]

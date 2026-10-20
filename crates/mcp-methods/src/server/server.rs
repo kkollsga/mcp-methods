@@ -1852,7 +1852,7 @@ impl McpServer {
                 .self_check
                 .as_ref()
                 .and_then(|c| c.reload_unavailable(true))
-                .unwrap_or("reload is not configured for this server");
+                .unwrap_or_else(|| "reload is not configured for this server".to_string());
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "reload refused: {why}"
             ))]));
@@ -2918,9 +2918,8 @@ impl ServerHandler for McpServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         use crate::response_budget::{Expansion, ResponseOptions};
-        // First, so every exit path of this call is counted and, for a
-        // reload request, releases the input gate the transport paused.
-        let _in_flight = self.options.self_check.as_ref().map(|c| c.enter_call());
+        // First, so every exit path of a reload request releases the input
+        // gate the transport paused.
         let reload_request = crate::server::reload::is_reload_ping(&request);
         let _gate = reload_request
             .then(|| {

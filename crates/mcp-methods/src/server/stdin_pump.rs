@@ -70,12 +70,28 @@ impl PumpHandle {
     }
 }
 
+/// Whether `fd` is a terminal.
+pub(crate) fn is_terminal(fd: RawFd) -> bool {
+    // SAFETY: isatty takes only the descriptor number.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
 /// Start pumping `fd` into `input`. Fails (leaving the descriptor as found)
-/// when there is no tokio runtime or the descriptor cannot be registered for
-/// readiness, which is what a regular file or terminal does.
+/// when there is no tokio runtime, when `fd` is a terminal, or when the
+/// descriptor cannot be registered for readiness (a regular file).
+///
+/// A terminal is refused up front even though it registers fine: `O_NONBLOCK`
+/// lives on the open file description, shared with the user's shell, and is
+/// only cleared by [`PumpHandle::stop`], which a signal death never reaches.
 pub(crate) fn start(fd: RawFd, input: Arc<InputBuffer>) -> io::Result<PumpHandle> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
+    if is_terminal(fd) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stdin is a terminal",
+        ));
+    }
     let original_flags = fcntl_flags(fd)?;
     set_flags(fd, original_flags | libc::O_NONBLOCK)?;
     let registered = {
@@ -89,7 +105,10 @@ pub(crate) fn start(fd: RawFd, input: Arc<InputBuffer>) -> io::Result<PumpHandle
         Ok(afd) => afd,
         Err(error) => {
             let _ = set_flags(fd, original_flags);
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("stdin is not pollable: {error}"),
+            ));
         }
     };
     let task = runtime.spawn(run(fd, afd, input));

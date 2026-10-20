@@ -88,6 +88,59 @@ pub(crate) fn write_handover(handover: &Handover) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Handover files older than this are orphans whatever their pid says.
+#[cfg(unix)]
+const HANDOVER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove handover files in `dir` that no process will ever read: owned by
+/// this user and named for a pid that is gone, or older than `max_age`.
+/// `keep` (the file this process is about to read) is never touched. Errors
+/// are ignored; this is housekeeping.
+#[cfg(unix)]
+pub(crate) fn sweep_stale_handovers(
+    dir: &std::path::Path,
+    max_age: std::time::Duration,
+    keep: Option<&std::path::Path>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("mcp-methods-reload-"))
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|n| n.split('-').next())
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if keep == Some(path.as_path()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || meta.uid() != uid {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        // SAFETY: signal 0 only probes for the pid's existence.
+        let gone = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone || old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Read a handover file. The file is removed whether or not it parsed.
 pub(crate) fn read_handover(path: &std::path::Path) -> Result<Handover, String> {
     let read = std::fs::read(path);
@@ -165,14 +218,21 @@ pub(crate) async fn reload_ping(
             check.running_version()
         ));
     }
-    // A request decoded just before this one may not have entered
-    // `call_tool` yet; give it the chance to be counted.
-    tokio::task::yield_now().await;
-    let others = check.in_flight().saturating_sub(1);
-    if others > 0 {
-        return refused(format!(
-            "{others} other tool call(s) are running; retry when they finish"
-        ));
+    // Every request decoded before this one (the transport decodes nothing
+    // after it until this handler returns) must have had its answer written:
+    // the exec would otherwise drop answers still on their way out.
+    let Some(link) = check.link() else {
+        return refused("reload needs the framework stdio transport");
+    };
+    if !link
+        .outstanding
+        .wait_until_only(Some(&context.id), OUTSTANDING_WAIT)
+        .await
+    {
+        return refused(
+            "other requests are still in flight (waited for their answers); \
+             retry when they finish",
+        );
     }
     let Some(config) = check.reload_config() else {
         return refused("reload is not configured for this server");
@@ -205,6 +265,9 @@ pub(crate) async fn reload_ping(
     let replay_line = raw.source.to_string();
     perform(check, config.argv.clone(), peer_info, replay_line, tools).await
 }
+
+/// Longest a reload waits for earlier requests' answers to be written.
+const OUTSTANDING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(unix)]
 async fn perform(
@@ -242,7 +305,17 @@ async fn perform(
             return refused(format!("cannot write the handover: {error}"));
         }
     };
-    if let Some(before_exec) = check.reload_config().and_then(|c| c.before_exec.as_ref()) {
+    if let Err(reason) = exec_viable(program) {
+        link.input.unfreeze();
+        let _ = std::fs::remove_file(&path);
+        drop(held);
+        return refused(format!(
+            "cannot start {}: {reason}",
+            program.to_string_lossy()
+        ));
+    }
+    let before_exec = check.reload_config().and_then(|c| c.before_exec.as_ref());
+    if let Some(before_exec) = before_exec {
         before_exec();
     }
     link.input.restore_blocking();
@@ -255,10 +328,51 @@ async fn perform(
     let _ = std::fs::remove_file(&path);
     link.input.unfreeze();
     drop(held);
-    refused(format!(
-        "cannot start {}: {error}",
-        program.to_string_lossy()
-    ))
+    let program = program.to_string_lossy();
+    if before_exec.is_some() {
+        // The consumer already released its state; continuing would serve
+        // from a half-torn-down process.
+        check.exit_after_answer(link.outstanding.clone());
+        return CallToolResult::error(vec![ContentBlock::text(format!(
+            "reload failed: cannot start {program}: {error}. The server released its \
+             state for the reload (before_exec ran), so it is shutting down; \
+             restart the MCP client."
+        ))]);
+    }
+    refused(format!("cannot start {program}: {error}"))
+}
+
+/// Whether `exec` of `program` can plausibly succeed: an executable regular
+/// file at that path, or on `PATH` for a bare name. Checked before the
+/// consumer's `before_exec` hook so a missing or non-executable target never
+/// costs the consumer its state.
+#[cfg(unix)]
+fn exec_viable(program: &std::ffi::OsStr) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    fn direct(path: &std::path::Path) -> Result<(), String> {
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: `c_path` is a valid NUL-terminated string.
+        if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    if program.as_bytes().contains(&b'/') {
+        return direct(std::path::Path::new(program));
+    }
+    let on_path = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| direct(&dir.join(program)).is_ok())
+    });
+    if on_path {
+        Ok(())
+    } else {
+        Err("not found on PATH".to_string())
+    }
 }
 
 #[cfg(not(unix))]
@@ -290,6 +404,9 @@ impl McpServer {
     /// when configured, and sends `tools/list_changed` when the tool set
     /// differs from the old process's.
     ///
+    /// Before anything else it removes orphaned handover files (see
+    /// `sweep_stale_handovers`) left by reloads whose new image died early.
+    ///
     /// A handover that exists but cannot be read leaves no session to
     /// resume: the error is returned (and the file removed), so a caller
     /// that propagates it exits non-zero rather than waiting for a client
@@ -311,7 +428,14 @@ impl McpServer {
         if let Some(state) = &state {
             state.attach(transport.link());
         }
-        let Some(path) = std::env::var_os(HANDOVER_ENV) else {
+        let handover_path = std::env::var_os(HANDOVER_ENV);
+        #[cfg(unix)]
+        sweep_stale_handovers(
+            &std::env::temp_dir(),
+            HANDOVER_MAX_AGE,
+            handover_path.as_deref().map(std::path::Path::new),
+        );
+        let Some(path) = handover_path else {
             return Ok(rmcp::ServiceExt::serve(self, transport).await?);
         };
         std::env::remove_var(HANDOVER_ENV);
@@ -427,6 +551,8 @@ mod session_tests {
         notes: Vec<Value>,
         id: i64,
         gate: Arc<tokio::sync::Notify>,
+        /// Set by the injected replacement for `process::exit`.
+        exited: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Harness {
@@ -532,6 +658,14 @@ mod session_tests {
         );
         let mut server = McpServer::new(ServerOptions::default().with_self_check(check));
         let gate = Arc::new(tokio::sync::Notify::new());
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag = exited.clone();
+        server
+            .options()
+            .self_check
+            .as_ref()
+            .expect("self check configured")
+            .set_exit_hook(move || exit_flag.store(true, Ordering::SeqCst));
         server.tool_router_mut().add_route(slow_route(gate.clone()));
         let (pipe_in, pipe_out) = pipe();
         let (server_tx, client_rx) = duplex(1 << 20);
@@ -567,6 +701,7 @@ mod session_tests {
             notes: Vec::new(),
             id: 0,
             gate,
+            exited,
         };
         let init = h
             .request("initialize", serde_json::from_str(INIT).unwrap())
@@ -641,10 +776,7 @@ mod session_tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let frame = h.call("ping", json!({"reload": true})).await;
         assert_eq!(frame["result"]["isError"], true);
-        assert!(
-            Harness::text(&frame).contains("1 other tool call"),
-            "{frame}"
-        );
+        assert!(Harness::text(&frame).contains("still in flight"), "{frame}");
         h.gate.notify_one();
         assert!(Harness::text(&h.frame_for(slow_id).await).starts_with("slow done"));
         // Nothing else running: it now reaches the exec, which fails.
@@ -695,7 +827,8 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn failed_exec_keeps_serving_and_the_pipelined_request_is_answered() {
+    async fn unexecutable_target_keeps_serving_without_running_before_exec_and_answers_the_pipelined_request(
+    ) {
         let hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook2 = hook.clone();
         let mut h = boot_with(
@@ -725,7 +858,10 @@ mod session_tests {
             Harness::text(&first).contains("cannot start /nonexistent/server"),
             "{first}"
         );
-        assert!(hook.load(Ordering::SeqCst), "before_exec ran");
+        assert!(
+            !hook.load(Ordering::SeqCst),
+            "a target that cannot be executed is caught before before_exec"
+        );
         let second = h.frame_for(next_id).await;
         assert!(Harness::text(&second).starts_with("pong"), "{second}");
         let pid_prefix = format!("mcp-methods-reload-{}-", std::process::id());
@@ -739,6 +875,137 @@ mod session_tests {
         );
         // Input still flows after the pump was frozen and resumed.
         assert!(Harness::text(&h.call("ping", json!({})).await).starts_with("pong"));
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_a_slow_answer_to_be_written_before_it_proceeds() {
+        let mut h = boot_with(|c| c.with_reload(["/nonexistent/server"]), true).await;
+        h.replace();
+        h.id += 1;
+        let (slow_id, ping_id) = (h.id, h.id + 1);
+        h.id = ping_id;
+        let both = format!(
+            "{}{}",
+            h.line(slow_id, "tools/call", json!({"name":"slow","arguments":{}})),
+            h.line(
+                ping_id,
+                "tools/call",
+                json!({"name":"ping","arguments":{"reload":true}})
+            )
+        );
+        h.send_raw(&both);
+        // The slow call finishes well inside the wait: the reload is held
+        // back until its answer is written, then reaches the exec stage.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.gate.notify_one();
+        let slow = h.frame_for(slow_id).await;
+        assert!(Harness::text(&slow).starts_with("slow done"), "{slow}");
+        let ping = h.frame_for(ping_id).await;
+        let text = Harness::text(&ping);
+        assert!(text.contains("cannot start"), "{ping}");
+        assert!(!text.contains("in flight"), "{ping}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_call_that_outlasts_the_wait_refuses_the_reload_and_is_still_answered() {
+        let mut h = boot_with(|c| c.with_reload(["/nonexistent/server"]), true).await;
+        h.replace();
+        h.id += 1;
+        let slow_id = h.id;
+        let slow = h.line(slow_id, "tools/call", json!({"name":"slow","arguments":{}}));
+        h.send_raw(&slow);
+        let ping = h.call("ping", json!({"reload": true})).await;
+        assert!(Harness::text(&ping).contains("still in flight"), "{ping}");
+        h.gate.notify_one();
+        let slow = h.frame_for(slow_id).await;
+        assert!(Harness::text(&slow).starts_with("slow done"), "{slow}");
+    }
+
+    #[tokio::test]
+    async fn exec_failing_after_before_exec_answers_with_an_error_and_shuts_the_server_down() {
+        use std::os::unix::fs::PermissionsExt;
+        // Executable regular file, so the pre-check passes, whose interpreter
+        // does not exist, so the exec itself fails.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let script = bin_dir.path().join("server");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook2 = hook.clone();
+        let argv = [script.clone()];
+        let mut h = boot_with(
+            move |c| {
+                c.with_reload(argv)
+                    .with_before_exec(move || hook2.store(true, Ordering::SeqCst))
+            },
+            true,
+        )
+        .await;
+        h.replace();
+        let frame = h.call("ping", json!({"reload": true})).await;
+        assert!(hook.load(Ordering::SeqCst), "before_exec ran");
+        assert_eq!(frame["result"]["isError"], true);
+        let text = Harness::text(&frame);
+        assert!(text.contains("shutting down"), "{frame}");
+        assert!(text.contains("cannot start"), "{frame}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !h.exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the server ends the process after answering");
+    }
+
+    #[test]
+    fn exec_viability_requires_an_executable_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prog");
+        assert!(exec_viable(file.as_os_str()).is_err(), "missing");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(exec_viable(file.as_os_str()).is_err(), "not executable");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(exec_viable(file.as_os_str()).is_ok());
+        assert!(exec_viable(dir.path().as_os_str()).is_err(), "a directory");
+        assert!(
+            exec_viable(std::ffi::OsStr::new("sh")).is_ok(),
+            "bare name on PATH"
+        );
+        assert!(exec_viable(std::ffi::OsStr::new("no-such-program-anywhere")).is_err());
+    }
+
+    #[test]
+    fn sweep_removes_only_orphaned_handover_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let make = |name: String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"{}").unwrap();
+            path
+        };
+        let orphan = make(format!("mcp-methods-reload-{dead_pid}-1.json"));
+        let live = make(format!("mcp-methods-reload-{me}-2.json"));
+        let current = make(format!("mcp-methods-reload-{me}-3.json"));
+        let old_live = make(format!("mcp-methods-reload-{me}-4.json"));
+        let unrelated = make("mcp-methods-other.json".into());
+        let unparsable = make("mcp-methods-reload-notapid-5.json".into());
+        std::fs::File::options()
+            .write(true)
+            .open(&old_live)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        sweep_stale_handovers(dir.path(), HANDOVER_MAX_AGE, Some(&current));
+        assert!(!orphan.exists(), "dead pid");
+        assert!(!old_live.exists(), "older than the age bound");
+        assert!(live.exists(), "live pid, fresh");
+        assert!(current.exists(), "the file this process will read");
+        assert!(unrelated.exists() && unparsable.exists(), "not ours");
     }
 
     #[tokio::test]

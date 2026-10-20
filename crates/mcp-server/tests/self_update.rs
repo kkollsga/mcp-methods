@@ -87,15 +87,18 @@ impl Session {
     }
 
     fn wait_for(&mut self, id: i64) -> String {
-        let needle = format!("\"id\":{id}");
-        if let Some(at) = self.unread.iter().position(|l| l.contains(&needle)) {
+        let is_answer = |line: &str| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|v| v["id"].as_i64() == Some(id))
+        };
+        if let Some(at) = self.unread.iter().position(|l| is_answer(l)) {
             return self.unread.remove(at);
         }
         loop {
             let mut line = String::new();
             let n = self.stdout.read_line(&mut line).unwrap();
             assert!(n > 0, "server exited before answering id {id}");
-            if line.contains(&needle) {
+            if is_answer(&line) {
                 return line;
             }
             self.unread.push(line);
@@ -296,4 +299,62 @@ fn ping_reload_is_refused_when_the_new_build_fails_its_selftest() {
         ping.contains(&format!("mcp-server {VERSION} (stale")),
         "{ping}"
     );
+}
+
+#[test]
+fn reload_preflight_exits_zero_on_a_clean_boot_and_nonzero_on_rejected_input() {
+    let td = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(td.path())
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["--reload-preflight"]).status.success());
+    let missing = td.path().join("no-such-dir");
+    let missing = missing.to_str().unwrap();
+    assert!(!run(&["--source-root", missing, "--reload-preflight"])
+        .status
+        .success());
+    assert!(!run(&["--mcp-config", missing, "--reload-preflight"])
+        .status
+        .success());
+    assert!(!run(&["--no-such-flag", "--reload-preflight"])
+        .status
+        .success());
+    assert_eq!(
+        std::fs::read_dir(td.path()).unwrap().count(),
+        0,
+        "the preflight writes nothing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ping_reload_is_refused_when_the_new_build_passes_version_but_fails_preflight() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = tempfile::tempdir().unwrap();
+    let (mut session, exe) = stale_session(td.path());
+    let flaky = td.path().join("flaky");
+    std::fs::write(
+        &flaky,
+        "#!/bin/sh\ncase \"$*\" in *--reload-preflight*) exit 2;; esac\necho 'mcp-server 9.9.9'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&flaky, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&flaky, &exe).unwrap();
+
+    let refused = session.request(
+        "tools/call",
+        r#"{"name":"ping","arguments":{"reload":true}}"#,
+    );
+    assert!(refused.contains("\"isError\":true"), "{refused}");
+    assert!(refused.contains("--reload-preflight"), "{refused}");
+    assert!(session.alive());
+    let ping = session.request("tools/call", r#"{"name":"ping","arguments":{}}"#);
+    assert!(ping.contains("pong"), "{ping}");
 }

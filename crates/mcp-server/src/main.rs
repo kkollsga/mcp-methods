@@ -158,6 +158,12 @@ struct Cli {
     #[arg(long = "stale-after-days", default_value_t = 7)]
     stale_after_days: u32,
 
+    /// Run the boot path up to, but excluding, serving (argument, manifest and
+    /// environment checks only), then exit 0. A reload runs the new build with
+    /// this flag before committing to it. No watcher, network, or file writes.
+    #[arg(long = "reload-preflight", hide = true)]
+    reload_preflight: bool,
+
     /// Optional skills-related subcommand. When set, runs the named
     /// command and exits without booting the MCP server.
     #[command(subcommand)]
@@ -688,6 +694,9 @@ async fn main() -> Result<()> {
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
     if cli.name.is_some() {
         options.name = cli.name.clone();
+    }
+    if cli.reload_preflight {
+        return Ok(());
     }
     if let Some(check) = self_update::self_check() {
         options = options.with_self_check(check);

@@ -64,10 +64,23 @@ replaces the process image with `exec`, keeping the same PID and pipes.
   `serve(..)` in the consumer's `main`; it is the entry point that picks up a
   handover.
 - A reload is refused, with the reason in the `ping` answer and the old
-  process left serving, when the binary is not stale, other calls are in
-  flight, `with_can_reload` returns `Err`, or `with_selftest` fails against the
-  new build. `with_before_exec` runs a consumer hook just before the exec.
-  `mcp-server` self-tests the new build with `<exe> --version` (5 s timeout).
+  process left serving, when the binary is not stale, other requests are
+  in flight, `with_can_reload` returns `Err`, the target is not an executable
+  file, or `with_selftest` fails against the new build. "In flight" means a
+  request whose answer the transport has not yet written (any method, not
+  only `tools/call`); the reload waits up to 2 s for such answers, so a call
+  that returned an instant before the reload is never cut off.
+- `with_before_exec` runs a consumer hook just before the exec, after the
+  target was checked to be an executable file. If the exec still fails after
+  the hook ran, the server cannot continue with state the hook released: it
+  answers the reload request with an error and exits with status 1.
+- `mcp-server` self-tests the new build with `<exe> --version` and with
+  `<exe> <current arguments> --reload-preflight` (hidden flag: argument,
+  manifest and environment checks, then exit 0; no watcher, network or
+  writes), 5 s each, so options or a manifest the new build rejects refuse the
+  reload instead of killing the session.
+- `serve_with_handover` removes orphaned `mcp-methods-reload-*` files in the
+  temp directory (this user's, for a pid that is gone or older than 1 hour).
 - The `reload` argument appears in `ping`'s schema only when reload is
   configured; other servers see no schema change.
 - State lost on reload, and stated in the `ping` answer: retained response ids
@@ -77,7 +90,9 @@ replaces the process image with `exec`, keeping the same PID and pipes.
   unsupported.
 - Reload needs `StdioTransport::stdio()` reading fd 0 through the framework's
   non-consuming pump. When stdin is a terminal or a regular file, or the server
-  uses another transport, reload reports itself unavailable.
+  uses another transport, reload reports itself unavailable ("stdin is a
+  terminal" for a terminal, which is never switched to `O_NONBLOCK`: that flag
+  is shared with the user's shell and a signal death would leave it set).
 
 ### Added — `mcp-server --version`, and self-update in `mcp-server`
 
@@ -94,8 +109,11 @@ on unix for the stdin pump.
 
 ### Known limitations
 
-- A request other than `tools/call` that is in flight when the process execs
-  loses its answer; only `tools/call` is counted by the in-flight guard.
+- A new build that passes the selftest but then fails before reaching
+  `serve_with_handover` (a crash during boot) loses the replayed request: the
+  client sees the server exit, and the handover file is left for the next
+  `serve_with_handover` sweep. `mcp-server`'s `--reload-preflight` selftest
+  narrows this to failures after argument, manifest and environment checks.
 - After a reload, `get_info` for the resumed session still reports the old
   version, because the client's handshake already happened.
 - The FastMCP Python wrapper is not covered by this release.

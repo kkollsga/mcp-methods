@@ -1,6 +1,7 @@
 //! Wiring for the framework's stale-binary notice: watch the running
 //! executable and probe the on-disk build for its version.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -8,6 +9,9 @@ use std::time::{Duration, Instant};
 use mcp_methods::server::SelfCheck;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hidden flag that boots the argument/manifest path and exits 0.
+const PREFLIGHT_FLAG: &str = "--reload-preflight";
 
 /// The executable path to watch. Linux appends " (deleted)" to
 /// `/proc/self/exe` once the file was unlinked; the name that matters
@@ -27,11 +31,11 @@ fn parse_version_output(stdout: &str) -> Option<String> {
         .then(|| version.to_string())
 }
 
-/// Run `<exe> --version`, bounded by [`PROBE_TIMEOUT`]; `None` on any
-/// failure (missing file, non-zero exit, timeout, unparseable output).
-fn probe_installed_version(exe: &Path) -> Option<String> {
+/// Run `exe args`, bounded by [`PROBE_TIMEOUT`]: `Some(stdout)` on exit 0,
+/// `None` on any failure (missing file, non-zero exit, timeout).
+fn run_bounded(exe: &Path, args: &[OsString]) -> Option<String> {
     let mut child = Command::new(exe)
-        .arg("--version")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -52,14 +56,31 @@ fn probe_installed_version(exe: &Path) -> Option<String> {
     }
     let mut out = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
-    parse_version_output(&out)
+    Some(out)
 }
 
-/// Reload selftest: the new build must run `--version` and report one.
-fn selftest(exe: &Path) -> Result<(), String> {
-    probe_installed_version(exe).map(|_| ()).ok_or_else(|| {
-        format!(
+/// `<exe> --version`, parsed; `None` on any failure.
+fn probe_installed_version(exe: &Path) -> Option<String> {
+    parse_version_output(&run_bounded(exe, &[OsString::from("--version")])?)
+}
+
+/// Reload selftest: the new build must report a version, and must accept this
+/// process's own arguments (`<exe> <args> --reload-preflight` exits 0), so an
+/// option or manifest the new build rejects is caught before the exec rather
+/// than after the old process is gone.
+fn selftest(exe: &Path, original_args: &[OsString]) -> Result<(), String> {
+    if probe_installed_version(exe).is_none() {
+        return Err(format!(
             "`{} --version` did not exit 0 with a version within {}s",
+            exe.display(),
+            PROBE_TIMEOUT.as_secs()
+        ));
+    }
+    let mut args = original_args.to_vec();
+    args.push(OsString::from(PREFLIGHT_FLAG));
+    run_bounded(exe, &args).map(|_| ()).ok_or_else(|| {
+        format!(
+            "`{} {PREFLIGHT_FLAG}` with the current arguments did not exit 0 within {}s",
             exe.display(),
             PROBE_TIMEOUT.as_secs()
         )
@@ -72,13 +93,14 @@ fn selftest(exe: &Path) -> Result<(), String> {
 pub fn self_check() -> Option<SelfCheck> {
     let exe = normalize_exe_path(std::env::current_exe().ok()?);
     let probe_path = exe.clone();
+    let original_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut argv = vec![exe.clone().into_os_string()];
-    argv.extend(std::env::args_os().skip(1));
+    argv.extend(original_args.iter().cloned());
     Some(
         SelfCheck::new("mcp-server", exe, env!("CARGO_PKG_VERSION"))
             .with_installed_version(move || probe_installed_version(&probe_path))
             .with_reload(argv)
-            .with_selftest(selftest),
+            .with_selftest(move |path| selftest(path, &original_args)),
     )
 }
 
@@ -110,7 +132,7 @@ mod tests {
 
     #[test]
     fn selftest_rejects_a_missing_binary_and_names_it() {
-        let error = selftest(Path::new("/nonexistent/mcp-server")).unwrap_err();
+        let error = selftest(Path::new("/nonexistent/mcp-server"), &[]).unwrap_err();
         assert!(
             error.contains("/nonexistent/mcp-server --version"),
             "{error}"

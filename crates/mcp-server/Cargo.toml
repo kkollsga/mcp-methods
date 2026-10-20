@@ -35,3 +35,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `local_workspace_mode` path resolution is asserted against.
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"

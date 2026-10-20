@@ -192,9 +192,14 @@ let options = ServerOptions::from_manifest(None, "My Server").with_self_check(ch
   so the replacement process can resume the session. The agent calls
   `ping(reload=true)`; the process re-executes in place and answers
   `reloaded: <old> -> <new>`.
-- Reload is refused while the binary is not stale, while other calls are in
-  flight, or when `with_can_reload` / `with_selftest` returns `Err`.
-  `with_before_exec` runs just before the exec.
+- Reload is refused while the binary is not stale, while other requests are
+  in flight (it waits up to 2 s for their answers to be written), when the
+  target is not an executable file, or when `with_can_reload` /
+  `with_selftest` returns `Err`. `with_before_exec` runs just before the exec;
+  if the exec still fails after it ran, the server answers with an error and
+  exits, because the hook already released its state. Make the selftest run
+  the new build with your real arguments, so a build that cannot boot refuses
+  the reload (a build that dies after the exec loses the replayed request).
 - Reload loses retained response ids, loaded skills, and workspace/session
   state. When stdin is a terminal or file, or on Windows, only the notice
   appears.

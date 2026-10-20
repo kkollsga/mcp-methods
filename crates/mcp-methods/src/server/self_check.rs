@@ -12,7 +12,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Probe returning the version of the build currently on disk, or
@@ -101,6 +101,12 @@ impl SelfCheck {
 
     /// Run `hook` right before the process image is replaced (flush and
     /// release whatever must not outlive the old code).
+    ///
+    /// The hook runs after the target was checked to be an executable file,
+    /// but the exec itself can still fail. When it does, the hook has already
+    /// released state the process needs, so the server does not resume
+    /// serving: it answers the reload request with an error and exits with
+    /// status 1. A hook must therefore be safe to run once and never undone.
     pub fn with_before_exec(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.before_exec = Some(Arc::new(hook));
         self
@@ -137,15 +143,6 @@ impl std::fmt::Debug for SelfCheck {
             .field("path", &self.path)
             .field("running_version", &self.running_version)
             .finish_non_exhaustive()
-    }
-}
-
-/// Guard from [`SelfCheckState::enter_call`].
-pub(crate) struct InFlight(Arc<SelfCheckState>);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -191,8 +188,10 @@ pub struct SelfCheckState {
     reload: Option<ReloadConfig>,
     /// Transport handles, attached by `serve_with_handover`.
     link: OnceLock<crate::server::stdio::TransportLink>,
-    /// Tool calls currently inside `call_tool`.
-    in_flight: AtomicUsize,
+    /// Replaces `process::exit(1)` in tests.
+    // Read only by the unix reload path.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    exit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Version of the process this one replaced, until the replayed
     /// `ping(reload=true)` consumes it.
     reloaded_from: Mutex<Option<String>>,
@@ -214,7 +213,7 @@ impl SelfCheckState {
             installed: tokio::sync::OnceCell::new(),
             reload,
             link: OnceLock::new(),
-            in_flight: AtomicUsize::new(0),
+            exit_hook: Mutex::new(None),
             reloaded_from: Mutex::new(None),
         }
     }
@@ -288,14 +287,33 @@ impl SelfCheckState {
         let _ = self.link.set(link);
     }
 
-    /// Count a tool call as in flight until the guard drops.
-    pub(crate) fn enter_call(self: &Arc<Self>) -> InFlight {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        InFlight(self.clone())
+    /// End the process once every answer already queued has been written
+    /// (bounded at 5 s): a failed reload left it unable to continue.
+    #[cfg(unix)]
+    pub(crate) fn exit_after_answer(
+        self: &Arc<Self>,
+        outstanding: Arc<crate::server::stdio::Outstanding>,
+    ) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            outstanding
+                .wait_until_only(None, std::time::Duration::from_secs(5))
+                .await;
+            let hook = state
+                .exit_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match hook {
+                Some(hook) => hook(),
+                None => std::process::exit(1),
+            }
+        });
     }
 
-    pub(crate) fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_exit_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.exit_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
     /// Record that this process replaced `old_version`.
@@ -314,21 +332,22 @@ impl SelfCheckState {
 
     /// Why `ping(reload=true)` cannot run here, or `None` when it can.
     /// `ping_present` is whether the server still serves a `ping` route.
-    pub(crate) fn reload_unavailable(&self, ping_present: bool) -> Option<&'static str> {
+    pub(crate) fn reload_unavailable(&self, ping_present: bool) -> Option<String> {
         if self.reload.is_none() {
-            return Some("reload is not configured for this server");
+            return Some("reload is not configured for this server".into());
         }
         if !cfg!(unix) {
-            return Some("reload is unsupported on this platform");
+            return Some("reload is unsupported on this platform".into());
         }
         if !ping_present {
-            return Some("this server has no ping tool to trigger a reload");
+            return Some("this server has no ping tool to trigger a reload".into());
         }
         match self.link() {
-            None => Some("reload needs the framework stdio transport (serve_with_handover)"),
-            Some(link) if !link.input.pump_active() => {
-                Some("reload is unavailable: stdin is not pollable (a file or terminal)")
-            }
+            None => Some("reload needs the framework stdio transport (serve_with_handover)".into()),
+            Some(link) if !link.input.pump_active() => Some(format!(
+                "reload is unavailable: {}",
+                link.input.unpumped_reason()
+            )),
             Some(_) => None,
         }
     }
