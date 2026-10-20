@@ -803,12 +803,47 @@ mod session_tests {
     /// serves through `serve_with_handover` holds this for its whole run.
     static SERVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Fails the process, naming the test, when a session test outlives its
+    /// budget. A tokio timeout cannot do this job: a test that blocks its
+    /// current-thread runtime in a syscall never polls its own timer, and an
+    /// unbounded test would otherwise hold `SERVE_LOCK` and wedge CI.
+    struct Watchdog(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    impl Watchdog {
+        fn arm() -> Self {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let name = std::thread::current().name().unwrap_or("?").to_string();
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    rx.recv_timeout(Duration::from_secs(45))
+                {
+                    // Straight to the descriptor: `eprintln!` would be swallowed by
+                    // the test harness's output capture.
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "session test `{name}` exceeded 45 s while holding SERVE_LOCK"
+                    );
+                    std::process::exit(101);
+                }
+            });
+            Self(tx)
+        }
+    }
+
     const INIT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"c","version":"1"}}"#;
 
     /// Client side of a served transport: requests go through a real pipe
     /// (so the stdin pump is exercised), responses come back over a duplex.
     struct Harness {
         _serve: tokio::sync::MutexGuard<'static, ()>,
+        _watchdog: Watchdog,
         dir: tempfile::TempDir,
         pipe_in: std::fs::File,
         _pipe_out: std::os::fd::OwnedFd,
@@ -959,6 +994,7 @@ mod session_tests {
         }
         let mut h = Harness {
             _serve: serve,
+            _watchdog: Watchdog::arm(),
             dir,
             pipe_in: std::mem::replace(&mut harness_in, std::fs::File::open("/dev/null").unwrap()),
             _pipe_out: pipe_out,
@@ -1391,6 +1427,7 @@ mod session_tests {
         client_tx: DuplexStream,
         out: BufReader<DuplexStream>,
         _serve: tokio::sync::MutexGuard<'static, ()>,
+        _watchdog: Watchdog,
         _dir: tempfile::TempDir,
     }
 
@@ -1445,6 +1482,7 @@ mod session_tests {
                 client_tx,
                 out: BufReader::new(client_rx),
                 _serve: serve,
+                _watchdog: Watchdog::arm(),
                 _dir: dir,
             },
             run,

@@ -13,6 +13,14 @@ statuses mapped to the same messages, a 10 MB body cap, and no proxy
 environment variables. Only the text of low-level transport errors (DNS,
 connect, TLS) differs, because it now comes from ureq 3.
 
+### Fixed — stdin pump no longer addresses a caller's descriptor number after it is closed
+
+The pump now reads and restores flags through its own duplicate of the
+descriptor. Before, `stop` and a late wakeup used the caller's descriptor
+number, which a closed-and-reused number turned into a read of, or an
+`O_NONBLOCK` clear on, an unrelated descriptor. Serving real stdin was not
+affected; the in-process reload session tests hit it intermittently.
+
 ## 0.5.0 — 2026-10-20
 
 ### Changed — `get_info` reports the consumer's running version when `SelfCheck` is set

@@ -8,7 +8,7 @@
 //! consumed and leave the rest in the OS pipe for the replacement process.
 
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
@@ -16,13 +16,30 @@ use tokio::task::JoinHandle;
 
 use crate::server::stdio::{InputBuffer, PumpStep};
 
-/// Borrowed descriptor: the pump never closes it.
-struct BorrowedFd(RawFd);
+/// The pump's own duplicate of the caller's descriptor. It shares the open
+/// file description (so `O_NONBLOCK` and the pipe contents are the caller's)
+/// but has a number of its own that stays allocated until both the task and
+/// the handle are gone, so a number the caller closes and the process reuses
+/// is never read or re-flagged by the pump.
+#[derive(Clone)]
+struct PumpFd(Arc<OwnedFd>);
 
-impl AsRawFd for BorrowedFd {
+impl AsRawFd for PumpFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0
+        self.0.as_raw_fd()
     }
+}
+
+fn duplicate(fd: RawFd) -> io::Result<PumpFd> {
+    // SAFETY: F_DUPFD_CLOEXEC takes an integer argument; the result is a
+    // fresh descriptor owned by nobody else. Close-on-exec keeps it out of a
+    // reload's replacement image.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` was just created and is owned here alone.
+    Ok(PumpFd(Arc::new(unsafe { OwnedFd::from_raw_fd(dup) })))
 }
 
 fn fcntl_flags(fd: RawFd) -> io::Result<i32> {
@@ -46,7 +63,7 @@ fn set_flags(fd: RawFd, flags: i32) -> io::Result<()> {
 
 /// A running pump and the descriptor flags to restore.
 pub(crate) struct PumpHandle {
-    fd: RawFd,
+    fd: PumpFd,
     original_flags: i32,
     task: JoinHandle<()>,
 }
@@ -55,18 +72,18 @@ impl PumpHandle {
     /// Stop reading and put the descriptor back in its original mode.
     pub(crate) fn stop(self) {
         self.task.abort();
-        let _ = set_flags(self.fd, self.original_flags);
+        let _ = set_flags(self.fd.as_raw_fd(), self.original_flags);
     }
 
     /// Restore the descriptor's original (normally blocking) mode, for an
     /// `exec` that hands it to a new image.
     pub(crate) fn restore_flags(&self) {
-        let _ = set_flags(self.fd, self.original_flags);
+        let _ = set_flags(self.fd.as_raw_fd(), self.original_flags);
     }
 
     /// Re-enter nonblocking mode after a failed `exec`.
     pub(crate) fn reapply_nonblocking(&self) {
-        let _ = set_flags(self.fd, self.original_flags | libc::O_NONBLOCK);
+        let _ = set_flags(self.fd.as_raw_fd(), self.original_flags | libc::O_NONBLOCK);
     }
 }
 
@@ -92,14 +109,16 @@ pub(crate) fn start(fd: RawFd, input: Arc<InputBuffer>) -> io::Result<PumpHandle
             "stdin is a terminal",
         ));
     }
+    let pump_fd = duplicate(fd)?;
+    let fd = pump_fd.as_raw_fd();
     let original_flags = fcntl_flags(fd)?;
     set_flags(fd, original_flags | libc::O_NONBLOCK)?;
     let registered = {
         let _enter = runtime.enter();
         // reason: `AsyncFd::register` exists only in the newest tokio; `new` is the
-        // form every tokio 1.x accepted, and `BorrowedFd` is never closed.
+        // form every tokio 1.x accepted.
         #[allow(deprecated)]
-        AsyncFd::new(BorrowedFd(fd))
+        AsyncFd::new(pump_fd.clone())
     };
     let afd = match registered {
         Ok(afd) => afd,
@@ -113,13 +132,13 @@ pub(crate) fn start(fd: RawFd, input: Arc<InputBuffer>) -> io::Result<PumpHandle
     };
     let task = runtime.spawn(run(fd, afd, input));
     Ok(PumpHandle {
-        fd,
+        fd: pump_fd,
         original_flags,
         task,
     })
 }
 
-async fn run(fd: RawFd, afd: AsyncFd<BorrowedFd>, input: Arc<InputBuffer>) {
+async fn run(fd: RawFd, afd: AsyncFd<PumpFd>, input: Arc<InputBuffer>) {
     let mut chunk = vec![0u8; 8192];
     loop {
         let mut ready = match afd.readable().await {

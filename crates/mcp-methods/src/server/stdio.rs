@@ -1135,6 +1135,44 @@ mod tests {
             );
         }
 
+        /// Regression: the pump used to address the caller's descriptor
+        /// number for its reads and for `stop`'s flag restore, so a number the
+        /// caller had closed and the process had reused was read by the pump
+        /// and had `O_NONBLOCK` cleared under its new owner, which blocked an
+        /// async reader forever.
+        #[tokio::test]
+        async fn a_closed_and_reused_descriptor_number_is_left_alone() {
+            let (_write_a, read_a) = pipe();
+            let n = read_a.as_raw_fd();
+            let (server_tx, _client_rx) = duplex(4096);
+            let t = StdioTransport::<tokio::io::Empty, _>::pumped(n, server_tx).unwrap();
+            let input = t.link().input;
+
+            let (mut write_b, read_b) = pipe();
+            drop(read_a);
+            // SAFETY: `n` was just closed, so dup2 installs B's read end there.
+            assert_eq!(unsafe { libc::dup2(read_b.as_raw_fd(), n) }, n);
+            // SAFETY: F_SETFL takes an integer argument.
+            unsafe { libc::fcntl(n, libc::F_SETFL, flags(n) | libc::O_NONBLOCK) };
+            write_b.write_all(b"B\n").unwrap();
+
+            // Let the pump observe whatever it can see, then tear it down.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(input.freeze_and_snapshot(), b"", "pump read a foreign pipe");
+            drop(t);
+            assert_ne!(
+                flags(n) & libc::O_NONBLOCK,
+                0,
+                "stop cleared the flag on a foreign descriptor"
+            );
+            let mut got = [0u8; 4];
+            // SAFETY: valid buffer; `n` is nonblocking and has data waiting.
+            let r = unsafe { libc::read(n, got.as_mut_ptr().cast(), got.len()) };
+            assert_eq!(&got[..r.max(0) as usize], b"B\n");
+            // SAFETY: `n` is the dup2 copy this test owns.
+            unsafe { libc::close(n) };
+        }
+
         #[tokio::test]
         async fn a_terminal_is_never_pumped_and_keeps_its_blocking_mode() {
             let (mut master, mut slave) = (0i32, 0i32);
