@@ -413,6 +413,11 @@ pub struct ServerOptions {
     /// append a runtime steering footer. `None` (default) leaves every
     /// result unchanged. See [`ResultPostprocessHook`].
     pub result_postprocess: Option<ResultPostprocessHook>,
+    /// Self-update detection; set via [`with_self_check`](Self::with_self_check).
+    /// Public only so `..ServerOptions::default()` struct-update syntax
+    /// keeps working for consumers.
+    #[doc(hidden)]
+    pub self_check: Option<Arc<crate::server::self_check::SelfCheckState>>,
 }
 
 impl std::fmt::Debug for ServerOptions {
@@ -428,6 +433,7 @@ impl std::fmt::Debug for ServerOptions {
                 "default_repo",
                 &self.default_repo.as_ref().map(|_| "<provider>"),
             )
+            .field("self_check", &self.self_check.as_ref().map(|_| "<armed>"))
             .finish()
     }
 }
@@ -446,6 +452,7 @@ impl ServerOptions {
             builtins: manifest.map(|m| m.builtins.clone()).unwrap_or_default(),
             extensions: manifest.map(|m| m.extensions.clone()).unwrap_or_default(),
             result_postprocess: None,
+            self_check: None,
         }
     }
 
@@ -520,6 +527,19 @@ impl ServerOptions {
     /// `cypher_query` when a pattern is definition-shaped).
     pub fn with_result_postprocess(mut self, hook: ResultPostprocessHook) -> Self {
         self.result_postprocess = Some(hook);
+        self
+    }
+
+    /// Watch a file (normally the running executable) and, once it has
+    /// been replaced, append a one-line `stale:` notice to completed
+    /// tool results. The stat snapshot is taken here, so call this as
+    /// the server boots. `ping` reports the state in its body and
+    /// `get_info` reports the check's running version as the server
+    /// version. See [`SelfCheck`](crate::server::SelfCheck).
+    pub fn with_self_check(mut self, check: crate::server::SelfCheck) -> Self {
+        self.self_check = Some(Arc::new(crate::server::self_check::SelfCheckState::new(
+            check,
+        )));
         self
     }
 }
@@ -1717,6 +1737,18 @@ impl McpServer {
         msg
     }
 
+    /// Append the self-update notice to a completed, non-error result.
+    fn append_stale_notice(&self, response: &mut CallToolResponse) {
+        let Some(check) = &self.options.self_check else {
+            return;
+        };
+        if let CallToolResponse::Complete(result) = response {
+            if result.is_error != Some(true) {
+                append_notice_to_result(result, check.notice());
+            }
+        }
+    }
+
     /// Run the consumer's result-postprocess hook (if any) against a
     /// builtin tool's text `body`, appending any returned footer. The
     /// single application point for the static `#[tool]` methods; the
@@ -1766,7 +1798,11 @@ impl McpServer {
         Parameters(args): Parameters<PingArgs>,
     ) -> Result<CallToolResult, McpError> {
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
-        let body = args.message.unwrap_or_else(|| "pong".to_string());
+        let mut body = args.message.unwrap_or_else(|| "pong".to_string());
+        if let Some(check) = &self.options.self_check {
+            body.push('\n');
+            body.push_str(&check.ping_line());
+        }
         let body = self.finish("ping", &args_json, body);
         Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
@@ -2848,9 +2884,10 @@ impl ServerHandler for McpServer {
                 .unwrap_or_else(|e| e.into_inner())
                 .expand(&owner, &args, &expansion_tool)
                 .map_err(|e| McpError::invalid_params(e, None))?;
-            let sent = serde_json::from_value::<CallToolResult>(result)
+            let mut sent = serde_json::from_value::<CallToolResult>(result)
                 .map(CallToolResponse::from)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            self.append_stale_notice(&mut sent);
             if let Some(ledger) = &self.send_ledger {
                 Self::ledger_call(
                     ledger,
@@ -2960,9 +2997,15 @@ impl ServerHandler for McpServer {
                         "preview"
                     }
                 });
-                let sent = serde_json::from_value::<CallToolResult>(result)
+                let mut sent = serde_json::from_value::<CallToolResult>(result)
                     .map(CallToolResponse::from)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                // After the budget step: a preview keeps the notice and a
+                // retained payload never stores it, so `expand_response`
+                // cannot replay a stale one.
+                if name != "ping" {
+                    self.append_stale_notice(&mut sent);
+                }
                 if let (Some(ledger), Some(budget), Some(args)) =
                     (&self.send_ledger, budget, arguments_bytes)
                 {
@@ -3090,7 +3133,13 @@ impl ServerHandler for McpServer {
             caps.prompts = Some(prompts);
         }
         let mut info = InitializeResult::new(caps)
-            .with_server_info(Implementation::new(name, env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                name,
+                self.options
+                    .self_check
+                    .as_ref()
+                    .map_or(env!("CARGO_PKG_VERSION"), |c| c.running_version()),
+            ))
             .with_protocol_version(ProtocolVersion::V_2024_11_05);
         if let Some(text) = &self.options.instructions {
             info = info.with_instructions(text.clone());

@@ -39,6 +39,7 @@ pub mod env;
 pub mod manifest;
 pub mod roots;
 pub mod runtime;
+mod self_check;
 mod send_ledger;
 // `server` inside the `server` feature module — the inner module is
 // the rmcp `ServerHandler` impl. Rename would churn every downstream
@@ -62,6 +63,7 @@ pub use runtime::{
     init_tracing, load_env_for_mode, maybe_watch, resolve_source_roots,
     resolve_source_roots_lenient, UnresolvedSourceRoot,
 };
+pub use self_check::SelfCheck;
 pub use server::{
     notify_skills_changed, serve_prompts, ActiveSkill, McpServer, PromptRouterMut, RepoProvider,
     ResponsePreviewHook, ResultCtx, ResultPostprocessHook, ServerOptions, SkillArgs, SkillReloader,
