@@ -49,6 +49,7 @@ Two boolean flags under `trust:` declare what dynamic-code hooks the manifest pe
 For anything beyond source navigation + GitHub access, you build a small Rust binary that depends on `mcp-methods`. The pattern is ~50-500 LOC:
 
 ```rust
+use mcp_methods::server::stdio::StdioTransport;
 use mcp_methods::server::{McpServer, ServerOptions};
 
 let manifest = mcp_methods::server::manifest::load(&yaml_path)?;
@@ -61,7 +62,7 @@ server.register_typed_tool::<MyArgs, _>(
     move |args: MyArgs| -> String { /* your logic */ },
 );
 
-server.serve(rmcp::transport::stdio()).await?.waiting().await?;
+server.serve(StdioTransport::stdio()).await?.waiting().await?;
 ```
 
 [`kglite-mcp-server`](https://github.com/kkollsga/kglite/tree/main/crates/kglite-mcp-server) is the canonical worked example — ~500 LOC layering Cypher queries, graph overview, save, and code-source tools on top of this foundation. The minimal version lives at [`examples/downstream_binary/`](https://github.com/kkollsga/mcp-methods/tree/main/examples/downstream_binary) (~60 LOC) and is the starting point most consumers should copy. See [Downstream Binary](guides/downstream-binary.md).

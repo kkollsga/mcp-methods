@@ -47,8 +47,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::Parser;
+use mcp_methods::server::stdio::StdioTransport;
 use mcp_methods::server::{McpServer, ServerOptions};
-use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
         },
     );
 
-    let service = server.serve(stdio()).await?;
+    let service = server.serve(StdioTransport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -167,6 +167,41 @@ if m.extensions.get("my_hook").is_some() && !m.trust.allow_embedder {
 ```
 
 The framework's source tools are automatically available based on the manifest's `source_roots:` / `workspace:` declarations — you don't register them, the framework does.
+
+## Self-update and reload
+
+A long-lived stdio server keeps running the code it started with, even after
+`pip install -U` or `cargo install` replaces the binary. `SelfCheck` makes
+that visible, and optionally fixes it without a client restart.
+
+```rust
+use mcp_methods::server::SelfCheck;
+
+let exe = std::env::current_exe()?;
+let check = SelfCheck::new("my-server", &exe, env!("CARGO_PKG_VERSION"))
+    .with_installed_version(|| None) // e.g. run `<exe> --version`
+    .with_reload(std::env::args_os()); // opt in: exec argv on ping(reload=true)
+let options = ServerOptions::from_manifest(None, "My Server").with_self_check(check);
+```
+
+- Once the file at the watched path is replaced, every successful `tools/call`
+  result ends with `stale: my-server 1.2.0 running, 1.3.0 installed - call
+  ping(reload=true) to load it`. `ping` reports the same state in its body.
+- `with_reload` is opt-in and unix only. Serve with
+  `server.serve_with_handover(StdioTransport::stdio())` instead of `serve(..)`,
+  so the replacement process can resume the session. The agent calls
+  `ping(reload=true)`; the process re-executes in place and answers
+  `reloaded: <old> -> <new>`.
+- Reload is refused while the binary is not stale, while other calls are in
+  flight, or when `with_can_reload` / `with_selftest` returns `Err`.
+  `with_before_exec` runs just before the exec.
+- Reload loses retained response ids, loaded skills, and workspace/session
+  state. When stdin is a terminal or file, or on Windows, only the notice
+  appears.
+- `get_info` reports the `running_version` you pass to `SelfCheck::new`.
+
+`mcp-server` wires all of this up for its own executable and adds
+`--version`.
 
 ## Operating modes
 

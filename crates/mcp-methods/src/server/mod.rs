@@ -23,6 +23,9 @@
 //! 4. `server.serve(server::stdio::StdioTransport::stdio()).await` — the
 //!    framework's stdio transport, which retains each request's exact
 //!    text for raw routes (rmcp's own `transport::stdio()` does not).
+//!    A binary that opts into [`SelfCheck`] reload serves with
+//!    [`server::McpServer::serve_with_handover`] instead, so a
+//!    `ping(reload=true)` re-exec can resume the session.
 //!
 //! See `kglite-mcp-server` for a real example: it adds `cypher_query`,
 //! `graph_overview`, and `save_graph` tools that close over an active

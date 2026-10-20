@@ -1,5 +1,105 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed — `get_info` reports the consumer's running version when `SelfCheck` is set
+
+`get_info` used to report mcp-methods' own crate version, so a downstream
+binary (kglite, `mcp-server`) advertised the framework's version to clients
+instead of its own. With `ServerOptions::with_self_check(SelfCheck)` set,
+`serverInfo.version` is now the `running_version` the consumer passed to
+`SelfCheck::new`. Servers that do not set a `SelfCheck` are unchanged.
+
+### Added — stale-binary notice (`SelfCheck`)
+
+A long-lived stdio server keeps running the code it started with. After
+`pip install -U` or `cargo install` replaces the executable, the agent keeps
+talking to the old build with no sign that a newer one is on disk.
+
+`ServerOptions::with_self_check(SelfCheck::new(name, path, running_version))`
+watches `path` (normally the running executable). The file's identity (device,
+inode, mtime, size) is recorded at construction and re-checked on each call
+until the first mismatch, after which the server latches stale and stops
+statting. A stale server appends one line to every successful `tools/call`
+result, and to `expand_response` results:
+
+```
+stale: my-server 1.2.0 running, 1.3.0 installed — call ping(reload=true) to load it
+```
+
+- The notice is added after the response budget, so a budget preview keeps it
+  and `expand_response` never replays it inside a stored payload.
+- It is absent on error results, and on `ping`, which reports the state in its
+  own body instead (a `ping` line giving the running version and whether the
+  binary is stale).
+- `SelfCheck::with_installed_version(probe)` supplies the installed version for
+  the notice; the probe runs once, at first detection. Without it the notice
+  says "a newer build".
+- The reload clause reads "restart the MCP client" when reload is not
+  configured, not supported on the platform, or `ping` has been removed.
+
+### Added — framework stdio transport (`server::stdio`)
+
+`StdioTransport`, `RawJsonRpcRequest` and `StdioTransport::with_recover` are
+lifted from kglite's `raw_stdio.rs`, minus its kglite-specific repair of
+non-finite numbers (a consumer can reinstate that through `with_recover`).
+rmcp's own `transport::stdio()` decodes each request and discards its text;
+this transport keeps the exact request text, which raw `ToolRoute`s need.
+Serve through it with `server.serve(StdioTransport::stdio())`. Use
+`StdioTransport::from_io` for any other reader/writer pair.
+
+### Added — in-place reload: `ping(reload=true)` and `serve_with_handover`
+
+An agent that sees the stale notice can load the new build without the client
+restarting the server. `SelfCheck::with_reload(argv)` opts in; the reload then
+replaces the process image with `exec`, keeping the same PID and pipes.
+
+- The old process writes an owner-only (0600) handover file holding the
+  client's `initialize` info, the reload request, and any stdin bytes read but
+  not yet decoded, then execs `argv`. The new process reads and deletes the
+  file, resumes the session without a second `initialize`, and answers the
+  pending `ping` with `reloaded: <old> → <new>`. A request pipelined behind the
+  reload is not lost. If the tool set changed, it sends `tools/list_changed`.
+- `McpServer::serve_with_handover(StdioTransport::stdio())` replaces
+  `serve(..)` in the consumer's `main`; it is the entry point that picks up a
+  handover.
+- A reload is refused, with the reason in the `ping` answer and the old
+  process left serving, when the binary is not stale, other calls are in
+  flight, `with_can_reload` returns `Err`, or `with_selftest` fails against the
+  new build. `with_before_exec` runs a consumer hook just before the exec.
+  `mcp-server` self-tests the new build with `<exe> --version` (5 s timeout).
+- The `reload` argument appears in `ping`'s schema only when reload is
+  configured; other servers see no schema change.
+- State lost on reload, and stated in the `ping` answer: retained response ids
+  (`expand_response` cannot replay earlier previews), loaded skills, and
+  workspace/session state.
+- Unix only. On Windows the stale notice works and reload is reported
+  unsupported.
+- Reload needs `StdioTransport::stdio()` reading fd 0 through the framework's
+  non-consuming pump. When stdin is a terminal or a regular file, or the server
+  uses another transport, reload reports itself unavailable.
+
+### Added — `mcp-server --version`, and self-update in `mcp-server`
+
+`mcp-server --version` prints the version. The binary watches its own
+executable (stripping the ` (deleted)` suffix Linux appends), reports the
+installed version through that flag, and opts into reload with its original
+arguments.
+
+### Dependencies
+
+New under the `server` feature: `futures` 0.3 and `tokio-util` 0.7 (codec
+framing), plus rmcp's `transport-async-rw` and tokio's `net`. `libc` is added
+on unix for the stdin pump.
+
+### Known limitations
+
+- A request other than `tools/call` that is in flight when the process execs
+  loses its answer; only `tools/call` is counted by the in-flight guard.
+- After a reload, `get_info` for the resumed session still reports the old
+  version, because the client's handshake already happened.
+- The FastMCP Python wrapper is not covered by this release.
+
 ## 0.4.13 — 2026-10-10
 
 ### Fixed — `outputSchema` lost its root `"type": "object"`, so strict clients rejected `tools/list`
