@@ -83,9 +83,28 @@ replaces the process image with `exec`, keeping the same PID and pipes.
   temp directory (this user's, for a pid that is gone or older than 1 hour).
 - The `reload` argument appears in `ping`'s schema only when reload is
   configured; other servers see no schema change.
-- State lost on reload, and stated in the `ping` answer: retained response ids
-  (`expand_response` cannot replay earlier previews), loaded skills, and
-  workspace/session state.
+- Session state carried over the reload (in the same handover file):
+  - Retained response ids keep working with `expand_response`. Each entry
+    carries its remaining lifetime, so it expires when the old process would
+    have expired it, and new ids never collide with carried ones. The usual
+    32-entry and 32 MiB caps apply.
+  - Loaded skills stay loaded when the new build serves the same body, so an
+    unchanged skill is not announced again. A skill whose body changed (or
+    that is gone) is announced again. The body hash is now FNV-1a so it
+    agrees across builds.
+  - The active workspace root (local) or repository (GitHub) is re-activated
+    through the same path as `set_root_dir` / `adopt_client_root` /
+    `repo_management`, so consumer activation hooks fire. When that fails
+    (for example the directory is gone) the server stays on its boot binding
+    and the `reloaded:` answer says so.
+  - The old `instructions` text. When the new build's instructions differ,
+    the `reloaded:` answer says so and includes the new text, because the
+    client holds the old text from `initialize`.
+  - A handover file from a build without these fields still parses.
+  - Not carried: per-consumer state beyond the above (a consumer rebuilds it
+    in its activation or `with_before_exec` hooks), and the server name and
+    version the client holds from `initialize`. The `reloaded:` answer lists
+    both.
 - Unix only. On Windows the stale notice works and reload is reported
   unsupported.
 - Reload needs `StdioTransport::stdio()` reading fd 0 through the framework's
@@ -114,8 +133,10 @@ on unix for the stdin pump.
   client sees the server exit, and the handover file is left for the next
   `serve_with_handover` sweep. `mcp-server`'s `--reload-preflight` selftest
   narrows this to failures after argument, manifest and environment checks.
-- After a reload, `get_info` for the resumed session still reports the old
-  version, because the client's handshake already happened.
+- After a reload, the client still holds the old server name, version and
+  `capabilities` from its `initialize` handshake. MCP has no message that
+  refreshes them, so the framework cannot correct them. (Changed
+  instructions are repeated in the `reloaded:` answer for this reason.)
 - The FastMCP Python wrapper is not covered by this release.
 
 ## 0.4.13 — 2026-10-10

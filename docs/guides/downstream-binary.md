@@ -200,10 +200,18 @@ let options = ServerOptions::from_manifest(None, "My Server").with_self_check(ch
   exits, because the hook already released its state. Make the selftest run
   the new build with your real arguments, so a build that cannot boot refuses
   the reload (a build that dies after the exec loses the replayed request).
-- Reload loses retained response ids, loaded skills, and workspace/session
-  state. When stdin is a terminal or file, or on Windows, only the notice
-  appears.
-- `get_info` reports the `running_version` you pass to `SelfCheck::new`.
+- Reload carries the session's retained response ids (with their remaining
+  lifetime), its loaded skills (an unchanged skill is not announced again, a
+  changed one is), the active workspace root, and the old `instructions`
+  text. The root is re-activated through the ordinary swap path, so your
+  activation hooks fire; if it cannot be, the server stays on its boot root
+  and the `reloaded:` answer says so. If the new build's instructions differ,
+  that answer includes the new text. Per-consumer state beyond this is yours
+  to rebuild in those hooks or in `with_before_exec`. When stdin is a
+  terminal or file, or on Windows, only the notice appears.
+- `get_info` reports the `running_version` you pass to `SelfCheck::new`. A
+  client that is already connected keeps the name and version from its
+  `initialize` handshake; MCP has no way to refresh them.
 
 `mcp-server` wires all of this up for its own executable and adds
 `--version`.

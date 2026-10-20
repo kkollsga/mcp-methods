@@ -31,7 +31,12 @@ const HANG_BOUND: Duration = Duration::from_secs(90);
 
 impl Session {
     fn spawn(exe: &Path, cwd: &Path) -> Session {
+        Session::spawn_with(exe, cwd, &[])
+    }
+
+    fn spawn_with(exe: &Path, cwd: &Path, args: &[&str]) -> Session {
         let mut child = Command::new(exe)
+            .args(args)
             .current_dir(cwd)
             .env_remove("GITHUB_TOKEN")
             .env_remove("GH_TOKEN")
@@ -204,9 +209,14 @@ fn replacing_the_binary_makes_later_results_carry_the_stale_notice() {
 
 #[cfg(unix)]
 fn stale_session(td: &Path) -> (Session, std::path::PathBuf) {
+    stale_session_with(td, &[])
+}
+
+#[cfg(unix)]
+fn stale_session_with(td: &Path, args: &[&str]) -> (Session, std::path::PathBuf) {
     let exe = td.join("mcp-server-copy");
     std::fs::copy(BIN, &exe).unwrap();
-    let mut session = Session::spawn(&exe, td);
+    let mut session = Session::spawn_with(&exe, td, args);
     session.initialize();
     let fresh = td.join("mcp-server-new");
     std::fs::copy(BIN, &fresh).unwrap();
@@ -244,6 +254,10 @@ fn ping_reload_replaces_the_process_in_place_and_resumes_the_session() {
     );
     assert!(reloaded.contains("retained response ids"), "{reloaded}");
     assert!(!reloaded.contains("isError\":true"), "{reloaded}");
+    assert!(
+        !reloaded.contains("instructions changed"),
+        "same build, same instructions: {reloaded}"
+    );
     let pipelined = session.wait_for(ids[1]);
     assert!(pipelined.contains("pong"), "{pipelined}");
     assert!(
@@ -269,6 +283,48 @@ fn ping_reload_replaces_the_process_in_place_and_resumes_the_session() {
     );
     assert!(again.contains("reloaded:"), "{again}");
     assert!(session.alive());
+}
+
+/// Pull the `result_id` out of a budgeted answer line.
+fn result_id(answer: &str) -> String {
+    let frame: serde_json::Value = serde_json::from_str(answer).unwrap();
+    let text = frame["result"]["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("answer was not budgeted: {answer}"));
+    body["response_budget"]["result_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no result_id in {answer}"))
+        .to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_result_id_retained_before_the_reload_expands_after_it() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("big.txt"), "line of text\n".repeat(6000)).unwrap();
+    let (mut session, _exe) = stale_session_with(td.path(), &["--source-root", "."]);
+    let big = session.request(
+        "tools/call",
+        r#"{"name":"read_source","arguments":{"file_path":"big.txt"}}"#,
+    );
+    let id = result_id(&big);
+
+    let reloaded = session.request(
+        "tools/call",
+        r#"{"name":"ping","arguments":{"reload":true}}"#,
+    );
+    assert!(reloaded.contains("reloaded:"), "{reloaded}");
+
+    let expanded = session.request(
+        "tools/call",
+        &format!(
+            r#"{{"name":"expand_response","arguments":{{"result_id":"{id}","response":{{"mode":"full"}}}}}}"#
+        ),
+    );
+    assert!(!expanded.contains("\"error\""), "{expanded}");
+    let frame: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+    let text = frame["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.matches("line of text").count() >= 6000, "full payload");
 }
 
 #[cfg(unix)]

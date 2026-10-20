@@ -194,7 +194,7 @@ pub struct SelfCheckState {
     exit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Version of the process this one replaced, until the replayed
     /// `ping(reload=true)` consumes it.
-    reloaded_from: Mutex<Option<String>>,
+    reloaded_from: Mutex<Option<(String, Vec<String>)>>,
 }
 
 impl SelfCheckState {
@@ -316,14 +316,15 @@ impl SelfCheckState {
         *self.exit_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
-    /// Record that this process replaced `old_version`.
-    pub(crate) fn mark_reloaded(&self, old_version: String) {
-        *self.reloaded_from.lock().unwrap_or_else(|e| e.into_inner()) = Some(old_version);
+    /// Record that this process replaced `old_version`, with the lines the
+    /// first `reloaded:` answer must carry about what the resume did.
+    pub(crate) fn mark_reloaded(&self, old_version: String, notes: Vec<String>) {
+        *self.reloaded_from.lock().unwrap_or_else(|e| e.into_inner()) = Some((old_version, notes));
     }
 
     /// The one-shot "reloaded from" marker, consumed by the first
     /// `ping(reload=true)` after a reload.
-    pub(crate) fn take_reloaded(&self) -> Option<String> {
+    pub(crate) fn take_reloaded(&self) -> Option<(String, Vec<String>)> {
         self.reloaded_from
             .lock()
             .unwrap_or_else(|e| e.into_inner())

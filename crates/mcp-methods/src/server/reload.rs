@@ -11,9 +11,16 @@
 //! with the recorded peer info instead of a handshake, and feeds the replay
 //! bytes ahead of live stdin, so the replayed ping is answered with
 //! `reloaded: <old> → <new>` and any request pipelined behind it is
-//! answered normally. State that lived in the old process (retained
-//! response ids, loaded skills, workspace and session state) is gone and
-//! the answer says so.
+//! answered normally.
+//!
+//! Session state rides in the same file: the session's retained responses
+//! (with their remaining lifetime), its loaded skills (with the body hash
+//! each was loaded at, so a changed skill is announced again), the active
+//! workspace root (re-activated through the ordinary swap path, so consumer
+//! hooks fire) and the old `instructions` text. What cannot be carried is
+//! per-consumer state, which the consumer's own hooks rebuild, and the
+//! server name and version the client holds from `initialize`; the
+//! `reloaded:` answer says so, and says when the instructions changed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +54,129 @@ pub(crate) struct Handover {
     /// Tool names the old process served, sorted.
     pub(crate) tools: Vec<String>,
     pub(crate) old_version: String,
+    /// The reloading session's retained responses and loaded skills.
+    #[serde(default)]
+    pub(crate) session: CarriedSession,
+    /// The active workspace binding, when the old process had a workspace.
+    #[serde(default)]
+    pub(crate) workspace: Option<CarriedWorkspace>,
+    /// Whether `instructions` was recorded. A handover from a build that
+    /// predates the field leaves this false, and no comparison is made.
+    #[serde(default)]
+    pub(crate) instructions_known: bool,
+    #[serde(default)]
+    pub(crate) instructions: Option<String>,
+}
+
+/// Session state that survives a reload.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CarriedSession {
+    #[serde(default)]
+    pub(crate) responses: crate::response_budget::CarriedResponses,
+    #[serde(default)]
+    pub(crate) skills: Vec<CarriedSkill>,
+}
+
+/// A loaded skill and the hash of the body the agent was given.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CarriedSkill {
+    pub(crate) name: String,
+    pub(crate) hash: u64,
+}
+
+/// The workspace binding of the old process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CarriedWorkspace {
+    pub(crate) name: Option<String>,
+    pub(crate) path: Option<PathBuf>,
+    /// `unowned`, `adopted` or `operator`.
+    pub(crate) ownership: String,
+}
+
+fn carry_workspace(options: &crate::server::server::ServerOptions) -> Option<CarriedWorkspace> {
+    use crate::server::workspace::RootOwnership;
+    let ws = options.workspace.as_ref()?;
+    Some(CarriedWorkspace {
+        name: ws.active_repo_name(),
+        path: ws.active_repo_path(),
+        ownership: match ws.root_ownership() {
+            RootOwnership::Unowned => "unowned",
+            RootOwnership::Adopted => "adopted",
+            RootOwnership::Operator => "operator",
+        }
+        .to_string(),
+    })
+}
+
+/// Re-activate the old process's workspace binding when this process booted
+/// on a different one. Goes through `set_root_dir` / `adopt_client_root` /
+/// `repo_management`, so consumer activation hooks fire exactly as for a
+/// request. Returns a line for the `reloaded:` answer, or `None` when
+/// nothing needed doing. Blocking: the hooks may rebuild a graph.
+fn restore_workspace(
+    ws: &crate::server::workspace::Workspace,
+    old: &CarriedWorkspace,
+) -> Option<String> {
+    use crate::server::workspace::WorkspaceKind;
+    match ws.kind() {
+        WorkspaceKind::Local => {
+            let path = old.path.as_ref()?;
+            let wanted = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if ws.active_repo_path().as_deref() == Some(wanted.as_path()) {
+                return None;
+            }
+            let outcome = if old.ownership == "adopted" {
+                ws.adopt_client_root(path)
+            } else {
+                Ok(ws.set_root_dir(path, None))
+            };
+            if ws.active_repo_path().as_deref() == Some(wanted.as_path()) {
+                return Some(format!("workspace root {} re-activated.", path.display()));
+            }
+            let why = match outcome {
+                Ok(message) | Err(message) => message,
+            };
+            Some(format!(
+                "workspace root {} could not be re-activated ({why}); the server stays on {}.",
+                path.display(),
+                ws.active_repo_path()
+                    .map_or_else(|| "no active root".to_string(), |p| p.display().to_string())
+            ))
+        }
+        WorkspaceKind::Github => {
+            let name = old.name.as_ref()?;
+            if ws.active_repo_name().as_deref() == Some(name.as_str()) {
+                return None;
+            }
+            let message = ws.repo_management(Some(name), false, false, false, None);
+            if ws.active_repo_name().as_deref() == Some(name.as_str()) {
+                return Some(format!("active repository {name} re-activated."));
+            }
+            Some(format!(
+                "active repository {name} could not be re-activated ({}); the server stays on {}.",
+                message.lines().next().unwrap_or("no reason given"),
+                ws.active_repo_name()
+                    .unwrap_or_else(|| "no active repository".to_string())
+            ))
+        }
+    }
+}
+
+/// The `reloaded:` answer's line about changed server instructions, or
+/// `None` when they match or the old process did not record them. Clients
+/// hold the `initialize` result and MCP cannot refresh it, so the new text
+/// is delivered here.
+fn instructions_note(handover: &Handover, current: Option<&str>) -> Option<String> {
+    if !handover.instructions_known || handover.instructions.as_deref() == current {
+        return None;
+    }
+    Some(match current {
+        Some(text) => format!(
+            "the server instructions changed; your client still holds the old text.              New instructions:\n{text}"
+        ),
+        None => "the server instructions were removed; your client still holds the old text."
+            .to_string(),
+    })
 }
 
 impl Handover {
@@ -196,17 +326,26 @@ fn refused(reason: impl std::fmt::Display) -> CallToolResult {
 /// Handle `ping(reload=true)`. Returns the answer when the process is not
 /// replaced; a successful reload never returns from the old process.
 pub(crate) async fn reload_ping(
+    server: &McpServer,
     check: &Arc<SelfCheckState>,
     context: &RequestContext<RoleServer>,
     tools: Vec<String>,
 ) -> CallToolResult {
-    if let Some(old) = check.take_reloaded() {
-        return CallToolResult::success(vec![ContentBlock::text(format!(
+    if let Some((old, notes)) = check.take_reloaded() {
+        let mut text = format!(
             "reloaded: {old} → {new}\n\
-             state reset by the reload: retained response ids (expand_response), \
-             loaded skills, and workspace or session state started over.",
+             carried over: retained response ids (expand_response), loaded skills and the \
+             active workspace root.\n\
+             not carried over: per-consumer state beyond that (rebuilt by the consumer's own \
+             hooks) and the server name and version your client holds from initialize, \
+             which MCP cannot refresh.",
             new = check.running_version()
-        ))]);
+        );
+        for note in notes {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        return CallToolResult::success(vec![ContentBlock::text(text)]);
     }
     if let Some(why) = check.reload_unavailable(true) {
         return refused(why);
@@ -262,8 +401,33 @@ pub(crate) async fn reload_ping(
     else {
         return refused("the session's initialize parameters are unavailable");
     };
+    let Some(peer_arc) = context.peer.peer_info() else {
+        return refused("the session's initialize parameters are unavailable");
+    };
     let replay_line = raw.source.to_string();
-    perform(check, config.argv.clone(), peer_info, replay_line, tools).await
+    let carried = Carried {
+        session: server.carry_session(peer_arc),
+        workspace: carry_workspace(server.options()),
+        instructions: server.options().instructions.clone(),
+    };
+    perform(
+        check,
+        config.argv.clone(),
+        peer_info,
+        replay_line,
+        tools,
+        carried,
+    )
+    .await
+}
+
+/// State read from the running server at reload time.
+// Only the unix reload path writes a handover; windows builds never read these.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Carried {
+    session: CarriedSession,
+    workspace: Option<CarriedWorkspace>,
+    instructions: Option<String>,
 }
 
 /// Longest a reload waits for earlier requests' answers to be written.
@@ -276,6 +440,7 @@ async fn perform(
     peer_info: serde_json::Value,
     replay_line: String,
     tools: Vec<String>,
+    carried: Carried,
 ) -> CallToolResult {
     use std::os::unix::process::CommandExt;
     let Some(link) = check.link() else {
@@ -297,6 +462,10 @@ async fn perform(
         pending,
         tools,
         old_version: check.running_version().to_string(),
+        session: carried.session,
+        workspace: carried.workspace,
+        instructions_known: true,
+        instructions: carried.instructions,
     };
     let path = match write_handover(&handover) {
         Ok(path) => path,
@@ -382,6 +551,7 @@ async fn perform(
     _peer_info: serde_json::Value,
     _replay_line: String,
     _tools: Vec<String>,
+    _carried: Carried,
 ) -> CallToolResult {
     refused("reload is unsupported on this platform")
 }
@@ -455,8 +625,22 @@ impl McpServer {
                 anyhow::bail!("reload handover carried unusable client info: {error}");
             }
         };
+        let mut notes = Vec::new();
+        if let (Some(ws), Some(old)) =
+            (self.options().workspace.clone(), handover.workspace.clone())
+        {
+            match tokio::task::spawn_blocking(move || restore_workspace(&ws, &old)).await {
+                Ok(note) => notes.extend(note),
+                Err(error) => notes.push(format!("workspace restore did not complete: {error}")),
+            }
+        }
+        notes.extend(instructions_note(
+            &handover,
+            self.options().instructions.as_deref(),
+        ));
+        self.park_carried(handover.session.clone());
         if let Some(state) = &state {
-            state.mark_reloaded(handover.old_version.clone());
+            state.mark_reloaded(handover.old_version.clone(), notes);
         }
         transport.prepend_input(&handover.replay_bytes());
         let service = rmcp::service::serve_directly(self.clone(), transport, Some(peer_info));
@@ -476,6 +660,7 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn handover_round_trips_including_non_utf8_pending_bytes() {
@@ -485,6 +670,20 @@ mod tests {
             pending: vec![b'{', 0xFF, b'\n', 0, 200],
             tools: vec!["grep".into(), "ping".into()],
             old_version: "1.0.0".into(),
+            session: CarriedSession {
+                responses: Default::default(),
+                skills: vec![CarriedSkill {
+                    name: "s".into(),
+                    hash: u64::MAX,
+                }],
+            },
+            workspace: Some(CarriedWorkspace {
+                name: Some("local/x".into()),
+                path: Some(PathBuf::from("/x")),
+                ownership: "operator".into(),
+            }),
+            instructions_known: true,
+            instructions: Some("old".into()),
         };
         let path = write_handover(&handover).unwrap();
         #[cfg(unix)]
@@ -500,6 +699,42 @@ mod tests {
         expected.push(b'\n');
         expected.extend_from_slice(&handover.pending);
         assert_eq!(back.replay_bytes(), expected);
+    }
+
+    #[test]
+    fn a_handover_without_the_state_fields_still_parses() {
+        let old = r#"{"peer_info":{},"replay_line":"x","pending":[1],"tools":["ping"],"old_version":"0.4.12"}"#;
+        let path =
+            std::env::temp_dir().join(format!("mcp-methods-old-{}.json", std::process::id()));
+        std::fs::write(&path, old).unwrap();
+        let handover = read_handover(&path).unwrap();
+        assert_eq!(handover.session, CarriedSession::default());
+        assert!(handover.workspace.is_none());
+        assert!(!handover.instructions_known);
+        assert_eq!(instructions_note(&handover, Some("anything")), None);
+    }
+
+    #[test]
+    fn instructions_note_reports_a_change_with_the_new_text_and_is_silent_otherwise() {
+        let mut handover = Handover {
+            peer_info: json!({}),
+            replay_line: String::new(),
+            pending: vec![],
+            tools: vec![],
+            old_version: "1".into(),
+            session: Default::default(),
+            workspace: None,
+            instructions_known: true,
+            instructions: Some("old text".into()),
+        };
+        assert_eq!(instructions_note(&handover, Some("old text")), None);
+        let changed = instructions_note(&handover, Some("brand new text")).unwrap();
+        assert!(changed.contains("brand new text"), "{changed}");
+        let removed = instructions_note(&handover, None).unwrap();
+        assert!(removed.contains("removed"), "{removed}");
+        handover.instructions = None;
+        assert_eq!(instructions_note(&handover, None), None);
+        assert!(instructions_note(&handover, Some("now set")).is_some());
     }
 
     #[test]
@@ -1048,6 +1283,14 @@ mod session_tests {
         handover: &Handover,
         raw_file: Option<&[u8]>,
     ) -> (Resumed, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        resume_with(handover, raw_file, |options| options).await
+    }
+
+    async fn resume_with(
+        handover: &Handover,
+        raw_file: Option<&[u8]>,
+        configure: impl FnOnce(ServerOptions) -> ServerOptions,
+    ) -> (Resumed, tokio::task::JoinHandle<anyhow::Result<()>>) {
         let serve = SERVE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bin"), b"v2").unwrap();
@@ -1062,7 +1305,7 @@ mod session_tests {
         std::env::set_var(HANDOVER_ENV, &path);
         let check =
             SelfCheck::new("demo", dir.path().join("bin"), "2.0.0").with_reload(["/bin/true"]);
-        let server = McpServer::new(ServerOptions::default().with_self_check(check));
+        let server = McpServer::new(configure(ServerOptions::default().with_self_check(check)));
         let (client_tx, server_rx) = duplex(1 << 20);
         let (server_tx, client_rx) = duplex(1 << 20);
         let transport = StdioTransport::from_io(server_rx, server_tx);
@@ -1111,7 +1354,75 @@ mod session_tests {
             pending: format!("{NEXT_PING}\n").into_bytes(),
             tools,
             old_version: "1.0.0".to_string(),
+            session: CarriedSession::default(),
+            workspace: None,
+            instructions_known: false,
+            instructions: None,
         }
+    }
+
+    /// The two answers a resumed session always starts with (the replayed
+    /// ping, id 7, and the pipelined one, id 8); returns the first's text.
+    async fn drain_replay(r: &mut Resumed) -> String {
+        let mut replayed = None;
+        let mut seen = 0;
+        while seen < 2 {
+            let frame = r
+                .frame(Duration::from_secs(10))
+                .await
+                .expect("replay answers");
+            if frame["id"] == 7 {
+                replayed = Some(Harness::text(&frame));
+            }
+            if frame["id"] == 7 || frame["id"] == 8 {
+                seen += 1;
+            }
+        }
+        replayed.unwrap()
+    }
+
+    async fn expand(r: &mut Resumed, id: i64, result_id: &str) -> Value {
+        let line = format!(
+            "{}\n",
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":"expand_response",
+                "arguments":{"result_id":result_id,"response":{"mode":"full"}}}})
+        );
+        r.client_tx.write_all(line.as_bytes()).await.unwrap();
+        loop {
+            let frame = r
+                .frame(Duration::from_secs(10))
+                .await
+                .expect("expand answer");
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+
+    fn big_result() -> Value {
+        json!({"content":[{"type":"text","text":"界x".repeat(10_000)}]})
+    }
+
+    /// A store that retained one oversized result for owner `"old"`, plus
+    /// that entry's id, as the reloading process would have carried them.
+    fn carried_responses() -> (crate::response_budget::CarriedResponses, String) {
+        use crate::response_budget::{ResponseOptions, ResponseStore};
+        let mut store = ResponseStore::default();
+        let preview = store.present(
+            "old",
+            "grep",
+            json!({"q":"x"}),
+            big_result(),
+            &ResponseOptions::default(),
+            "expand_response",
+        );
+        let id = serde_json::from_str::<Value>(preview["content"][0]["text"].as_str().unwrap())
+            .unwrap()["response_budget"]["result_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (store.carry(&"old"), id)
     }
 
     fn current_tools() -> Vec<String> {
@@ -1132,6 +1443,7 @@ mod session_tests {
             "{replayed}"
         );
         assert!(replayed.contains("retained response ids"), "{replayed}");
+        assert!(!replayed.contains("instructions"), "{replayed}");
         assert_ne!(by_id(7)["result"]["isError"], true);
         let next = Harness::text(&by_id(8));
         assert!(next.starts_with("pong"), "{next}");
@@ -1201,5 +1513,118 @@ mod session_tests {
             .unwrap()
             .unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pre_reload_result_id_expands_after_resume_and_new_ids_do_not_collide() {
+        let (carried, id) = carried_responses();
+        let mut handover = sample_handover(current_tools());
+        handover.session.responses = carried;
+        let (mut r, _run) = resume(&handover, None).await;
+        let note = drain_replay(&mut r).await;
+        assert!(note.contains("retained response ids"), "{note}");
+        let frame = expand(&mut r, 20, &id).await;
+        assert!(frame.get("error").is_none(), "{frame}");
+        assert_eq!(
+            frame["result"]["content"][0]["text"],
+            big_result()["content"][0]["text"]
+        );
+        // An id nobody carried stays unavailable.
+        let missing = expand(&mut r, 21, "r999").await;
+        assert!(missing.get("error").is_some(), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn a_carried_response_near_expiry_expires_on_its_old_schedule() {
+        let (mut carried, id) = carried_responses();
+        let wire = serde_json::to_value(&carried).unwrap();
+        let mut wire = wire;
+        wire["entries"][0]["remaining_ms"] = json!(400);
+        carried = serde_json::from_value(wire).unwrap();
+        let mut handover = sample_handover(current_tools());
+        handover.session.responses = carried;
+        let (mut r, _run) = resume(&handover, None).await;
+        drain_replay(&mut r).await;
+        let ok = expand(&mut r, 20, &id).await;
+        assert!(ok.get("error").is_none(), "{ok}");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let gone = expand(&mut r, 21, &id).await;
+        assert!(gone.get("error").is_some(), "{gone}");
+    }
+
+    #[tokio::test]
+    async fn workspace_root_is_re_activated_through_the_swap_path_and_a_gone_root_is_reported() {
+        use crate::server::workspace::Workspace;
+        let boot = tempfile::tempdir().unwrap();
+        let moved = tempfile::tempdir().unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_ws = |fired: Arc<std::sync::atomic::AtomicUsize>| {
+            let hook: crate::server::workspace::PostActivateHook = Arc::new(move |_, _| {
+                fired.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            Workspace::open_local(boot.path().to_path_buf(), Some(hook)).unwrap()
+        };
+        let old = |path: PathBuf| CarriedWorkspace {
+            name: None,
+            path: Some(path),
+            ownership: "operator".into(),
+        };
+
+        // Re-activation: the consumer hook fires and the root is the old one.
+        let ws = make_ws(fired.clone());
+        let mut handover = sample_handover(current_tools());
+        handover.workspace = Some(old(moved.path().to_path_buf()));
+        let before = fired.load(Ordering::SeqCst);
+        let handle = ws.clone();
+        let (mut r, _run) = resume_with(&handover, None, |o| o.with_workspace(ws)).await;
+        let note = drain_replay(&mut r).await;
+        assert!(note.contains("re-activated"), "{note}");
+        assert_eq!(
+            handle.active_repo_path().unwrap(),
+            moved.path().canonicalize().unwrap()
+        );
+        assert!(fired.load(Ordering::SeqCst) > before, "consumer hook fired");
+        drop(r);
+
+        // Failure: the old root is gone; the server stays on its boot root.
+        let gone = boot.path().join("vanished");
+        let ws = make_ws(fired.clone());
+        let mut handover = sample_handover(current_tools());
+        handover.workspace = Some(old(gone.clone()));
+        let handle = ws.clone();
+        let (mut r, _run) = resume_with(&handover, None, |o| o.with_workspace(ws)).await;
+        let note = drain_replay(&mut r).await;
+        assert!(note.contains("could not be re-activated"), "{note}");
+        assert!(note.contains("vanished"), "{note}");
+        assert_eq!(
+            handle.active_repo_path().unwrap(),
+            boot.path().canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reloaded_answer_includes_new_instructions_only_when_they_changed() {
+        let mut handover = sample_handover(current_tools());
+        handover.instructions_known = true;
+        handover.instructions = Some("old instructions".into());
+        let (mut r, _run) = resume_with(&handover, None, |mut o| {
+            o.instructions = Some("new instructions".into());
+            o
+        })
+        .await;
+        let note = drain_replay(&mut r).await;
+        assert!(note.contains("server instructions changed"), "{note}");
+        assert!(note.contains("new instructions"), "{note}");
+        drop(r);
+
+        let (mut r, _run) = resume_with(&handover, None, |mut o| {
+            o.instructions = Some("old instructions".into());
+            o
+        })
+        .await;
+        let note = drain_replay(&mut r).await;
+        assert!(!note.contains("instructions changed"), "{note}");
+        assert!(!note.contains("old instructions"), "{note}");
     }
 }

@@ -74,6 +74,28 @@ struct Stored<S> {
     created: Instant,
 }
 
+/// One retained response in transit across an in-place reload. Carries the
+/// time it has left rather than an `Instant`, which means nothing in another
+/// process.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CarriedResponse {
+    id: String,
+    tool: String,
+    arguments: Value,
+    result: Value,
+    payload: Value,
+    bytes: usize,
+    remaining_ms: u64,
+}
+
+/// A session's retained responses plus the id counter, as handed to the
+/// process that replaces this one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CarriedResponses {
+    pub(crate) entries: Vec<CarriedResponse>,
+    pub(crate) next_id: u64,
+}
+
 /// One bounded store per server. Owners must identify sessions, not client names.
 /// Oldest results are evicted at 32 entries or 32 MiB of serialized originals
 /// and normalized payloads; entries expire after ten minutes on the next access.
@@ -141,6 +163,68 @@ impl<S: PartialEq> ResponseStore<S> {
         let preview = render(&entry, "", 0, options.limit(), expansion_tool);
         self.entries.push_back(entry);
         preview
+    }
+
+    /// The unexpired entries of `owner`, oldest first, with their remaining
+    /// lifetime. `next_id` is the whole store's counter, so ids issued after
+    /// a restore never collide with a carried one.
+    pub(crate) fn carry(&mut self, owner: &S) -> CarriedResponses {
+        self.expire();
+        let entries = self
+            .entries
+            .iter()
+            .filter(|e| &e.owner == owner)
+            .map(|e| CarriedResponse {
+                id: e.id.clone(),
+                tool: e.tool.clone(),
+                arguments: e.arguments.clone(),
+                result: e.result.clone(),
+                payload: e.payload.clone(),
+                bytes: e.bytes,
+                remaining_ms: u64::try_from(TTL.saturating_sub(e.created.elapsed()).as_millis())
+                    .unwrap_or(u64::MAX),
+            })
+            .collect();
+        CarriedResponses {
+            entries,
+            next_id: self.next_id,
+        }
+    }
+
+    /// Re-create carried entries under `owner`, backdating each so it expires
+    /// when the old process would have expired it, and keep the counter above
+    /// every restored id. The usual entry and byte caps apply: the oldest
+    /// entries go first.
+    pub(crate) fn restore(&mut self, owner: &S, carried: CarriedResponses)
+    where
+        S: Clone,
+    {
+        let now = Instant::now();
+        for c in carried.entries {
+            let remaining = Duration::from_millis(c.remaining_ms).min(TTL);
+            let Some(created) = now.checked_sub(TTL - remaining) else {
+                continue;
+            };
+            if c.bytes > CACHE_BYTES || remaining.is_zero() {
+                continue;
+            }
+            while self.entries.len() >= CACHE_ENTRIES
+                || self.entries.iter().map(|e| e.bytes).sum::<usize>() + c.bytes > CACHE_BYTES
+            {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(Stored {
+                owner: owner.clone(),
+                id: c.id,
+                tool: c.tool,
+                arguments: c.arguments,
+                result: c.result,
+                payload: c.payload,
+                bytes: c.bytes,
+                created,
+            });
+        }
+        self.next_id = self.next_id.max(carried.next_id);
     }
 
     pub fn expand(
@@ -526,6 +610,93 @@ mod tests {
                 original
             );
         }
+    }
+
+    #[test]
+    fn carried_entries_expand_after_restore_keep_their_clock_and_never_collide() {
+        let mut old = ResponseStore::default();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let preview = old.present(
+                "old",
+                "tool",
+                json!({"q":1}),
+                large(),
+                &ResponseOptions::default(),
+                "expand_response",
+            );
+            ids.push(body(&preview)["result_id"].as_str().unwrap().to_string());
+        }
+        old.present(
+            "other",
+            "tool",
+            json!({}),
+            large(),
+            &ResponseOptions::default(),
+            "expand_response",
+        );
+        // The first entry is one second from expiry, the second is fresh.
+        old.entries.front_mut().unwrap().created = Instant::now() - (TTL - Duration::from_secs(1));
+        let carried = old.carry(&"old");
+        assert_eq!(carried.entries.len(), 2, "only the session's own entries");
+        assert!(carried.entries[0].remaining_ms <= 1000);
+        let wire: CarriedResponses =
+            serde_json::from_value(serde_json::to_value(&carried).unwrap()).unwrap();
+
+        let mut new = ResponseStore::default();
+        new.restore(&"new", wire);
+        assert_eq!(
+            new.expand(&"new", &request(&ids[1]), "expand_response")
+                .unwrap(),
+            large()
+        );
+        assert!(new
+            .expand(&"stranger", &request(&ids[1]), "expand_response")
+            .is_err());
+        let fresh = new.present(
+            "new",
+            "tool",
+            json!({}),
+            large(),
+            &ResponseOptions::default(),
+            "expand_response",
+        );
+        let fresh_id = body(&fresh)["result_id"].as_str().unwrap().to_string();
+        assert!(!ids.contains(&fresh_id), "{fresh_id} collides with {ids:?}");
+        // The near-expiry entry dies on the old schedule.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(new
+            .expand(&"new", &request(&ids[0]), "expand_response")
+            .is_err());
+        assert!(new
+            .expand(&"new", &request(&ids[1]), "expand_response")
+            .is_ok());
+    }
+
+    #[test]
+    fn restore_respects_the_entry_cap_and_drops_expired_entries() {
+        let entry = |n: u64, remaining_ms: u64| CarriedResponse {
+            id: format!("r{n}"),
+            tool: "t".into(),
+            arguments: json!({}),
+            result: json!({"content":[{"type":"text","text":"x"}]}),
+            payload: json!("x"),
+            bytes: 10,
+            remaining_ms,
+        };
+        let mut entries: Vec<_> = (1..=40).map(|n| entry(n, 5000)).collect();
+        entries.push(entry(41, 0));
+        let mut store = ResponseStore::default();
+        store.restore(
+            &"s",
+            CarriedResponses {
+                entries,
+                next_id: 41,
+            },
+        );
+        assert_eq!(store.entries.len(), CACHE_ENTRIES);
+        assert_eq!(store.entries.front().unwrap().id, "r9");
+        assert_eq!(store.next_id, 41);
     }
 
     #[test]

@@ -967,6 +967,17 @@ impl LoadedSkills {
             .push((owner.clone(), loaded, std::time::Instant::now()));
     }
 
+    fn names(&self, owner: &ResponseSession) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .sessions
+            .iter()
+            .find(|(session, _, _)| session == owner)
+            .map(|(_, loaded, _)| loaded.iter().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     fn contains(&self, owner: &ResponseSession, name: &str) -> bool {
         self.sessions
             .iter()
@@ -1134,6 +1145,11 @@ pub struct McpServer {
     /// Behind an `Arc` because every clone of the server serves the
     /// same sessions.
     loaded_skills: Arc<Mutex<LoadedSkills>>,
+    /// Session state carried over an in-place reload, waiting for the
+    /// resumed session's first tool call. The session's identity (the
+    /// negotiated-info `Arc`) only exists once rmcp serves it, so the
+    /// state is parked here and attached to whichever session calls first.
+    carried: Arc<Mutex<Option<crate::server::reload::CarriedSession>>>,
     /// Opt-in record of what this server sent; `None` (the default)
     /// means every hook is a no-op that serializes nothing.
     send_ledger: Option<Arc<crate::server::send_ledger::SendLedger>>,
@@ -1156,6 +1172,7 @@ impl McpServer {
             responses: Arc::new(Mutex::new(crate::response_budget::ResponseStore::default())),
             response_preview: None,
             loaded_skills: Arc::new(Mutex::new(LoadedSkills::default())),
+            carried: Arc::new(Mutex::new(None)),
             send_ledger: crate::server::send_ledger::SendLedger::from_env().map(Arc::new),
         };
         server.register_github_tools_if_authorized();
@@ -1712,6 +1729,71 @@ impl McpServer {
             })
             .collect();
         (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Snapshot what a reload must keep for the session identified by
+    /// `peer_info`: its retained responses and the loaded skills with the
+    /// body hash each was loaded at.
+    pub(crate) fn carry_session(
+        &self,
+        peer_info: Arc<InitializeRequestParams>,
+    ) -> crate::server::reload::CarriedSession {
+        let owner = ResponseSession(peer_info);
+        let responses = self
+            .responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carry(&owner);
+        let names = self
+            .loaded_skills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .names(&owner);
+        let state = self.skill_state();
+        let skills = names
+            .into_iter()
+            .filter_map(|name| {
+                let hash = *state.body_hashes.get(&name)?;
+                Some(crate::server::reload::CarriedSkill { name, hash })
+            })
+            .collect();
+        crate::server::reload::CarriedSession { responses, skills }
+    }
+
+    /// Park carried session state until the resumed session's first call.
+    pub(crate) fn park_carried(&self, carried: crate::server::reload::CarriedSession) {
+        *self.carried.lock().unwrap_or_else(|e| e.into_inner()) = Some(carried);
+    }
+
+    /// Attach parked state to `owner`. A skill comes back as loaded only
+    /// when this process serves the same body under that name: a changed or
+    /// removed skill is left unloaded so the agent is told again.
+    fn adopt_carried(&self, owner: &ResponseSession) {
+        let Some(carried) = self
+            .carried
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        self.responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restore(owner, carried.responses);
+        let still_current: Vec<String> = {
+            let state = self.skill_state();
+            carried
+                .skills
+                .into_iter()
+                .filter(|s| state.body_hashes.get(&s.name) == Some(&s.hash))
+                .map(|s| s.name)
+                .collect()
+        };
+        let mut loaded = self.loaded_skills.lock().unwrap_or_else(|e| e.into_inner());
+        for name in still_current {
+            loaded.mark(owner, &name);
+        }
     }
 
     fn current_source_roots(&self) -> Vec<String> {
@@ -2282,15 +2364,17 @@ fn strip_injected_skills(description: &str) -> Option<String> {
     (!kept.is_empty()).then_some(kept)
 }
 
-/// Hash a skill body for the loaded-set rule. Only ever compared
-/// against another hash of the same function in the same process, so
-/// the unspecified stability of `DefaultHasher` across releases does
-/// not matter here.
+/// Hash a skill body for the loaded-set rule: FNV-1a, fixed by its
+/// definition. The hash crosses an in-place reload inside the handover
+/// file, where the new binary compares it with its own; `DefaultHasher`
+/// is unspecified across Rust releases and could silently disagree.
 fn body_hash(body: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut hasher);
-    hasher.finish()
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in body.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// The single skill-resolution pass, behind both [`serve_prompts`] and
@@ -2938,6 +3022,7 @@ impl ServerHandler for McpServer {
                 .peer_info()
                 .ok_or_else(|| McpError::invalid_request("initialize is required", None))?,
         );
+        self.adopt_carried(&owner);
         if reload_request {
             if let Some(check) = self
                 .options
@@ -2947,6 +3032,7 @@ impl ServerHandler for McpServer {
             {
                 if self.tools_snapshot().get("ping").is_some() {
                     return Ok(crate::server::reload::reload_ping(
+                        self,
                         check,
                         &context,
                         self.tool_names(),
@@ -5104,6 +5190,41 @@ mod tests {
             body.contains(NUDGE),
             "a session idle past the window must start empty: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn carried_skill_state_silences_an_unchanged_skill_and_renotices_a_changed_one() {
+        const NUDGE: &str = "has not been loaded this session";
+        for (delta, expect_nudge) in [(0u64, false), (1, true)] {
+            let registry = build_test_registry(&[("ping", "Routing.", "BODY", true)]);
+            let mut server = McpServer::new(ServerOptions::default());
+            super::serve_prompts(&registry, &mut server);
+            let hash = *server
+                .skill_state()
+                .body_hashes
+                .get("ping")
+                .expect("lazy skill hashed");
+            server.park_carried(crate::server::reload::CarriedSession {
+                skills: vec![crate::server::reload::CarriedSkill {
+                    name: "ping".into(),
+                    hash: hash.wrapping_add(delta),
+                }],
+                ..Default::default()
+            });
+            let mut client = serve_over_duplex(server).await;
+            assert_eq!(
+                client.call("ping").await.contains(NUDGE),
+                expect_nudge,
+                "delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_hash_is_a_fixed_function_of_the_text() {
+        // Pinned: the value crosses a reload inside the handover file.
+        assert_eq!(super::body_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(super::body_hash("a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]
