@@ -15,7 +15,9 @@
 //! message is answered with an `invalid_request` error carrying a null id.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use futures::SinkExt;
 use rmcp::model::{ErrorData, GetExtensions, JsonRpcMessage};
@@ -23,8 +25,8 @@ use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::async_rw::{JsonRpcMessageCodec, JsonRpcMessageCodecError};
 use rmcp::transport::Transport;
 use rmcp::RoleServer;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::sync::{Mutex, Notify};
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, FramedWrite};
 
@@ -108,15 +110,284 @@ fn raw_text(line: &[u8]) -> Result<Arc<str>, JsonRpcMessageCodecError> {
 type ServerMessageCodec = JsonRpcMessageCodec<TxJsonRpcMessage<RoleServer>>;
 pub(crate) type SharedWriter<W> = Arc<Mutex<Option<FramedWrite<W, ServerMessageCodec>>>>;
 
+/// Outcome of one [`InputBuffer::pump_step`].
+#[cfg(unix)]
+pub(crate) enum PumpStep {
+    /// Bytes were appended (or the call was interrupted): read again.
+    Data,
+    /// Nothing more to read right now.
+    WouldBlock,
+    /// End of input or a read error; the buffer is marked finished.
+    Eof,
+    /// A reload owns the input.
+    Frozen,
+}
+
+struct InState {
+    /// Bytes read from the OS and not yet decoded into a line.
+    buf: Vec<u8>,
+    eof: bool,
+    /// Set while a reload owns the input: the pump must not read, so the
+    /// bytes still in the OS buffer stay there for the next process.
+    frozen: bool,
+}
+
+/// The single buffer between the OS and the decoder. Every byte the process
+/// has read from stdin but not yet decoded is in `state.buf`, so a reload can
+/// hand all of it to the next process; the stdin pump appends here while
+/// holding the lock across its `read(2)`, so no byte is ever in transit.
+pub(crate) struct InputBuffer {
+    state: StdMutex<InState>,
+    ready: Notify,
+    unfrozen: Notify,
+    pump_active: AtomicBool,
+    #[cfg(unix)]
+    pump: StdMutex<Option<crate::server::stdin_pump::PumpHandle>>,
+}
+
+impl InputBuffer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: StdMutex::new(InState {
+                buf: Vec::new(),
+                eof: false,
+                frozen: false,
+            }),
+            ready: Notify::new(),
+            unfrozen: Notify::new(),
+            pump_active: AtomicBool::new(false),
+            #[cfg(unix)]
+            pump: StdMutex::new(None),
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, InState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the non-consuming stdin pump feeds this buffer.
+    pub(crate) fn pump_active(&self) -> bool {
+        self.pump_active.load(Ordering::Acquire)
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        self.state().buf.extend_from_slice(bytes);
+        self.ready.notify_one();
+    }
+
+    /// Put `bytes` ahead of anything already buffered (the handover replay
+    /// precedes live input).
+    pub(crate) fn prepend(&self, bytes: &[u8]) {
+        let mut state = self.state();
+        let mut joined = Vec::with_capacity(bytes.len() + state.buf.len());
+        joined.extend_from_slice(bytes);
+        joined.extend_from_slice(&state.buf);
+        state.buf = joined;
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// The next complete line including its `\n`.
+    fn take_line(&self) -> Option<Vec<u8>> {
+        let mut state = self.state();
+        let end = state.buf.iter().position(|b| *b == b'\n')? + 1;
+        Some(state.buf.drain(..end).collect())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn mark_eof_external(&self) {
+        self.mark_eof();
+    }
+
+    fn mark_eof(&self) {
+        self.state().eof = true;
+        self.ready.notify_one();
+    }
+
+    /// At end of input: whatever remains (a final line without `\n`), once.
+    fn take_at_eof(&self) -> Option<Vec<u8>> {
+        let mut state = self.state();
+        state.eof.then(|| std::mem::take(&mut state.buf))
+    }
+
+    /// Stop the pump from reading and return every undecoded byte, leaving
+    /// the buffer intact so [`unfreeze`](Self::unfreeze) can resume.
+    pub(crate) fn freeze_and_snapshot(&self) -> Vec<u8> {
+        let mut state = self.state();
+        state.frozen = true;
+        state.buf.clone()
+    }
+
+    /// Resume reading after a reload that did not replace the process.
+    pub(crate) fn unfreeze(&self) {
+        self.state().frozen = false;
+        self.unfrozen.notify_one();
+    }
+
+    /// One nonblocking `read(2)` of `fd` into the buffer, under the state
+    /// lock so the bytes are never in transit between the OS and the buffer
+    /// while a reload snapshots it.
+    #[cfg(unix)]
+    pub(crate) fn pump_step(&self, fd: std::os::fd::RawFd, chunk: &mut [u8]) -> PumpStep {
+        let mut state = self.state();
+        if state.frozen {
+            return PumpStep::Frozen;
+        }
+        // SAFETY: `chunk` is a valid writable region of `chunk.len()` bytes.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        let step = if n > 0 {
+            state.buf.extend_from_slice(&chunk[..n as usize]);
+            PumpStep::Data
+        } else if n == 0 {
+            state.eof = true;
+            PumpStep::Eof
+        } else {
+            match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::WouldBlock => PumpStep::WouldBlock,
+                std::io::ErrorKind::Interrupted => PumpStep::Data,
+                _ => {
+                    state.eof = true;
+                    PumpStep::Eof
+                }
+            }
+        };
+        drop(state);
+        if matches!(step, PumpStep::Data | PumpStep::Eof) {
+            self.ready.notify_one();
+        }
+        step
+    }
+
+    /// Resolves when a reload that froze the input has been abandoned.
+    #[cfg(unix)]
+    pub(crate) async fn wait_unfrozen(&self) {
+        self.unfrozen.notified().await;
+    }
+
+    /// Restore the descriptor's original mode ahead of an `exec`.
+    pub(crate) fn restore_blocking(&self) {
+        #[cfg(unix)]
+        if let Some(handle) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            handle.restore_flags();
+        }
+    }
+
+    /// Re-enter nonblocking mode after an `exec` that failed.
+    pub(crate) fn reapply_nonblocking(&self) {
+        #[cfg(unix)]
+        if let Some(handle) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            handle.reapply_nonblocking();
+        }
+    }
+
+    /// Stop the pump and give stdin back its original blocking mode.
+    fn shutdown(&self) {
+        #[cfg(unix)]
+        if let Some(handle) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            handle.stop();
+        }
+    }
+}
+
+/// Pause point after a request that must be handled before any later input is
+/// decoded (a reload): the transport stops delivering messages until the
+/// handler calls [`release`](Self::release), so everything after that
+/// request is still undecoded when the reload hands the input over.
+pub(crate) struct Gate {
+    paused: AtomicBool,
+    changed: Notify,
+}
+
+/// Longest the transport waits for a paused gate; a handler that never
+/// releases it (a request that fails before dispatch) must not wedge input.
+const GATE_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            paused: AtomicBool::new(false),
+            changed: Notify::new(),
+        })
+    }
+
+    fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    async fn wait(&self) {
+        let waiting = async {
+            while self.paused.load(Ordering::Acquire) {
+                self.changed.notified().await;
+            }
+        };
+        if tokio::time::timeout(GATE_TIMEOUT, waiting).await.is_err() {
+            tracing::warn!("input gate not released within {GATE_TIMEOUT:?}; resuming");
+            self.paused.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Holds the output side exclusively: nothing more is written while the
+/// returned guard lives.
+pub(crate) trait WriterHold: Send + Sync {
+    /// Flush, then take the writer lock.
+    fn hold(
+        &self,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<Box<dyn std::any::Any + Send>>>;
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> WriterHold for SharedWriter<W> {
+    fn hold(
+        &self,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<Box<dyn std::any::Any + Send>>> {
+        let writer = self.clone();
+        Box::pin(async move {
+            let mut guard = writer.lock_owned().await;
+            match guard.as_mut() {
+                Some(framed) => {
+                    futures::SinkExt::<TxJsonRpcMessage<RoleServer>>::flush(framed).await?
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Transport is closed",
+                    ))
+                }
+            }
+            Ok(Box::new(guard) as Box<dyn std::any::Any + Send>)
+        })
+    }
+}
+
+/// Type-erased handles a reload needs from a running transport.
+#[derive(Clone)]
+pub(crate) struct TransportLink {
+    pub(crate) input: Arc<InputBuffer>,
+    pub(crate) gate: Arc<Gate>,
+    pub(crate) writer: Arc<dyn WriterHold>,
+}
+
+type PauseAfter = Arc<dyn Fn(&RxJsonRpcMessage<RoleServer>) -> bool + Send + Sync>;
+
 /// rmcp server transport over any async reader/writer pair, keeping raw
 /// request text. Build with [`StdioTransport::stdio`] for the process's
 /// stdin/stdout or [`StdioTransport::from_io`] for any other stream.
 ///
-/// The reader type `R` is the swappable input side; the writer lives behind a
-/// shared lock so `send` futures (which outlive `&mut self`) can reach it.
+/// All undecoded input lives in one shared buffer; on unix,
+/// [`stdio`](Self::stdio) fills it from a non-consuming pump on fd 0 so that
+/// a reload can carry unread input into the replacement process. The writer
+/// lives behind a shared lock so `send` futures (which outlive `&mut self`)
+/// can reach it.
 pub struct StdioTransport<R, W> {
-    read: BufReader<R>,
-    line: Vec<u8>,
+    reader: Option<R>,
+    input: Arc<InputBuffer>,
+    gate: Arc<Gate>,
+    pause_after: Option<PauseAfter>,
     decoder: RawLineCodec<RxJsonRpcMessage<RoleServer>>,
     write: SharedWriter<W>,
     recover: Option<RecoverFn>,
@@ -124,7 +395,18 @@ pub struct StdioTransport<R, W> {
 
 impl StdioTransport<tokio::io::Stdin, tokio::io::Stdout> {
     /// Transport over the process's stdin and stdout.
+    ///
+    /// On unix, inside a tokio runtime, stdin is polled by a pump that never
+    /// consumes more than it buffers, which is what makes
+    /// `ping(reload=true)` available. When fd 0 cannot be registered (a
+    /// regular file, a terminal) or there is no runtime, input is read with
+    /// tokio's blocking stdin and reload reports itself unavailable.
     pub fn stdio() -> Self {
+        #[cfg(unix)]
+        match Self::pumped(0, tokio::io::stdout()) {
+            Ok(transport) => return transport,
+            Err(error) => tracing::info!("stdin pump unavailable, reload disabled: {error}"),
+        }
         Self::from_io(tokio::io::stdin(), tokio::io::stdout())
     }
 }
@@ -134,11 +416,12 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    /// Transport over an arbitrary reader/writer pair.
-    pub fn from_io(read: R, write: W) -> Self {
+    fn assemble(reader: Option<R>, input: Arc<InputBuffer>, write: W) -> Self {
         Self {
-            read: BufReader::new(read),
-            line: Vec::new(),
+            reader,
+            input,
+            gate: Gate::new(),
+            pause_after: None,
             decoder: RawLineCodec::default(),
             write: Arc::new(Mutex::new(Some(FramedWrite::new(
                 write,
@@ -146,6 +429,21 @@ where
             )))),
             recover: None,
         }
+    }
+
+    /// Transport reading file descriptor `fd` through the stdin pump.
+    #[cfg(unix)]
+    pub(crate) fn pumped(fd: std::os::fd::RawFd, write: W) -> std::io::Result<Self> {
+        let input = InputBuffer::new();
+        let handle = crate::server::stdin_pump::start(fd, input.clone())?;
+        *input.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        input.pump_active.store(true, Ordering::Release);
+        Ok(Self::assemble(None, input, write))
+    }
+
+    /// Transport over an arbitrary reader/writer pair.
+    pub fn from_io(read: R, write: W) -> Self {
+        Self::assemble(Some(read), InputBuffer::new(), write)
     }
 
     /// Offer lines that fail to decode to `recover` before the default
@@ -159,10 +457,62 @@ where
         self
     }
 
-    /// The shared writer, for a holder that must serialise against `send`.
-    #[allow(dead_code)] // reason: consumed by the reload handover, not yet wired
-    pub(crate) fn writer(&self) -> SharedWriter<W> {
-        self.write.clone()
+    /// After delivering a message `pred` accepts, hold back all further input
+    /// until [`Gate::release`] is called on this transport's gate.
+    pub(crate) fn with_pause_after(
+        mut self,
+        pred: impl Fn(&RxJsonRpcMessage<RoleServer>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.pause_after = Some(Arc::new(pred));
+        self
+    }
+
+    /// Put `bytes` ahead of all pending input.
+    pub(crate) fn prepend_input(&self, bytes: &[u8]) {
+        self.input.prepend(bytes);
+    }
+
+    /// Shared handles for a reload to take over this transport's streams.
+    pub(crate) fn link(&self) -> TransportLink
+    where
+        W: Send + 'static,
+    {
+        TransportLink {
+            input: self.input.clone(),
+            gate: self.gate.clone(),
+            writer: Arc::new(self.write.clone()),
+        }
+    }
+
+    /// The next line (with its `\n`, or the unterminated tail at end of
+    /// input) and whether it is that tail; `None` once input is exhausted.
+    async fn next_line(&mut self) -> Option<(Vec<u8>, bool)> {
+        let mut chunk = [0u8; 8192];
+        loop {
+            if let Some(line) = self.input.take_line() {
+                return Some((line, false));
+            }
+            if let Some(tail) = self.input.take_at_eof() {
+                return (!tail.is_empty()).then_some((tail, true));
+            }
+            match self.reader.as_mut() {
+                Some(reader) => match reader.read(&mut chunk).await {
+                    Ok(0) => self.input.mark_eof(),
+                    Ok(n) => self.input.push(&chunk[..n]),
+                    Err(error) => {
+                        tracing::error!("Error reading from stream: {error}");
+                        return None;
+                    }
+                },
+                None => self.input.ready.notified().await,
+            }
+        }
+    }
+}
+
+impl<R, W> Drop for StdioTransport<R, W> {
+    fn drop(&mut self) {
+        self.input.shutdown();
     }
 }
 
@@ -201,29 +551,22 @@ where
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
         loop {
-            let decoded = match self.read.read_until(b'\n', &mut self.line).await {
-                Ok(0) if self.line.is_empty() => return None,
-                Ok(0) => {
-                    let mut final_line = BytesMut::from(self.line.as_slice());
-                    self.decoder.decode_eof(&mut final_line)
-                }
-                // A partial line (reader returned before `\n`): keep
-                // accumulating into `self.line`.
-                Ok(_) if !self.line.ends_with(b"\n") => continue,
-                Ok(_) => {
-                    let mut complete_line = BytesMut::from(self.line.as_slice());
-                    self.decoder.decode(&mut complete_line)
-                }
-                Err(error) => {
-                    tracing::error!("Error reading from stream: {error}");
-                    return None;
-                }
+            self.gate.wait().await;
+            let (line, at_eof) = self.next_line().await?;
+            let decoded = if at_eof {
+                let mut final_line = BytesMut::from(line.as_slice());
+                self.decoder.decode_eof(&mut final_line)
+            } else {
+                let mut complete_line = BytesMut::from(line.as_slice());
+                self.decoder.decode(&mut complete_line)
             };
-            let raw = raw_text(self.line.strip_suffix(b"\n").unwrap_or(&self.line)).ok();
-            self.line.clear();
+            let raw = raw_text(line.strip_suffix(b"\n").unwrap_or(&line)).ok();
             match decoded {
                 Ok(Some((mut message, raw))) => {
                     attach_raw(&mut message, raw, false);
+                    if self.pause_after.as_ref().is_some_and(|pred| pred(&message)) {
+                        self.gate.pause();
+                    }
                     return Some(message);
                 }
                 Ok(None) => continue,
@@ -269,6 +612,7 @@ where
 mod tests {
     use super::*;
     use rmcp::model::ClientRequest;
+    use std::time::Duration;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     type T = StdioTransport<DuplexStream, DuplexStream>;
@@ -469,5 +813,148 @@ mod tests {
             TxJsonRpcMessage::<RoleServer>::error(ErrorData::invalid_request("x", None), None);
         let error = t.send(again).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn undecoded_bytes_are_all_in_the_shared_buffer() {
+        // The handover data path: after one message is decoded, everything
+        // the transport has read but not decoded (the next message and a
+        // partial line) is what a reload carries over.
+        let (mut t, mut tx, _rx) = pair();
+        let second = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        tx.write_all(format!("{PING}\n{second}\n{{\"par").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, PING);
+        let link = t.link();
+        let pending = link.input.freeze_and_snapshot();
+        assert_eq!(pending, format!("{second}\n{{\"par").into_bytes());
+    }
+
+    #[tokio::test]
+    async fn prepended_replay_is_decoded_before_live_input() {
+        let (mut t, mut tx, _rx) = pair();
+        tx.write_all(format!("{PING}\n").as_bytes()).await.unwrap();
+        t.prepend_input(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n");
+        let first = raw_of(&t.receive().await.unwrap());
+        assert!(first.source.contains("\"id\":9"));
+        assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, PING);
+    }
+
+    #[tokio::test]
+    async fn gate_holds_back_input_after_a_matching_message_until_released() {
+        let (t, mut tx, _rx) = pair();
+        let mut t = t.with_pause_after(|_| true);
+        let second = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        tx.write_all(format!("{PING}\n{second}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, PING);
+        let gate = t.link().gate;
+        let held = tokio::time::timeout(Duration::from_millis(150), t.receive()).await;
+        assert!(held.is_err(), "second message must wait for the gate");
+        gate.release();
+        assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, second);
+    }
+
+    #[cfg(unix)]
+    mod pump {
+        use super::*;
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        fn pipe() -> (std::fs::File, std::os::fd::OwnedFd) {
+            let mut fds = [0i32; 2];
+            // SAFETY: `fds` has room for the two descriptors `pipe(2)` writes.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: both descriptors are fresh and owned by nobody else.
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[1]),
+                    std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                )
+            }
+        }
+
+        fn flags(fd: i32) -> i32 {
+            // SAFETY: F_GETFL takes no pointer argument.
+            unsafe { libc::fcntl(fd, libc::F_GETFL) }
+        }
+
+        #[tokio::test]
+        async fn freezing_leaves_later_bytes_in_the_os_pipe() {
+            let (mut write, read) = pipe();
+            let fd = read.as_raw_fd();
+            let blocking = flags(fd);
+            assert_eq!(blocking & libc::O_NONBLOCK, 0);
+            let (server_tx, _client_rx) = duplex(4096);
+            let mut t = StdioTransport::<tokio::io::Empty, _>::pumped(fd, server_tx).unwrap();
+            assert_ne!(flags(fd) & libc::O_NONBLOCK, 0, "pump polls nonblocking");
+            assert!(t.link().input.pump_active());
+
+            write
+                .write_all(format!("{PING}\n{{\"half").as_bytes())
+                .unwrap();
+            assert_eq!(&*raw_of(&t.receive().await.unwrap()).source, PING);
+            // The partial line has reached the buffer once the pump caught up.
+            let link = t.link();
+            let snapshot = loop {
+                let snap = link.input.freeze_and_snapshot();
+                if snap == b"{\"half" {
+                    break snap;
+                }
+                link.input.unfreeze();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(snapshot, b"{\"half");
+
+            // Frozen: a later write is NOT consumed by this process.
+            write.write_all(b"LATER\n").unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(link.input.freeze_and_snapshot(), b"{\"half");
+            link.input.restore_blocking();
+            assert_eq!(
+                flags(fd) & libc::O_NONBLOCK,
+                0,
+                "original mode restored for exec"
+            );
+            let mut leftover = [0u8; 16];
+            // SAFETY: valid buffer; the descriptor is blocking but data is waiting.
+            let n = unsafe { libc::read(fd, leftover.as_mut_ptr().cast(), leftover.len()) };
+            assert_eq!(&leftover[..n as usize], b"LATER\n");
+
+            // An abandoned reload resumes reading.
+            link.input.reapply_nonblocking();
+            link.input.unfreeze();
+            write.write_all(b"\n").unwrap();
+            let line = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(l) = link.input.take_line() {
+                        break l;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(line, b"{\"half\n");
+            drop(t);
+            assert_eq!(
+                flags(fd) & libc::O_NONBLOCK,
+                0,
+                "dropping the transport restores stdin"
+            );
+        }
+
+        #[tokio::test]
+        async fn unpollable_descriptor_is_rejected_and_left_untouched() {
+            let file = std::fs::File::open("/dev/null").unwrap();
+            let fd = file.as_raw_fd();
+            let before = flags(fd);
+            let (server_tx, _client_rx) = duplex(64);
+            let result = StdioTransport::<tokio::io::Empty, _>::pumped(fd, server_tx);
+            assert!(result.is_err());
+            assert_eq!(flags(fd), before);
+        }
     }
 }

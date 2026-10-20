@@ -557,6 +557,13 @@ pub struct PingArgs {
     /// Optional message to echo back. Defaults to "pong".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// `true` asks the server to load a newer installed build in place. The
+    /// framework advertises this argument in the tool schema only when a
+    /// reload is configured (`SelfCheck::with_reload`), so it is kept out
+    /// of the derived schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub reload: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1738,15 +1745,54 @@ impl McpServer {
     }
 
     /// Append the self-update notice to a completed, non-error result.
-    fn append_stale_notice(&self, response: &mut CallToolResponse) {
+    async fn append_stale_notice(&self, response: &mut CallToolResponse) {
         let Some(check) = &self.options.self_check else {
             return;
         };
         if let CallToolResponse::Complete(result) = response {
             if result.is_error != Some(true) {
-                append_notice_to_result(result, check.notice());
+                check.refresh().await;
+                let ping_present = self.tools_snapshot().get("ping").is_some();
+                append_notice_to_result(result, check.notice(ping_present));
             }
         }
+    }
+
+    /// The options this server was built with.
+    pub(crate) fn options(&self) -> &ServerOptions {
+        &self.options
+    }
+
+    /// Names of the tools currently routed, sorted.
+    pub(crate) fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tools_snapshot()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Add the `reload` argument to `ping`'s schema when a reload is
+    /// configured; every other tool, and every other server's `ping`, is
+    /// returned untouched.
+    fn with_reload_arg(&self, mut tool: Tool) -> Tool {
+        let configured = self
+            .options
+            .self_check
+            .as_ref()
+            .is_some_and(|c| c.reload_config().is_some());
+        if configured && tool.name == "ping" {
+            Arc::make_mut(&mut tool.input_schema)
+                .entry("properties")
+                .or_insert_with(|| serde_json::json!({}))["reload"] = serde_json::json!({
+                "type": "boolean",
+                "description": "Set true, when a result says this server is stale, to load the newer installed build in place; the session continues without restarting the client. Refused while other calls are running, or when already up to date."
+            });
+        }
+        tool
     }
 
     /// Run the consumer's result-postprocess hook (if any) against a
@@ -1798,8 +1844,22 @@ impl McpServer {
         Parameters(args): Parameters<PingArgs>,
     ) -> Result<CallToolResult, McpError> {
         let args_json = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        if args.reload == Some(true) {
+            // A configured reload is answered in `call_tool`, so this call
+            // reached a server that cannot reload.
+            let why = self
+                .options
+                .self_check
+                .as_ref()
+                .and_then(|c| c.reload_unavailable(true))
+                .unwrap_or("reload is not configured for this server");
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "reload refused: {why}"
+            ))]));
+        }
         let mut body = args.message.unwrap_or_else(|| "pong".to_string());
         if let Some(check) = &self.options.self_check {
+            check.refresh().await;
             body.push('\n');
             body.push_str(&check.ping_line());
         }
@@ -2858,6 +2918,19 @@ impl ServerHandler for McpServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         use crate::response_budget::{Expansion, ResponseOptions};
+        // First, so every exit path of this call is counted and, for a
+        // reload request, releases the input gate the transport paused.
+        let _in_flight = self.options.self_check.as_ref().map(|c| c.enter_call());
+        let reload_request = crate::server::reload::is_reload_ping(&request);
+        let _gate = reload_request
+            .then(|| {
+                self.options
+                    .self_check
+                    .as_ref()
+                    .and_then(|c| c.link())
+                    .map(|l| crate::server::reload::GateRelease::new(l.gate.clone()))
+            })
+            .flatten();
         let expansion_tool = self.response_expansion_name();
         let legacy = crate::server::send_ledger::is_legacy(context.protocol_version());
         let owner = ResponseSession(
@@ -2866,6 +2939,24 @@ impl ServerHandler for McpServer {
                 .peer_info()
                 .ok_or_else(|| McpError::invalid_request("initialize is required", None))?,
         );
+        if reload_request {
+            if let Some(check) = self
+                .options
+                .self_check
+                .as_ref()
+                .filter(|c| c.reload_config().is_some())
+            {
+                if self.tools_snapshot().get("ping").is_some() {
+                    return Ok(crate::server::reload::reload_ping(
+                        check,
+                        &context,
+                        self.tool_names(),
+                    )
+                    .await
+                    .into());
+                }
+            }
+        }
         // Any tool call is proof this session is still working, so its
         // loaded-skill record survives. Before the `expand_response`
         // branch, because that is a tool call too. See [`LoadedSkills`].
@@ -2887,7 +2978,7 @@ impl ServerHandler for McpServer {
             let mut sent = serde_json::from_value::<CallToolResult>(result)
                 .map(CallToolResponse::from)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            self.append_stale_notice(&mut sent);
+            self.append_stale_notice(&mut sent).await;
             if let Some(ledger) = &self.send_ledger {
                 Self::ledger_call(
                     ledger,
@@ -3004,7 +3095,7 @@ impl ServerHandler for McpServer {
                 // retained payload never stores it, so `expand_response`
                 // cannot replay a stale one.
                 if name != "ping" {
-                    self.append_stale_notice(&mut sent);
+                    self.append_stale_notice(&mut sent).await;
                 }
                 if let (Some(ledger), Some(budget), Some(args)) =
                     (&self.send_ledger, budget, arguments_bytes)
@@ -3047,6 +3138,7 @@ impl ServerHandler for McpServer {
             .tools_snapshot()
             .list_all()
             .into_iter()
+            .map(|tool| self.with_reload_arg(tool))
             .map(|tool| {
                 if Some(tool.name.as_ref()) == loader {
                     tool
@@ -3095,7 +3187,7 @@ impl ServerHandler for McpServer {
         if name == self.response_expansion_name() {
             return Some(self.response_expansion_tool());
         }
-        let tool = self.tools_snapshot().get(name).cloned()?;
+        let tool = self.with_reload_arg(self.tools_snapshot().get(name).cloned()?);
         if Some(name) == self.framework_skill_loader() {
             return Some(tool);
         }

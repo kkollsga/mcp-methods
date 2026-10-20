@@ -70,7 +70,7 @@ globset = "0.4"
 
 # --- server feature ---
 rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time", "net"], optional = true }
 serde_yaml = { version = "0.9", optional = true }
 schemars = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
@@ -84,6 +84,9 @@ notify-debouncer-mini = { version = "0.6", optional = true }
 # rmcp's own async-rw transport uses.
 futures = { version = "0.3", optional = true }
 tokio-util = { version = "0.7.9", features = ["codec"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

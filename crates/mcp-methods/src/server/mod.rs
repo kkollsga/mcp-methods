@@ -39,6 +39,7 @@ pub mod bundled_skills_index;
 pub mod cli;
 pub mod env;
 pub mod manifest;
+mod reload;
 pub mod roots;
 pub mod runtime;
 mod self_check;
@@ -50,6 +51,8 @@ mod send_ledger;
 pub mod server;
 pub mod skills;
 pub mod source;
+#[cfg(unix)]
+mod stdin_pump;
 pub mod stdio;
 pub mod watch;
 pub mod workspace;
