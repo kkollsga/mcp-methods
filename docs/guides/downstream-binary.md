@@ -206,8 +206,13 @@ let options = ServerOptions::from_manifest(None, "My Server").with_self_check(ch
   text. The root is re-activated through the ordinary swap path, so your
   activation hooks fire; if it cannot be, the server stays on its boot root
   and the `reloaded:` answer says so. If the new build's instructions differ,
-  that answer includes the new text. Per-consumer state beyond this is yours
-  to rebuild in those hooks or in `with_before_exec`. When stdin is a
+  that answer includes the new text. Per-consumer state beyond this is
+  yours to rebuild in those hooks, unless you supply `with_carry(save,
+  restore)`: `save` returns a JSON value right before `with_before_exec` (a
+  panic refuses the reload), and `restore` receives it in the new process after
+  the workspace re-activation and before the replayed ping is answered. A
+  `restore` error or panic becomes a line in the `reloaded:` answer and the
+  server keeps serving. When stdin is a
   terminal or file, or on Windows, only the notice appears.
 - `get_info` reports the `running_version` you pass to `SelfCheck::new`. A
   client that is already connected keeps the name and version from its

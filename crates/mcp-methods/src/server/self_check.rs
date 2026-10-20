@@ -26,6 +26,11 @@ pub(crate) type BeforeExec = Arc<dyn Fn() + Send + Sync>;
 /// Check of the new build at the watched path: `Err(reason)` refuses.
 pub(crate) type Selftest = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
+/// Consumer hook returning the state to carry across a reload.
+pub(crate) type CarrySave = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
+/// Consumer hook re-applying carried state in the new process.
+pub(crate) type CarryRestore = Arc<dyn Fn(serde_json::Value) -> Result<(), String> + Send + Sync>;
+
 /// Opt-in reload settings; present exactly when `reload_argv` is non-empty.
 #[derive(Clone)]
 pub(crate) struct ReloadConfig {
@@ -50,6 +55,8 @@ pub struct SelfCheck {
     pub(crate) can_reload: Option<CanReload>,
     pub(crate) before_exec: Option<BeforeExec>,
     pub(crate) selftest: Option<Selftest>,
+    pub(crate) carry_save: Option<CarrySave>,
+    pub(crate) carry_restore: Option<CarryRestore>,
 }
 
 impl SelfCheck {
@@ -71,6 +78,8 @@ impl SelfCheck {
             can_reload: None,
             before_exec: None,
             selftest: None,
+            carry_save: None,
+            carry_restore: None,
         }
     }
 
@@ -109,6 +118,36 @@ impl SelfCheck {
     /// status 1. A hook must therefore be safe to run once and never undone.
     pub fn with_before_exec(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.before_exec = Some(Arc::new(hook));
+        self
+    }
+
+    /// Carry consumer state across a reload. Only used with
+    /// [`with_reload`](Self::with_reload).
+    ///
+    /// `save` runs once per reload that is going ahead: after every refusal
+    /// check (stale build, in-flight requests, `can_reload`, selftest, target
+    /// executable) and immediately before [`with_before_exec`](Self::with_before_exec),
+    /// so it sees the state `before_exec` is about to release. It returns the
+    /// value to carry, or `None` to carry nothing. A panic in `save` refuses
+    /// the reload with an error answer: nothing is replaced and the server
+    /// keeps serving.
+    ///
+    /// `restore` runs in the new process on a blocking thread, after the
+    /// workspace root was re-activated and before the server starts serving,
+    /// so before the replayed `ping(reload=true)` is answered. It receives the
+    /// value `save` returned and may open a graph. When `restore` returns
+    /// `Err` or panics, the `reloaded:` answer carries a note and the server
+    /// keeps serving. It is not called when no value was carried (the old
+    /// build had no `save`, or `save` returned `None`).
+    ///
+    /// The value is stored in the handover file as JSON.
+    pub fn with_carry(
+        mut self,
+        save: impl Fn() -> Option<serde_json::Value> + Send + Sync + 'static,
+        restore: impl Fn(serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.carry_save = Some(Arc::new(save));
+        self.carry_restore = Some(Arc::new(restore));
         self
     }
 
@@ -272,6 +311,16 @@ impl SelfCheckState {
     /// Whether reload was configured at all.
     pub(crate) fn reload_config(&self) -> Option<&ReloadConfig> {
         self.reload.as_ref()
+    }
+
+    // Read only by the unix reload path.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn carry_save(&self) -> Option<CarrySave> {
+        self.config.carry_save.clone()
+    }
+
+    pub(crate) fn carry_restore(&self) -> Option<CarryRestore> {
+        self.config.carry_restore.clone()
     }
 
     pub(crate) fn path(&self) -> &Path {

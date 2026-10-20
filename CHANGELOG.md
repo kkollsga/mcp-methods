@@ -101,10 +101,19 @@ replaces the process image with `exec`, keeping the same PID and pipes.
     the `reloaded:` answer says so and includes the new text, because the
     client holds the old text from `initialize`.
   - A handover file from a build without these fields still parses.
-  - Not carried: per-consumer state beyond the above (a consumer rebuilds it
-    in its activation or `with_before_exec` hooks), and the server name and
-    version the client holds from `initialize`. The `reloaded:` answer lists
-    both.
+  - Not carried: per-consumer state beyond the above unless the consumer
+    supplies `with_carry` (below), and the server name and version the client
+    holds from `initialize`. The `reloaded:` answer lists both.
+  - `SelfCheck::with_carry(save, restore)` carries consumer state. `save`
+    returns `Option<serde_json::Value>`; it runs once, after every refusal
+    check and immediately before `with_before_exec`, and its value rides in the
+    handover file. A panic in `save` refuses the reload and the server keeps
+    serving. In the new process `restore` runs on a blocking thread after the
+    workspace re-activation and before serving, so before the replayed ping is
+    answered; an `Err` or panic adds a line to the `reloaded:` answer and the
+    server keeps serving. Nothing is called when no value was carried. The
+    target-executable check now runs before the handover file is written, so a
+    refusal there leaves no file behind and never reaches `save`.
 - Unix only. On Windows the stale notice works and reload is reported
   unsupported.
 - Reload needs `StdioTransport::stdio()` reading fd 0 through the framework's

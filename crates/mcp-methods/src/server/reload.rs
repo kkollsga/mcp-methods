@@ -17,9 +17,10 @@
 //! (with their remaining lifetime), its loaded skills (with the body hash
 //! each was loaded at, so a changed skill is announced again), the active
 //! workspace root (re-activated through the ordinary swap path, so consumer
-//! hooks fire) and the old `instructions` text. What cannot be carried is
-//! per-consumer state, which the consumer's own hooks rebuild, and the
-//! server name and version the client holds from `initialize`; the
+//! hooks fire) and the old `instructions` text. Per-consumer state rides
+//! along only when the consumer supplies
+//! [`SelfCheck::with_carry`](crate::server::SelfCheck::with_carry); otherwise
+//! its own hooks rebuild it. What cannot be carried is the server name and version the client holds from `initialize`; the
 //! `reloaded:` answer says so, and says when the instructions changed.
 
 use std::path::PathBuf;
@@ -66,6 +67,9 @@ pub(crate) struct Handover {
     pub(crate) instructions_known: bool,
     #[serde(default)]
     pub(crate) instructions: Option<String>,
+    /// The consumer's `with_carry` value, when its `save` produced one.
+    #[serde(default)]
+    pub(crate) consumer: Option<serde_json::Value>,
 }
 
 /// Session state that survives a reload.
@@ -336,9 +340,9 @@ pub(crate) async fn reload_ping(
             "reloaded: {old} → {new}\n\
              carried over: retained response ids (expand_response), loaded skills and the \
              active workspace root.\n\
-             not carried over: per-consumer state beyond that (rebuilt by the consumer's own \
-             hooks) and the server name and version your client holds from initialize, \
-             which MCP cannot refresh.",
+             not carried over: per-consumer state beyond that unless the consumer carries it \
+             (rebuilt by the consumer's own hooks) and the server name and version your \
+             client holds from initialize, which MCP cannot refresh.",
             new = check.running_version()
         );
         for note in notes {
@@ -449,6 +453,13 @@ async fn perform(
     let Some((program, args)) = argv.split_first() else {
         return refused("reload_argv is empty");
     };
+    // Checked before anything is saved or held so a refusal here costs nothing.
+    if let Err(reason) = exec_viable(program) {
+        return refused(format!(
+            "cannot start {}: {reason}",
+            program.to_string_lossy()
+        ));
+    }
     // Exclusive output from here to the exec: nothing else may be written
     // between the flush and the replacement of the process image.
     let held = match link.writer.hold().await {
@@ -456,6 +467,17 @@ async fn perform(
         Err(error) => return refused(format!("cannot take the output stream: {error}")),
     };
     let pending = link.input.freeze_and_snapshot();
+    let consumer = match check.carry_save() {
+        None => None,
+        Some(save) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| save())) {
+            Ok(value) => value,
+            Err(_) => {
+                link.input.unfreeze();
+                drop(held);
+                return refused("the consumer's carry save hook panicked");
+            }
+        },
+    };
     let handover = Handover {
         peer_info,
         replay_line,
@@ -466,6 +488,7 @@ async fn perform(
         workspace: carried.workspace,
         instructions_known: true,
         instructions: carried.instructions,
+        consumer,
     };
     let path = match write_handover(&handover) {
         Ok(path) => path,
@@ -474,15 +497,6 @@ async fn perform(
             return refused(format!("cannot write the handover: {error}"));
         }
     };
-    if let Err(reason) = exec_viable(program) {
-        link.input.unfreeze();
-        let _ = std::fs::remove_file(&path);
-        drop(held);
-        return refused(format!(
-            "cannot start {}: {reason}",
-            program.to_string_lossy()
-        ));
-    }
     let before_exec = check.reload_config().and_then(|c| c.before_exec.as_ref());
     if let Some(before_exec) = before_exec {
         before_exec();
@@ -634,6 +648,18 @@ impl McpServer {
                 Err(error) => notes.push(format!("workspace restore did not complete: {error}")),
             }
         }
+        if let (Some(restore), Some(value)) = (
+            state.as_ref().and_then(|s| s.carry_restore()),
+            handover.consumer.clone(),
+        ) {
+            match tokio::task::spawn_blocking(move || restore(value)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => notes.push(format!("consumer state restore failed: {reason}")),
+                Err(error) => {
+                    notes.push(format!("consumer state restore did not complete: {error}"))
+                }
+            }
+        }
         notes.extend(instructions_note(
             &handover,
             self.options().instructions.as_deref(),
@@ -684,6 +710,7 @@ mod tests {
             }),
             instructions_known: true,
             instructions: Some("old".into()),
+            consumer: Some(json!({"graph": "/g.kgl", "n": [1, 2]})),
         };
         let path = write_handover(&handover).unwrap();
         #[cfg(unix)]
@@ -711,6 +738,7 @@ mod tests {
         assert_eq!(handover.session, CarriedSession::default());
         assert!(handover.workspace.is_none());
         assert!(!handover.instructions_known);
+        assert!(handover.consumer.is_none());
         assert_eq!(instructions_note(&handover, Some("anything")), None);
     }
 
@@ -726,6 +754,7 @@ mod tests {
             workspace: None,
             instructions_known: true,
             instructions: Some("old text".into()),
+            consumer: None,
         };
         assert_eq!(instructions_note(&handover, Some("old text")), None);
         let changed = instructions_note(&handover, Some("brand new text")).unwrap();
@@ -766,6 +795,7 @@ mod session_tests {
     use rmcp::model::Tool;
     use serde_json::{json, Value};
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
@@ -1192,6 +1222,91 @@ mod session_tests {
         .expect("the server ends the process after answering");
     }
 
+    #[tokio::test]
+    async fn carry_save_is_not_called_on_a_refused_reload() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut h = boot_with(
+            move |sc| {
+                sc.with_reload(["/nonexistent/server"]).with_carry(
+                    move || {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Some(json!(1))
+                    },
+                    |_| Ok(()),
+                )
+            },
+            true,
+        )
+        .await;
+        let up_to_date = h.call("ping", json!({"reload": true})).await;
+        assert!(Harness::text(&up_to_date).contains("already up to date"));
+        h.replace();
+        let unexecutable = h.call("ping", json!({"reload": true})).await;
+        assert!(Harness::text(&unexecutable).contains("cannot start /nonexistent/server"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_carry_save_refuses_the_reload_and_the_server_keeps_serving() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = tempfile::tempdir().unwrap();
+        let script = bin_dir.path().join("server");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exec_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec_hook2 = exec_hook.clone();
+        let argv = [script.clone()];
+        let mut h = boot_with(
+            move |sc| {
+                sc.with_reload(argv)
+                    .with_before_exec(move || exec_hook2.store(true, Ordering::SeqCst))
+                    .with_carry(|| panic!("save blew up"), |_| Ok(()))
+            },
+            true,
+        )
+        .await;
+        h.replace();
+        let frame = h.call("ping", json!({"reload": true})).await;
+        assert_eq!(frame["result"]["isError"], true);
+        assert!(
+            Harness::text(&frame).contains("carry save hook panicked"),
+            "{frame}"
+        );
+        assert!(!exec_hook.load(Ordering::SeqCst), "nothing was replaced");
+        assert!(Harness::text(&h.call("ping", json!({})).await).starts_with("pong"));
+    }
+
+    #[tokio::test]
+    async fn carry_save_runs_once_and_before_before_exec() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = tempfile::tempdir().unwrap();
+        let script = bin_dir.path().join("server");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let (o1, o2) = (order.clone(), order.clone());
+        let argv = [script.clone()];
+        let mut h = boot_with(
+            move |sc| {
+                sc.with_reload(argv)
+                    .with_before_exec(move || o1.lock().unwrap().push("before_exec"))
+                    .with_carry(
+                        move || {
+                            o2.lock().unwrap().push("save");
+                            Some(json!({"k": 1}))
+                        },
+                        |_| Ok(()),
+                    )
+            },
+            true,
+        )
+        .await;
+        h.replace();
+        let _ = h.call("ping", json!({"reload": true})).await;
+        assert_eq!(*order.lock().unwrap(), vec!["save", "before_exec"]);
+    }
+
     #[test]
     fn exec_viability_requires_an_executable_regular_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -1358,6 +1473,7 @@ mod session_tests {
             workspace: None,
             instructions_known: false,
             instructions: None,
+            consumer: None,
         }
     }
 
@@ -1626,5 +1742,92 @@ mod session_tests {
         let note = drain_replay(&mut r).await;
         assert!(!note.contains("instructions changed"), "{note}");
         assert!(!note.contains("old instructions"), "{note}");
+    }
+    fn carrying_handover(value: Option<Value>) -> Handover {
+        let mut handover = sample_handover(vec![]);
+        handover.consumer = value;
+        handover
+    }
+
+    #[tokio::test]
+    async fn resume_calls_restore_once_with_the_carried_value_before_answering() {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen2 = seen.clone();
+        let (mut r, _run) = resume_with(
+            &carrying_handover(Some(json!({"graph": "/g.kgl"}))),
+            None,
+            move |o| {
+                let seen = seen2.clone();
+                let check = SelfCheck::new("demo", "/nonexistent/bin", "2.0.0")
+                    .with_reload(["/bin/true"])
+                    .with_carry(
+                        || None,
+                        move |v| {
+                            seen.lock().unwrap().push(v);
+                            Ok(())
+                        },
+                    );
+                o.with_self_check(check)
+            },
+        )
+        .await;
+        let text = drain_replay(&mut r).await;
+        assert!(text.starts_with("reloaded: 1.0.0 → 2.0.0"), "{text}");
+        assert!(!text.contains("restore failed"), "{text}");
+        assert_eq!(*seen.lock().unwrap(), vec![json!({"graph": "/g.kgl"})]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_panicking_restore_is_noted_and_the_server_keeps_serving() {
+        for panics in [false, true] {
+            let (mut r, _run) = resume_with(&carrying_handover(Some(json!(1))), None, move |o| {
+                let check = SelfCheck::new("demo", "/nonexistent/bin", "2.0.0")
+                    .with_reload(["/bin/true"])
+                    .with_carry(
+                        || None,
+                        move |_| {
+                            if panics {
+                                panic!("restore blew up")
+                            }
+                            Err("graph file is gone".to_string())
+                        },
+                    );
+                o.with_self_check(check)
+            })
+            .await;
+            let text = drain_replay(&mut r).await;
+            assert!(text.starts_with("reloaded: 1.0.0 → 2.0.0"), "{text}");
+            if panics {
+                assert!(text.contains("restore did not complete"), "{text}");
+            } else {
+                assert!(
+                    text.contains("consumer state restore failed: graph file is gone"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_is_not_called_without_a_carried_value() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let (mut r, _run) = resume_with(&carrying_handover(None), None, move |o| {
+            let c = c.clone();
+            let check = SelfCheck::new("demo", "/nonexistent/bin", "2.0.0")
+                .with_reload(["/bin/true"])
+                .with_carry(
+                    || None,
+                    move |_| {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+            o.with_self_check(check)
+        })
+        .await;
+        let text = drain_replay(&mut r).await;
+        assert!(!text.contains("restore"), "{text}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
