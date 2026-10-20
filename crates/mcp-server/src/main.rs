@@ -47,6 +47,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod self_update;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rmcp::transport::stdio;
@@ -100,6 +102,7 @@ enum Mode {
 #[derive(Parser, Debug)]
 #[command(
     name = "mcp-server",
+    version,
     about = "Rust-native MCP server framework — source navigation + GitHub + python tools",
     long_about = "\
 Boot a Model Context Protocol server over stdio. Generic by design: ships \
@@ -686,6 +689,9 @@ async fn main() -> Result<()> {
     let mut options = ServerOptions::from_manifest(manifest.as_ref(), fallback_name(&mode));
     if cli.name.is_some() {
         options.name = cli.name.clone();
+    }
+    if let Some(check) = self_update::self_check() {
+        options = options.with_self_check(check);
     }
 
     // Wire source roots / workspace: --source-root and --watch each pin
