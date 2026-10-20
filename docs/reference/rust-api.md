@@ -80,7 +80,7 @@ The most-imported types and functions, grouped:
 Disable with `default-features = false` for the bare primitives:
 
 ```toml
-mcp-methods = { version = "0.4", default-features = false }
+mcp-methods = { version = "0.5", default-features = false }
 ```
 
 ## See also

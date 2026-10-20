@@ -11,11 +11,11 @@ name = "greeter"
 path = "src/main.rs"
 
 [dependencies]
-# Depend on the published mcp-methods 0.4 with the `server` feature
+# Depend on the published mcp-methods 0.5 with the `server` feature
 # enabled — this is exactly the shape a downstream Rust binary would
 # use. `default-features = false` not needed because `server` is the
 # default; we list it explicitly for clarity.
-mcp-methods = { version = "0.4", features = ["server"] }
+mcp-methods = { version = "0.5", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io"] }

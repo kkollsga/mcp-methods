@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.5.0 — 2026-10-20
 
 ### Changed — `get_info` reports the consumer's running version when `SelfCheck` is set
 

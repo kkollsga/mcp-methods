@@ -1603,7 +1603,10 @@ mod session_tests {
             .await
             .unwrap()
             .unwrap();
-        let error = result.err().expect("boot fails").to_string();
+        let Err(error) = result else {
+            panic!("boot fails")
+        };
+        let error = error.to_string();
         assert!(error.contains("no session to resume"), "{error}");
     }
 

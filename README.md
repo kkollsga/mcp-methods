@@ -24,7 +24,7 @@ The wheel ships the `mcp-server` CLI on PATH alongside the library — `which mc
 
 ```toml
 [dependencies]
-mcp-methods = "0.4"
+mcp-methods = "0.5"
 ```
 
 ```rust

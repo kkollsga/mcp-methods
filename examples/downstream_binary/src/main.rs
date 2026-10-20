@@ -8,7 +8,7 @@
 //! 2. Build a [`ServerOptions`] (here defaulted via `from_manifest(None, ...)`).
 //! 3. Construct an [`McpServer`].
 //! 4. Register one or more custom tools via [`McpServer::register_typed_tool`].
-//! 5. Serve over stdio via rmcp.
+//! 5. Serve over stdio through the framework transport (`serve_with_handover`).
 //!
 //! Run with:
 //!     cargo run -p greeter -- --name "Greeter Server"
@@ -22,9 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::Parser;
+use mcp_methods::server::stdio::StdioTransport;
 use mcp_methods::server::{McpServer, ServerOptions};
-use rmcp::transport::stdio;
-use rmcp::ServiceExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -86,7 +85,7 @@ async fn main() -> Result<()> {
 
     eprintln!("greeter: serving 'greet' tool over stdio");
 
-    let service = server.serve(stdio()).await?;
+    let service = server.serve_with_handover(StdioTransport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
