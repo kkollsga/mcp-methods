@@ -1,4 +1,5 @@
-//! Binary-level proof of the stale-binary notice and `--version`.
+//! Binary-level proof of the stale-binary notice, `--version` and the
+//! in-place reload.
 //!
 //! The binary is copied into a tempdir and the *copy* is run, so the
 //! test can replace the file the process was started from the way an
@@ -7,6 +8,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mcp-server");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -16,7 +20,14 @@ struct Session {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
+    /// Lines read while waiting for a different id.
+    unread: Vec<String>,
+    done: Arc<AtomicBool>,
 }
+
+/// Longest any test may run before its server is killed, turning a hung
+/// read into an `EOF` failure.
+const HANG_BOUND: Duration = Duration::from_secs(90);
 
 impl Session {
     fn spawn(exe: &Path, cwd: &Path) -> Session {
@@ -31,32 +42,78 @@ impl Session {
             .expect("failed to spawn mcp-server copy");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        // Watchdog: a wedged server would block `read_line` forever; killing
+        // it closes the pipe so the test fails instead of hanging.
+        let done = Arc::new(AtomicBool::new(false));
+        let (watch, pid) = (done.clone(), child.id());
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !watch.load(Ordering::Acquire) {
+                if start.elapsed() > HANG_BOUND {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
         Session {
             child,
             stdin,
             stdout,
             next_id: 0,
+            unread: Vec::new(),
+            done,
+        }
+    }
+
+    /// Write requests without waiting; returns their ids.
+    fn send(&mut self, requests: &[(&str, &str)]) -> Vec<i64> {
+        let mut ids = Vec::new();
+        let mut payload = String::new();
+        for (method, params) in requests {
+            self.next_id += 1;
+            ids.push(self.next_id);
+            payload.push_str(&format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"{method}","params":{params}}}"#,
+                self.next_id
+            ));
+            payload.push('\n');
+        }
+        self.stdin.write_all(payload.as_bytes()).unwrap();
+        self.stdin.flush().unwrap();
+        ids
+    }
+
+    fn wait_for(&mut self, id: i64) -> String {
+        let needle = format!("\"id\":{id}");
+        if let Some(at) = self.unread.iter().position(|l| l.contains(&needle)) {
+            return self.unread.remove(at);
+        }
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "server exited before answering id {id}");
+            if line.contains(&needle) {
+                return line;
+            }
+            self.unread.push(line);
         }
     }
 
     fn request(&mut self, method: &str, params: &str) -> String {
-        self.next_id += 1;
-        let id = self.next_id;
-        writeln!(
-            self.stdin,
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
-        )
-        .unwrap();
-        self.stdin.flush().unwrap();
-        let needle = format!("\"id\":{id}");
-        loop {
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).unwrap();
-            assert!(n > 0, "server exited before answering {method}");
-            if line.contains(&needle) {
-                return line;
-            }
-        }
+        let id = self.send(&[(method, params)])[0];
+        self.wait_for(id)
+    }
+
+    fn alive(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+            && Command::new("kill")
+                .args(["-0", &self.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
     }
 
     fn initialize(&mut self) {
@@ -79,6 +136,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -132,5 +190,110 @@ fn replacing_the_binary_makes_later_results_carry_the_stale_notice() {
         )),
         "{tool}"
     );
-    assert!(tool.contains("restart the MCP client"), "{tool}");
+    // Reload is wired on unix; elsewhere the remedy is a client restart.
+    let remedy = if cfg!(unix) {
+        "call ping(reload=true) to load it"
+    } else {
+        "restart the MCP client to load it"
+    };
+    assert!(tool.contains(remedy), "{tool}");
+}
+
+#[cfg(unix)]
+fn stale_session(td: &Path) -> (Session, std::path::PathBuf) {
+    let exe = td.join("mcp-server-copy");
+    std::fs::copy(BIN, &exe).unwrap();
+    let mut session = Session::spawn(&exe, td);
+    session.initialize();
+    let fresh = td.join("mcp-server-new");
+    std::fs::copy(BIN, &fresh).unwrap();
+    std::fs::rename(&fresh, &exe).unwrap();
+    (session, exe)
+}
+
+const READ_MISSING: &str = r#"{"name":"read_source","arguments":{"file_path":"x"}}"#;
+
+#[cfg(unix)]
+#[test]
+fn ping_reload_replaces_the_process_in_place_and_resumes_the_session() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut session, _exe) = stale_session(td.path());
+    let pid = session.child.id();
+
+    let stale = session.request("tools/call", READ_MISSING);
+    assert!(
+        stale.contains("call ping(reload=true) to load it"),
+        "{stale}"
+    );
+
+    // The reload request and a second call arrive in one write.
+    let ids = session.send(&[
+        (
+            "tools/call",
+            r#"{"name":"ping","arguments":{"reload":true}}"#,
+        ),
+        ("tools/call", r#"{"name":"ping","arguments":{}}"#),
+    ]);
+    let reloaded = session.wait_for(ids[0]);
+    assert!(
+        reloaded.contains(&format!("reloaded: {VERSION} → {VERSION}")),
+        "{reloaded}"
+    );
+    assert!(reloaded.contains("retained response ids"), "{reloaded}");
+    assert!(!reloaded.contains("isError\":true"), "{reloaded}");
+    let pipelined = session.wait_for(ids[1]);
+    assert!(pipelined.contains("pong"), "{pipelined}");
+    assert!(
+        pipelined.contains(&format!("mcp-server {VERSION} (up to date)")),
+        "the new image watches the new file: {pipelined}"
+    );
+
+    // Same process, still the one child; the new image was never sent
+    // `initialize` yet answers tool calls.
+    assert_eq!(session.child.id(), pid);
+    assert!(session.alive());
+    let after = session.request("tools/call", READ_MISSING);
+    assert!(!after.contains("stale:"), "no longer stale: {after}");
+
+    // The new image can reload again once it is stale itself.
+    let exe = td.path().join("mcp-server-copy");
+    let fresh = td.path().join("mcp-server-newer");
+    std::fs::copy(BIN, &fresh).unwrap();
+    std::fs::rename(&fresh, &exe).unwrap();
+    let again = session.request(
+        "tools/call",
+        r#"{"name":"ping","arguments":{"reload":true}}"#,
+    );
+    assert!(again.contains("reloaded:"), "{again}");
+    assert!(session.alive());
+}
+
+#[cfg(unix)]
+#[test]
+fn ping_reload_is_refused_when_the_new_build_fails_its_selftest() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = tempfile::tempdir().unwrap();
+    let (mut session, exe) = stale_session(td.path());
+    // The installer delivered something that cannot start.
+    let broken = td.path().join("broken");
+    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&broken, &exe).unwrap();
+
+    let refused = session.request(
+        "tools/call",
+        r#"{"name":"ping","arguments":{"reload":true}}"#,
+    );
+    assert!(refused.contains("\"isError\":true"), "{refused}");
+    assert!(refused.contains("reload refused"), "{refused}");
+    assert!(refused.contains("selftest"), "{refused}");
+
+    // The old process is still serving.
+    assert!(session.alive());
+    let ping = session.request("tools/call", r#"{"name":"ping","arguments":{}}"#);
+    assert!(ping.contains("pong"), "{ping}");
+    assert!(
+        ping.contains(&format!("mcp-server {VERSION} (stale")),
+        "{ping}"
+    );
 }

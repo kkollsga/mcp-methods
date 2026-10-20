@@ -55,14 +55,30 @@ fn probe_installed_version(exe: &Path) -> Option<String> {
     parse_version_output(&out)
 }
 
+/// Reload selftest: the new build must run `--version` and report one.
+fn selftest(exe: &Path) -> Result<(), String> {
+    probe_installed_version(exe).map(|_| ()).ok_or_else(|| {
+        format!(
+            "`{} --version` did not exit 0 with a version within {}s",
+            exe.display(),
+            PROBE_TIMEOUT.as_secs()
+        )
+    })
+}
+
 /// The [`SelfCheck`] for this process, or `None` when the executable
-/// path cannot be determined.
+/// path cannot be determined. A reload re-executes the watched path with
+/// the arguments this process was started with.
 pub fn self_check() -> Option<SelfCheck> {
     let exe = normalize_exe_path(std::env::current_exe().ok()?);
     let probe_path = exe.clone();
+    let mut argv = vec![exe.clone().into_os_string()];
+    argv.extend(std::env::args_os().skip(1));
     Some(
         SelfCheck::new("mcp-server", exe, env!("CARGO_PKG_VERSION"))
-            .with_installed_version(move || probe_installed_version(&probe_path)),
+            .with_installed_version(move || probe_installed_version(&probe_path))
+            .with_reload(argv)
+            .with_selftest(selftest),
     )
 }
 
@@ -90,6 +106,15 @@ mod tests {
         );
         assert_eq!(parse_version_output("garbage\n"), None);
         assert_eq!(parse_version_output(""), None);
+    }
+
+    #[test]
+    fn selftest_rejects_a_missing_binary_and_names_it() {
+        let error = selftest(Path::new("/nonexistent/mcp-server")).unwrap_err();
+        assert!(
+            error.contains("/nonexistent/mcp-server --version"),
+            "{error}"
+        );
     }
 
     #[test]
