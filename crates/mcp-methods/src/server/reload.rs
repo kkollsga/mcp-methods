@@ -1539,7 +1539,7 @@ mod session_tests {
         let (mut carried, id) = carried_responses();
         let wire = serde_json::to_value(&carried).unwrap();
         let mut wire = wire;
-        wire["entries"][0]["remaining_ms"] = json!(400);
+        wire["entries"][0]["remaining_ms"] = json!(3_000);
         carried = serde_json::from_value(wire).unwrap();
         let mut handover = sample_handover(current_tools());
         handover.session.responses = carried;
@@ -1547,7 +1547,7 @@ mod session_tests {
         drain_replay(&mut r).await;
         let ok = expand(&mut r, 20, &id).await;
         assert!(ok.get("error").is_none(), "{ok}");
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
         let gone = expand(&mut r, 21, &id).await;
         assert!(gone.get("error").is_some(), "{gone}");
     }
