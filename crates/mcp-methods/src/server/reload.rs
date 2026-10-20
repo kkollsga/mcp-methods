@@ -61,6 +61,8 @@ impl Handover {
     }
 }
 
+// Only the unix reload path writes a handover; windows builds never call it.
+#[cfg_attr(not(unix), allow(dead_code))]
 /// Create the handover file, readable by the owner only.
 pub(crate) fn write_handover(handover: &Handover) -> std::io::Result<PathBuf> {
     use std::io::Write;

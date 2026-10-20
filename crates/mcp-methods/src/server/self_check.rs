@@ -31,6 +31,8 @@ pub(crate) type Selftest = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync
 pub(crate) struct ReloadConfig {
     pub(crate) argv: Vec<OsString>,
     pub(crate) can_reload: Option<CanReload>,
+    // Run only by the unix reload path; the builder stays cross-platform.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) before_exec: Option<BeforeExec>,
     pub(crate) selftest: Option<Selftest>,
 }

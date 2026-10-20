@@ -129,6 +129,8 @@ struct InState {
     eof: bool,
     /// Set while a reload owns the input: the pump must not read, so the
     /// bytes still in the OS buffer stay there for the next process.
+    // Only the unix reload path freezes the input; windows never sets it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     frozen: bool,
 }
 
@@ -139,6 +141,8 @@ struct InState {
 pub(crate) struct InputBuffer {
     state: StdMutex<InState>,
     ready: Notify,
+    // Awaited by the unix stdin pump only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     unfrozen: Notify,
     pump_active: AtomicBool,
     #[cfg(unix)]
@@ -210,6 +214,8 @@ impl InputBuffer {
         state.eof.then(|| std::mem::take(&mut state.buf))
     }
 
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Stop the pump from reading and return every undecoded byte, leaving
     /// the buffer intact so [`unfreeze`](Self::unfreeze) can resume.
     pub(crate) fn freeze_and_snapshot(&self) -> Vec<u8> {
@@ -218,6 +224,8 @@ impl InputBuffer {
         state.buf.clone()
     }
 
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Resume reading after a reload that did not replace the process.
     pub(crate) fn unfreeze(&self) {
         self.state().frozen = false;
@@ -264,6 +272,8 @@ impl InputBuffer {
         self.unfrozen.notified().await;
     }
 
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Restore the descriptor's original mode ahead of an `exec`.
     pub(crate) fn restore_blocking(&self) {
         #[cfg(unix)]
@@ -272,6 +282,8 @@ impl InputBuffer {
         }
     }
 
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     /// Re-enter nonblocking mode after an `exec` that failed.
     pub(crate) fn reapply_nonblocking(&self) {
         #[cfg(unix)]
@@ -336,6 +348,8 @@ impl Gate {
 /// returned guard lives.
 pub(crate) trait WriterHold: Send + Sync {
     /// Flush, then take the writer lock.
+    // Unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn hold(
         &self,
     ) -> futures::future::BoxFuture<'static, std::io::Result<Box<dyn std::any::Any + Send>>>;
@@ -369,6 +383,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WriterHold for SharedWriter<W> {
 pub(crate) struct TransportLink {
     pub(crate) input: Arc<InputBuffer>,
     pub(crate) gate: Arc<Gate>,
+    // Held by the unix reload path only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) writer: Arc<dyn WriterHold>,
 }
 
