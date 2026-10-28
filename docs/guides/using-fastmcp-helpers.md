@@ -101,7 +101,7 @@ output schemas allow that alternative. Full results preserve their original
 structured content and content blocks.
 
 The supported Python host is the official `mcp.server.fastmcp.FastMCP` from
-`mcp>=1.26,<2`. If using only application-defined tools, call
+`mcp>=1.30.0,<2`. If using only application-defined tools, call
 `install_response_budget(app)` once before serving. Helpers install it
 automatically; ordinary Python calls, prompts, resource responses, and independent
 downstream CLIs are outside this adapter's tool-response boundary. Install after

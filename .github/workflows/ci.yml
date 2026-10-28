@@ -10,7 +10,7 @@ jobs:
     name: Rust checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -56,7 +56,7 @@ jobs:
     name: Rust 1.88 MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
       # Cargo.lock is not committed, so resolve the way a 1.88 user's cargo
       # can: newest dependency versions whose rust-version still allows 1.88
@@ -70,15 +70,15 @@ jobs:
     name: Python checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # Pinned: an unpinned formatter turns every upstream ruff release into a
-      # red build on an unrelated commit. 0.16.0 formats Python inside Markdown
+      # red build on an unrelated commit. 0.16.0 and later format Python inside Markdown
       # code blocks, which 0.15.x did not — that shift broke CI here on a
       # commit that touched only pyproject.toml.
-      - run: pip install ruff==0.16.0
+      - run: pip install ruff==0.17.3
       - run: ruff format --check .
       - run: ruff check .
 
@@ -90,15 +90,15 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-cov requests mcp==1.26.0
+          pip install maturin pytest pytest-cov requests mcp==1.30.0
           maturin develop --release
           pytest tests/ -v
       - name: Test import
