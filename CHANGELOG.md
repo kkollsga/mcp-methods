@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 — 2026-10-28
 
 ### Breaking — Python 3.12 or later
 
