@@ -20,3 +20,9 @@ edition = "2021"
 rust-version = "1.88"
 authors = ["Kristian Kollsgard"]
 license = "MIT"
+
+# Dependency debug info: line-tables-only (kglite's measured recipe, 2026-08-31 compile-footprint
+# review: rlib -43%, debug tree ~-22%). Workspace crates keep full debug info; dependency
+# backtraces keep file/line.
+[profile.dev.package."*"]
+debug = "line-tables-only"
