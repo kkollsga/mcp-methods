@@ -4,6 +4,22 @@
 
 ## 0.6.1 (proposed)
 
+### Fixed — tool schemas no longer carry non-standard `format` values
+
+schemars labels Rust integers `uint`, `uint64`, `int64`, `uint8` and floats
+`double`. None is a JSON Schema format: Claude Code logged `unknown format
+"uint" ignored` for every session, and an Ajv client in strict mode rejects the
+schema. The affected inputs were `grep` (`context`, `max_results`),
+`list_source` (`depth`) and `read_source` (`end_line`, `grep_context`,
+`max_chars`, `max_matches`, `start_line`), plus any consumer-registered tool.
+
+`tools/list` (and the tool lookup behind call validation) now strips every
+`format` outside the JSON Schema 2020-12 vocabulary from both the input and
+output schema, whoever built it. `type: integer` stays, and unsigned types
+keep `minimum: 0`. A binary that builds its own schemas with schemars can apply
+the same cleanup: `mcp_methods::server::schema::StandardFormats` (a schemars
+`Transform`) or `schema::standardize(&mut Value)`.
+
 ### Fixed — a list change announced before a `subscriptions/listen` stream registered was lost
 
 A client on protocol 2026-07-28 sends `subscriptions/listen` and `tools/list`

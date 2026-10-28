@@ -326,10 +326,15 @@ where
     use std::pin::Pin;
     type DynFut<'a, R> = Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>>;
 
-    let schema_obj = serde_json::to_value(schemars::schema_for!(T))
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let schema_obj = serde_json::to_value(
+        schemars::generate::SchemaSettings::draft2020_12()
+            .with_transform(crate::server::schema::StandardFormats)
+            .into_generator()
+            .into_root_schema_for::<T>(),
+    )
+    .ok()
+    .and_then(|v| v.as_object().cloned())
+    .unwrap_or_default();
     let attr = rmcp::model::Tool::new(name, description, Arc::new(schema_obj));
     let handler = std::sync::Arc::new(handler);
     // Capture the result-postprocess plumbing: the dyn closure has
@@ -2872,6 +2877,25 @@ fn response_control_name(schema: &rmcp::model::JsonObject) -> String {
     name
 }
 
+/// Strip non-standard `format` values from both of a tool's schemas. The
+/// one place every listed tool passes through, whoever built its schema:
+/// the `#[tool]` macros, `register_typed_tool`, or a consumer's own route.
+fn standard_schema_formats(mut tool: Tool) -> Tool {
+    let mut input = serde_json::Value::Object((*tool.input_schema).clone());
+    crate::server::schema::standardize(&mut input);
+    if let serde_json::Value::Object(map) = input {
+        tool.input_schema = Arc::new(map);
+    }
+    if let Some(output) = tool.output_schema.take() {
+        let mut output = serde_json::Value::Object((*output).clone());
+        crate::server::schema::standardize(&mut output);
+        if let serde_json::Value::Object(map) = output {
+            tool.output_schema = Some(Arc::new(map));
+        }
+    }
+    tool
+}
+
 fn budgeted_tool(mut tool: Tool) -> Tool {
     let control = response_control_name(&tool.input_schema);
     let schema = Arc::make_mut(&mut tool.input_schema);
@@ -3256,6 +3280,7 @@ impl ServerHandler for McpServer {
             .list_all()
             .into_iter()
             .map(|tool| self.with_reload_arg(tool))
+            .map(standard_schema_formats)
             .map(|tool| {
                 if Some(tool.name.as_ref()) == loader {
                     tool
@@ -3301,7 +3326,9 @@ impl ServerHandler for McpServer {
         if name == self.response_expansion_name() {
             return Some(self.response_expansion_tool());
         }
-        let tool = self.with_reload_arg(self.tools_snapshot().get(name).cloned()?);
+        let tool = standard_schema_formats(
+            self.with_reload_arg(self.tools_snapshot().get(name).cloned()?),
+        );
         if Some(name) == self.framework_skill_loader() {
             return Some(tool);
         }

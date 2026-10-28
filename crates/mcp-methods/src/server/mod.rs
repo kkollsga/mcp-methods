@@ -45,6 +45,7 @@ pub mod manifest;
 mod reload;
 pub mod roots;
 pub mod runtime;
+pub mod schema;
 mod self_check;
 mod send_ledger;
 // `server` inside the `server` feature module — the inner module is
