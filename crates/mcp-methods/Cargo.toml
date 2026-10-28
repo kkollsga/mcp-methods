@@ -79,7 +79,7 @@ clap = { version = "4.6.7", features = ["derive"], optional = true }
 tracing = { version = "0.1.44", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 notify = { version = "8.2.1", optional = true }
-notify-debouncer-mini = { version = "0.6", optional = true }
+notify-debouncer-mini = { version = "0.7.0", optional = true }
 # Framing for the stdio transport (`server::stdio`): the same codec stack
 # rmcp's own async-rw transport uses.
 futures = { version = "0.3.34", optional = true }
