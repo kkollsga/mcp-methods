@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.6.2 (proposed)
+
+### Changed — every dependency at its latest release
+
+- Rust floors raised to the current release of each direct dependency, among
+  them `rmcp` 3.8.0 (was 3.5.0), `tokio` 1.54.1, `clap` 4.6.7, `schemars` 1.2.3,
+  `ignore` 0.4.34 and `ureq` 3.5.0. A consumer resolving to declared minimums
+  now gets these versions. `rmcp` 3.6 to 3.8 changed nothing this crate relies
+  on (its own transport and the stateless-client suite pass unchanged).
+- Major upgrades: `fancy-regex` 0.17 to 0.20, `notify-debouncer-mini` 0.6 to
+  0.7, `pyo3` 0.28 to 0.30. None needs a source change beyond dropping
+  `skip_from_py_object` from the `Skill` pyclass, which pyo3 0.30 made the
+  default.
+- Python: `maturin>=1.15`, `requests>=2.34.2`, `pytest>=9.2`, `ruff>=0.17.3`,
+  `mypy>=2.4`, `mcp>=1.30,<2`. `mcp` 2.x is not supported: it removed
+  `mcp.server.fastmcp`, which `mcp_methods.fastmcp` is written against.
+- The MSRV stays 1.88. A transitive crate (`uuid` 1.29, via `rmcp`) now needs
+  1.89; the MSRV job already resolves with the Rust-version-aware fallback.
+
 ## 0.6.1 (proposed)
 
 ### Fixed — tool schemas no longer carry non-standard `format` values
