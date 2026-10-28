@@ -876,7 +876,7 @@ fn write_skill_template(dest: PathBuf, name: &str, description: &str) -> PyResul
 /// shape so Python callers can pre-filter their registries before
 /// calling `register_skills_as_prompts`. `None` when the skill has
 /// no `applies_when:` block (always active).
-#[pyclass(name = "Skill", skip_from_py_object)]
+#[pyclass(name = "Skill")]
 #[derive(Clone)]
 struct PySkill {
     name: String,
