@@ -94,8 +94,13 @@ fn standardize_object(map: &mut Map<String, Value>) {
         }
     }
     // A property *named* "format" is an object value here, never a string,
-    // so recursing into every child cannot mistake it for the keyword.
-    map.values_mut().for_each(standardize);
+    // so recursing into it cannot mistake it for the keyword. Instance data
+    // is not a subschema: a `"format"` key inside it is a value.
+    for (keyword, value) in map.iter_mut() {
+        if !matches!(keyword.as_str(), "default" | "examples" | "const" | "enum") {
+            standardize(value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +136,30 @@ mod tests {
             schema["$defs"]["d"],
             json!({"type": "integer", "minimum": 0})
         );
+    }
+
+    #[test]
+    fn instance_data_keeps_its_format_keys() {
+        let mut schema = json!({
+            "type": "object",
+            "default": {"format": "csv"},
+            "examples": [{"format": "uint8"}],
+            "properties": {
+                "out": {
+                    "const": {"format": "csv"},
+                    "enum": [{"format": "uint64"}],
+                    "type": "integer",
+                    "format": "uint64"
+                }
+            }
+        });
+        standardize(&mut schema);
+        assert_eq!(schema["default"], json!({"format": "csv"}));
+        assert_eq!(schema["examples"], json!([{"format": "uint8"}]));
+        let out = &schema["properties"]["out"];
+        assert_eq!(out["const"], json!({"format": "csv"}));
+        assert_eq!(out["enum"], json!([{"format": "uint64"}]));
+        assert!(out.get("format").is_none());
+        assert_eq!(out["minimum"], 0);
     }
 }

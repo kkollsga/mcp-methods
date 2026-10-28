@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — schema cleanup no longer edits instance data
+
+`schema::standardize` and the `StandardFormats` transform also walked
+`default`, `examples`, `const` and `enum` values. Data such as
+`default: {"format": "csv"}` lost its `format` key, and a `uint…` value gained
+a stray `minimum`. Those keywords hold instance data, not subschemas, and are
+now left as written.
+
 ## 0.6.1 — 2026-10-28
 
 ### Breaking — `mcp_methods.fastmcp` requires `mcp` 2.x
