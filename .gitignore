@@ -38,7 +38,7 @@ venv/
 .DS_Store
 
 # Inbox — local coordination mail with kglite / mcp-servers. See the
-# "Mail interface" section in CLAUDE.md for the schema and counterparts.
+# "Mail interface" section in AGENTS.md for the schema and counterparts.
 inbox/
 
 # Local dev working folder — the backlog index (todos.md) and its plans/
@@ -48,7 +48,7 @@ inbox/
 # nothing committed may cite a path inside it as an instruction — a citation
 # outlives the file and silently becomes a dangling pointer. Its size/file
 # bound is `make check-dev-docs`, and the conventions it adopts or declines
-# belong in CLAUDE.md or the commit that decided them.
+# belong in AGENTS.md or the commit that decided them.
 #
 # NOT the same thing as the tracked, public `dev-documentation/` folder, which
 # holds durable design write-ups meant to be read by consumers of the crate.

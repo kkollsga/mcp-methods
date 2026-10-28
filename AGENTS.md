@@ -1,9 +1,10 @@
 # mcp-methods
 
-**Authority:** `CLAUDE.md` and `.claude/skills/` are the authority this repo's
-agent instructions are regenerated from; `AGENTS.md` and `.agents/skills/` are
-generated adapters. Edit the authority and regenerate in the same action —
-never edit an adapter.
+**Authority:** `AGENTS.md` is this repo's agent instructions; there is no
+`CLAUDE.md` (Claude Code loads `AGENTS.md` in its place). `.claude/skills/` is
+the skills authority and `.agents/skills/` its generated mirror. Edit the
+authority and regenerate the mirror in the same action — never edit the
+mirror.
 
 ## Doctrine adoption
 
@@ -79,9 +80,9 @@ re-fire manually once the registry is reachable.
    inherit it via `version.workspace = true`, so a release is a single
    edit.
    - The `mcp-server` → `mcp-methods` dependency is a minor-level req
-     (`mcp-methods = { version = "0.3", … }`), so patch bumps don't
-     touch it. Only bump that pin on a **minor/major** release (e.g.
-     `0.3` → `0.4`).
+     (`mcp-methods = { version = "0.5", … }` in
+     `crates/mcp-server/Cargo.toml`), so patch bumps don't touch it.
+     Only bump that pin on a **minor/major** release (e.g. `0.5` → `0.6`).
    - `mcp-methods-py` depends on `mcp-methods` by path only (no version
      req) — it's the wheel builder, never published standalone.
    - (`Cargo.lock` is gitignored — no need to touch it.)
@@ -92,7 +93,7 @@ re-fire manually once the registry is reachable.
    mcp-methods`, `cargo test -p mcp-methods --test deployed_manifests`,
    `cargo test -p mcp-server`, `pytest tests/`). All must pass.
 4. **Land on `main`** — merge the PR (or push `main`). The push fires
-   the publish workflows. Patch bumps (`0.3.X`) ship liberally for
+   the publish workflows. Patch bumps ship liberally for
    fixes and additive changes; see CONTRIBUTING's release-cadence
    table for when to go minor/major.
 5. **Confirm it landed** before announcing — poll the registries:
