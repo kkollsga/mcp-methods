@@ -27,7 +27,7 @@ PyO3 bindings crate. Builds the cdylib (`_mcp_methods.so`) that Python's `from m
 Why a separate crate? Two reasons:
 
 1. **The pure-Rust library stays clean.** Anyone reading `crates/mcp-methods/src/cache.rs` sees no `#[cfg_attr(feature = "python", pyfunction)]`, no `Py<PyAny>`, no `Python::attach`. Just Rust.
-2. **The cdylib has different constraints than the rlib.** It needs `crate-type = ["cdylib"]`, the `pyo3/extension-module` feature, and `abi3-py310` for the single-abi-wheel matrix. Keeping these in their own crate avoids polluting the library's Cargo.toml with concerns that have nothing to do with library consumers.
+2. **The cdylib has different constraints than the rlib.** It needs `crate-type = ["cdylib"]`, the `pyo3/extension-module` feature, and `abi3-py312` for the single-abi-wheel matrix. Keeping these in their own crate avoids polluting the library's Cargo.toml with concerns that have nothing to do with library consumers.
 
 This is the [polars](https://github.com/pola-rs/polars) / [pydantic-core](https://github.com/pydantic/pydantic-core) pattern.
 

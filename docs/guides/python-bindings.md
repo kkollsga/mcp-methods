@@ -8,7 +8,7 @@
 pip install mcp-methods
 ```
 
-One abi3 wheel per OS (macOS-arm64 / manylinux-x86_64 / win-amd64). Works on Python 3.10 through 3.13 without reinstall.
+One abi3 wheel per OS (macOS-arm64 / manylinux-x86_64 / win-amd64). Works on Python 3.12 and later without reinstall.
 
 ## What you get
 

@@ -18,7 +18,7 @@ pip install mcp-methods
 from mcp_methods import ElementCache, ripgrep, list_dir, github_discussions, read_file
 ```
 
-The wheel ships the `mcp-server` CLI on PATH alongside the library — `which mcp-server` should resolve immediately. Single abi3 wheel per OS; works on Python 3.10 through 3.13 without reinstall.
+The wheel ships the `mcp-server` CLI on PATH alongside the library — `which mcp-server` should resolve immediately. Single abi3 wheel per OS; works on Python 3.12 and later without reinstall.
 
 ### Rust library — `cargo add`
 

@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "mcp-methods"
 description = "Reusable utility methods for MCP servers"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 license-files = ["LICENSE"]
 authors = [
@@ -25,10 +25,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dynamic = ["version"]
@@ -65,7 +65,7 @@ mcp-server = "mcp_methods._cli:main"
 # which depends on the pure-Rust library and adds the PyO3 wrappers.
 # The cdylib lands at `mcp_methods/_mcp_methods.so` inside the wheel
 # (per `module-name`), the same path Python's `__init__.py` imports
-# from. Pyo3's `abi3-py310` feature collapses the per-Python-version
+# from. Pyo3's `abi3-py312` feature collapses the per-Python-version
 # wheel matrix to a single abi3 wheel per OS.
 manifest-path = "crates/mcp-methods-py/Cargo.toml"
 python-source = "python"
@@ -86,7 +86,7 @@ include = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP"]
@@ -96,7 +96,7 @@ ignore = ["E501"]
 "tests/*" = ["E402"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

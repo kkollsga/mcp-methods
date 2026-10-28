@@ -8,7 +8,7 @@
 //!
 //! Wheel build: see the workspace `pyproject.toml` which sets
 //! `manifest-path = "crates/mcp-methods-py/Cargo.toml"`. The
-//! `pyo3/abi3-py310` feature collapses the per-Python-version wheel
+//! `pyo3/abi3-py312` feature collapses the per-Python-version wheel
 //! matrix to a single abi3 wheel per OS.
 
 use std::path::PathBuf;

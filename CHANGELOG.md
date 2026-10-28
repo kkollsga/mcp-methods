@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking — Python 3.12 or later
+
+The wheel requires Python 3.12 or later (`requires-python >=3.12`), aligned
+with kglite. It is built as `cp312-abi3` and installs on 3.12 through 3.15; pip
+on 3.10 or 3.11 no longer finds a matching wheel and keeps the previous
+release. The Rust crates and the `mcp-server` binary are unaffected. CI tests
+3.12 to 3.15.
+
 ### Fixed — schema cleanup no longer edits instance data
 
 `schema::standardize` and the `StandardFormats` transform also walked
