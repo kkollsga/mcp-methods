@@ -11,7 +11,7 @@ pip install "mcp-methods[fastmcp]"
 ## The helpers
 
 ```python
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp_methods.fastmcp import (
     register_overview,  # graph_overview tool
     register_cypher_query,  # cypher_query tool with CSV export
@@ -20,7 +20,7 @@ from mcp_methods.fastmcp import (
     serve_csv_via_http,  # CORS-enabled HTTP server for CSV exports
 )
 
-app = FastMCP("My Server")
+app = MCPServer("My Server")
 
 register_overview(app, graph, overview_prefix="My custom guidance")
 register_cypher_query(app, graph, csv_dir="temp/")
@@ -28,7 +28,7 @@ register_source_tools(app, source_roots=["./source"])
 register_save_graph(app, graph)
 _server, base_url = serve_csv_via_http("temp/")  # optional
 
-app.run(transport="stdio")
+app.run("stdio")
 ```
 
 The helpers delegate source operations to Rust and graph operations to the supplied
@@ -100,12 +100,12 @@ The preview uses text for its evidence and a small
 output schemas allow that alternative. Full results preserve their original
 structured content and content blocks.
 
-The supported Python host is the official `mcp.server.fastmcp.FastMCP` from
-`mcp>=1.30.0,<2`. If using only application-defined tools, call
+The supported Python host is the official `mcp.server.mcpserver.MCPServer` from
+`mcp>=2.3.0`. `mcp` 1.x and its `mcp.server.fastmcp.FastMCP` are not supported. If using only application-defined tools, call
 `install_response_budget(app)` once before serving. Helpers install it
 automatically; ordinary Python calls, prompts, resource responses, and independent
-downstream CLIs are outside this adapter's tool-response boundary. Install after
-any code that replaces the host's low-level request handlers.
+downstream CLIs are outside this adapter's tool-response boundary. The adapter is server middleware, so it wraps whatever the app's
+middleware list holds at install time and runs inside middleware added later.
 
 For domain-aware guidance, a custom tool can return a `CallToolResult` carrying
 `_meta["mcp_methods/preview"]` with a summary, coverage, warnings and concrete
@@ -119,7 +119,7 @@ Tools own domain relevance; the generic fallback only describes structure.
 
 ## End-to-end example
 
-A runnable stub lives at [`python_tests/fastmcp_demo.py`](https://github.com/kkollsga/mcp-methods/blob/main/python_tests/fastmcp_demo.py) in the repo. It boots a FastMCP server with all five helpers wired up and a kglite-style graph backend.
+A runnable stub lives at [`python_tests/fastmcp_demo.py`](https://github.com/kkollsga/mcp-methods/blob/main/python_tests/fastmcp_demo.py) in the repo. It boots an `MCPServer` with all five helpers wired up and a kglite-style graph backend.
 
 ## When to use FastMCP vs the Rust binary
 

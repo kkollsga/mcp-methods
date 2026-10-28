@@ -105,14 +105,14 @@ A manifest with no `skills:` declaration boots identically to pre-0.3.35: no `pr
 Authoring is identical (same SKILL.md format, same `skills:` YAML field). Wiring is different — instead of relying on `mcp-server`, you compose at boot:
 
 ```python
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp_methods import SkillRegistry
 from mcp_methods.fastmcp import register_skills_as_prompts
 
-app = FastMCP("My Server")
+app = MCPServer("My Server")
 registry = SkillRegistry.from_manifest("./my_mcp.yaml")
 register_skills_as_prompts(app, registry)
-app.run(transport="stdio")
+app.run("stdio")
 ```
 
 `SkillRegistry.from_manifest` includes bundled framework defaults by default; pass `include_bundled=False` to skip them.

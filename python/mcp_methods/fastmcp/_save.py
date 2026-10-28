@@ -6,7 +6,7 @@ from ._response_budget import install_response_budget
 
 
 def register_save_graph(app, graph) -> None:
-    """Register a `save_graph(path)` tool on a FastMCP app.
+    """Register a `save_graph(path)` tool on a MCPServer app.
 
     `graph.save(path)` must exist on the supplied object.
     """

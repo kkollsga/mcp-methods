@@ -170,18 +170,18 @@ See [Using FastMCP Helpers](../guides/using-fastmcp-helpers.md) for `mcp_methods
 
 ### `register_skills_as_prompts(app, registry) -> int`
 
-Walks `registry`, registers each skill as a `@app.prompt(name, description)` on the FastMCP `app`, and returns the count of registered prompts. Empty registries are a safe no-op.
+Walks `registry`, registers each skill as a `@app.prompt(name, description)` on the `MCPServer` `app`, and returns the count of registered prompts. Empty registries are a safe no-op.
 
 ```python
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp_methods import SkillRegistry
 from mcp_methods.fastmcp import register_skills_as_prompts
 
-app = FastMCP("My Server")
+app = MCPServer("My Server")
 registry = SkillRegistry.from_manifest("./my_mcp.yaml")
 n = register_skills_as_prompts(app, registry)
 print(f"registered {n} skills")
-app.run(transport="stdio")
+app.run("stdio")
 ```
 
 ## See also

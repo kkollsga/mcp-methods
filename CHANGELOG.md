@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.6.3 (proposed)
+
+### Breaking — `mcp_methods.fastmcp` requires `mcp` 2.x
+
+Anyone building a Python server on `mcp` 1.x with
+`mcp.server.fastmcp.FastMCP` is affected. `mcp` 2.x removed that module, so
+the `fastmcp` extra now asks for `mcp>=2.3.0,<3` and the helpers no longer
+work on a `FastMCP` app.
+
+To move: install `mcp>=2.3.0`, replace
+`from mcp.server.fastmcp import FastMCP` with
+`from mcp.server.mcpserver import MCPServer`, build the app with
+`MCPServer("name")` and serve it with `app.run("stdio")`. The module name and
+every public name and signature are unchanged: `register_overview`,
+`register_cypher_query`, `register_source_tools`, `register_save_graph`,
+`register_skills_as_prompts`, `serve_csv_via_http` and
+`install_response_budget`.
+
+`install_response_budget` is now server middleware on the `MCPServer` app,
+where it was a patch of the SDK's private request handlers. Retained results
+belong to the client's connection: the handshake connection, or on 2026-07-28
+the stdio connection. A request that arrives alone (stateless HTTP) has no
+connection, so its expansion handles do not resolve across calls, as with the
+Rust `mcp-server`.
+
 ## 0.6.2 (proposed)
 
 ### Changed — every dependency at its latest release
@@ -16,8 +41,8 @@
   `skip_from_py_object` from the `Skill` pyclass, which pyo3 0.30 made the
   default.
 - Python: `maturin>=1.15`, `requests>=2.34.2`, `pytest>=9.2`, `ruff>=0.17.3`,
-  `mypy>=2.4`, `mcp>=1.30,<2`. `mcp` 2.x is not supported: it removed
-  `mcp.server.fastmcp`, which `mcp_methods.fastmcp` is written against.
+  `mypy>=2.4`, `mcp>=1.30,<2`. The `mcp` 2.x move is the next release
+  (0.6.3).
 - The MSRV stays 1.88. A transitive crate (`uuid` 1.29, via `rmcp`) now needs
   1.89; the MSRV job already resolves with the Rust-version-aware fallback.
 

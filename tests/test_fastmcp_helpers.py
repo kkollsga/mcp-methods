@@ -1,6 +1,6 @@
 """Tests for the mcp_methods.fastmcp helper submodule.
 
-We don't boot a real FastMCP server (that would pull in the `mcp` SDK
+We don't boot a real MCPServer server (that would pull in the `mcp` SDK
 plus async machinery just to assert tool registration). Instead each
 test uses a tiny `_FakeApp` that captures `@app.tool` invocations so we
 can introspect what was registered, then invokes the registered functions
@@ -24,7 +24,7 @@ from mcp_methods.fastmcp import (
 
 
 class _FakeApp:
-    """Captures FastMCP-style tool registrations.
+    """Captures MCPServer-style tool registrations.
 
     Each `@app.tool(description=...)` decorator stores the function in
     `self.tools[name]` and returns the function unchanged.
@@ -146,7 +146,7 @@ def test_register_cypher_query_text_mode():
 def test_register_cypher_query_text_mode_coerces_non_str():
     # kglite's cypher() returns a lazy ResultView (not a str) whose
     # __str__ renders the table. The tool is typed `-> str`, so it must
-    # coerce; without it, FastMCP output validation rejects the object.
+    # coerce; without it, MCPServer output validation rejects the object.
     class ResultViewLike:
         def __str__(self):
             return "rendered-table"

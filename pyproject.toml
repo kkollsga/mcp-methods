@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-fastmcp = ["mcp>=1.30.0,<2"]
+fastmcp = ["mcp>=2.3.0,<3"]
 dev = [
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",

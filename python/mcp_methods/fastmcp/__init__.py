@@ -1,28 +1,28 @@
-"""Composable FastMCP tool helpers.
+"""Composable MCPServer tool helpers (mcp 2.x).
 
-Built for users running a `FastMCP` server who want to register the same
+Built for users running a `MCPServer` who want to register the same
 tools the YAML-driven `mcp-server` binary ships, without rewriting them.
-Each helper takes a FastMCP `app` and the dependency it needs (a graph,
+Each helper takes a MCPServer `app` and the dependency it needs (a graph,
 a list of source roots, etc.) and registers one or more tools on the app.
 
 Typical use::
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp_methods.fastmcp import (
         register_overview, register_cypher_query, register_source_tools,
         register_save_graph, serve_csv_via_http,
     )
 
-    app = FastMCP("My Server")
+    app = MCPServer("My Server")
     register_overview(app, graph, overview_prefix="...")
     register_cypher_query(app, graph, csv_dir="temp/")
     register_source_tools(app, source_roots=["./source"])
     register_save_graph(app, graph)
-    app.run(transport="stdio")
+    app.run("stdio")
 
 All helpers are thin wrappers — the implementation work lives in the Rust
 `_mcp_methods` cdylib (for source tools) or in the user-supplied `graph`
-object (for graph tools). The helpers exist so each FastMCP author does
+object (for graph tools). The helpers exist so each MCPServer author does
 not re-implement parameter validation, default values, and tool-description
 strings; they mirror the corresponding YAML+CLI tool one-to-one so an
 agent can use familiar tool names across hosts. Registering a tool helper also

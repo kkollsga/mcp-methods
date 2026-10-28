@@ -1,4 +1,4 @@
-"""Source-tool registrations for FastMCP servers.
+"""Source-tool registrations for MCPServer servers.
 
 Each helper registers one MCP tool that mirrors the YAML+CLI surface:
 `read_source`, `grep`, `list_source`. The implementations are thin
@@ -22,7 +22,7 @@ from ._response_budget import install_response_budget
 
 
 def register_source_tools(app, *, source_roots: Sequence[str]) -> None:
-    """Register `read_source`, `grep`, `list_source` on a FastMCP app.
+    """Register `read_source`, `grep`, `list_source` on a MCPServer app.
 
     `source_roots` is a list of directories (absolute or relative —
     they're canonicalised at registration time). Path arguments passed

@@ -19,7 +19,7 @@ from ._response_budget import install_response_budget
 
 
 def register_cypher_query(app, graph, *, csv_dir: str | os.PathLike[str] = "temp/") -> None:
-    """Register a `cypher_query` tool on a FastMCP app."""
+    """Register a `cypher_query` tool on a MCPServer app."""
     csv_path = Path(csv_dir)
     csv_path.mkdir(parents=True, exist_ok=True)
 
@@ -51,6 +51,6 @@ def register_cypher_query(app, graph, *, csv_dir: str | os.PathLike[str] = "temp
         # Text mode: coerce to str. kglite's `cypher()` returns a lazy
         # `ResultView` (not a str); its `__str__` renders the result
         # table. Without this, the `-> str` tool hands a non-string to
-        # FastMCP's output validation and the call fails. Graph impls
+        # MCPServer's output validation and the call fails. Graph impls
         # that already return a str pass through unchanged.
         return str(graph.cypher(query))
