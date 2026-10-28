@@ -8,7 +8,8 @@
 `default`, `examples`, `const` and `enum` values. Data such as
 `default: {"format": "csv"}` lost its `format` key, and a `uint…` value gained
 a stray `minimum`. Those keywords hold instance data, not subschemas, and are
-now left as written.
+now left as written. A tool parameter that is itself called `default`, `enum`,
+`const` or `examples` is a subschema and is still cleaned.
 
 ## 0.6.1 — 2026-10-28
 

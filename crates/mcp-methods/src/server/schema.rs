@@ -97,8 +97,18 @@ fn standardize_object(map: &mut Map<String, Value>) {
     // so recursing into it cannot mistake it for the keyword. Instance data
     // is not a subschema: a `"format"` key inside it is a value.
     for (keyword, value) in map.iter_mut() {
-        if !matches!(keyword.as_str(), "default" | "examples" | "const" | "enum") {
-            standardize(value);
+        match keyword.as_str() {
+            "default" | "examples" | "const" | "enum" => {}
+            // Maps from an arbitrary name to a subschema: a property called
+            // `default` or `enum` is a schema, not instance data.
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                if let Value::Object(named) = value {
+                    named.values_mut().for_each(standardize);
+                } else {
+                    standardize(value);
+                }
+            }
+            _ => standardize(value),
         }
     }
 }
@@ -161,5 +171,24 @@ mod tests {
         assert_eq!(out["enum"], json!([{"format": "uint64"}]));
         assert!(out.get("format").is_none());
         assert_eq!(out["minimum"], 0);
+    }
+
+    #[test]
+    fn a_property_named_like_a_data_keyword_is_still_a_schema() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "default": {"type": "integer", "format": "uint64"},
+                "enum": {"type": "integer", "format": "uint32"}
+            }
+        });
+        standardize(&mut schema);
+        assert_eq!(
+            schema["properties"],
+            json!({
+                "default": {"type": "integer", "minimum": 0},
+                "enum": {"type": "integer", "minimum": 0}
+            })
+        );
     }
 }
