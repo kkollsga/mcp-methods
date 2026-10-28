@@ -1,10 +1,10 @@
 # mcp-methods
 
 **Authority:** `AGENTS.md` is this repo's agent instructions; there is no
-`CLAUDE.md` (Claude Code loads `AGENTS.md` in its place). `.claude/skills/` is
-the skills authority and `.agents/skills/` its generated mirror. Edit the
-authority and regenerate the mirror in the same action — never edit the
-mirror.
+`CLAUDE.md` (Claude Code loads `AGENTS.md` in its place). `.agents/skills/`
+holds the skills; `.claude/skills` is a symlink to it so Claude Code finds
+them. Both are workstation-local (gitignored); each machine creates its own
+link.
 
 ## Doctrine adoption
 
@@ -12,7 +12,7 @@ Follow `../doctrine/learn-from-us.md` → Doctrine sync procedure at planning or
 release entry. Compare numeric semantic-version tuples. A missing marker
 requires an adoption audit; planned or deferred work does not advance
 `dev-docs/.doctrine-synced`. Merge applicable corrections into the declared
-authority, preserve local improvements, regenerate adapters, and advance the
+authority, preserve local improvements, and advance the
 marker only through contiguous entries whose required actions are complete.
 Convention snapshots do not perform sync.
 
