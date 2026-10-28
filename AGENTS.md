@@ -80,9 +80,9 @@ re-fire manually once the registry is reachable.
    inherit it via `version.workspace = true`, so a release is a single
    edit.
    - The `mcp-server` → `mcp-methods` dependency is a minor-level req
-     (`mcp-methods = { version = "0.5", … }` in
+     (`mcp-methods = { version = "0.6", … }` in
      `crates/mcp-server/Cargo.toml`), so patch bumps don't touch it.
-     Only bump that pin on a **minor/major** release (e.g. `0.5` → `0.6`).
+     Only bump that pin on a **minor/major** release (e.g. `0.6` → `0.7`).
    - `mcp-methods-py` depends on `mcp-methods` by path only (no version
      req) — it's the wheel builder, never published standalone.
    - (`Cargo.lock` is gitignored — no need to touch it.)

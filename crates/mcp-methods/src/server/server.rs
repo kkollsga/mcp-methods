@@ -135,7 +135,7 @@ fn inside_no_rebuild_region() -> bool {
 ///
 /// - **From a `ResultPostprocessHook`**: the hook's only output is a
 ///   footer string and its [`ResultCtx`] carries no `Peer`, so a
-///   rebuild there cannot send `notifications/tools/list_changed` and
+///   rebuild there cannot announce the change to any client and
 ///   cannot report its own failure. The surface would change while
 ///   every connected client kept serving its cached `tools/list`. The
 ///   footer for *this* call was also computed before the handler ran,
@@ -147,11 +147,11 @@ fn inside_no_rebuild_region() -> bool {
 fn reject_rebuild_reentry(who: &str) -> String {
     format!(
         "{who} was called from inside a result-postprocess hook or a skill-resolution \
-         pass, and is refused there. Neither has a peer to send \
-         notifications/tools/list_changed through, so the rebuilt surface would be \
+         pass, and is refused there. Neither has a peer to announce \
+         the change through, so the rebuilt surface would be \
          invisible to every connected client; a rebuild nested inside the resolution \
          pass is additionally overwritten by the pass containing it. Return first, \
-         then drive {who} from the tool handler and notify the peer."
+         then drive {who} from the tool handler and announce the change."
     )
 }
 
@@ -840,14 +840,57 @@ pub struct ScreenStargazersArgs {
 pub type ResponsePreviewHook =
     Arc<dyn Fn(&str, &serde_json::Value, &serde_json::Value) -> serde_json::Value + Send + Sync>;
 
-// Hold the negotiated-info Arc with retained results so an allocator cannot
-// reuse a disconnected peer's address to grant another session access.
+// A session is a connection's peer info: the `initialize` params of a
+// handshake client, or the params [`session_info`] built from a
+// handshake-less client's first request. Held with retained results so an
+// allocator cannot reuse a disconnected peer's address to grant another
+// session access.
 #[derive(Clone)]
 struct ResponseSession(Arc<InitializeRequestParams>);
 impl PartialEq for ResponseSession {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+}
+
+/// Serialises [`session_info`]'s check-then-set so two requests racing on
+/// a fresh connection cannot each install their own identity.
+static SESSION_INIT: Mutex<()> = Mutex::new(());
+
+/// The identity of the session `context` belongs to.
+///
+/// A client that opened with `initialize` has one already. A 2026-07-28
+/// client has no handshake, so the first request that needs an identity
+/// installs one built from that request's `_meta`, and every later
+/// request on the same connection finds it. One connection is one
+/// session, which on stdio is the one client the process serves. A
+/// transport that serves each handshake-less request on a fresh peer
+/// (stateless Streamable HTTP) gets a fresh session per request: nothing
+/// connects its calls.
+///
+/// `None` only when the peer has neither a handshake nor a protocol
+/// version in the request, which no conforming client sends.
+fn session_info(
+    context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> Option<Arc<InitializeRequestParams>> {
+    let peer = &context.peer;
+    if let Some(info) = peer.peer_info() {
+        return Some(info);
+    }
+    let version = context.protocol_version()?;
+    let _install = SESSION_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if peer.peer_info().is_none() {
+        peer.set_peer_info(
+            InitializeRequestParams::new(
+                context.client_capabilities().unwrap_or_default(),
+                context
+                    .client_info()
+                    .unwrap_or_else(|| Implementation::new("unknown", "0")),
+            )
+            .with_protocol_version(version),
+        );
+    }
+    peer.peer_info()
 }
 
 tokio::task_local! {
@@ -1147,12 +1190,15 @@ pub struct McpServer {
     loaded_skills: Arc<Mutex<LoadedSkills>>,
     /// Session state carried over an in-place reload, waiting for the
     /// resumed session's first tool call. The session's identity (the
-    /// negotiated-info `Arc`) only exists once rmcp serves it, so the
+    /// peer-info `Arc`) only exists once rmcp serves it, so the
     /// state is parked here and attached to whichever session calls first.
     carried: Arc<Mutex<Option<crate::server::reload::CarriedSession>>>,
     /// Opt-in record of what this server sent; `None` (the default)
     /// means every hook is a no-op that serializes nothing.
     send_ledger: Option<Arc<crate::server::send_ledger::SendLedger>>,
+    /// Open `subscriptions/listen` streams, shared by every clone: the
+    /// only way a 2026-07-28 client hears that a list changed.
+    subscriptions: Arc<crate::server::subscriptions::Subscriptions>,
 }
 
 #[tool_router]
@@ -1174,11 +1220,16 @@ impl McpServer {
             loaded_skills: Arc::new(Mutex::new(LoadedSkills::default())),
             carried: Arc::new(Mutex::new(None)),
             send_ledger: crate::server::send_ledger::SendLedger::from_env().map(Arc::new),
+            subscriptions: Arc::default(),
         };
         server.register_github_tools_if_authorized();
         server.register_local_workspace_tools();
         server.gate_workspace_tools();
         server
+    }
+
+    pub(crate) fn subscriptions(&self) -> &Arc<crate::server::subscriptions::Subscriptions> {
+        &self.subscriptions
     }
 
     /// The tool router as it stands right now, as a cheap snapshot.
@@ -2198,20 +2249,20 @@ impl McpServer {
     /// index, then runs the same resolution [`serve_prompts`] runs and
     /// publishes the result. Returns the new active set.
     ///
-    /// **The caller must notify the peer.** Nothing here stores peers,
-    /// so `tools/list` and `prompts/list` change under clients that
-    /// will keep serving their cached copies until they are told
-    /// otherwise. The sequence, from inside a tool handler that holds a
-    /// `RequestContext`:
+    /// **The caller must announce the change.** `tools/list` and
+    /// `prompts/list` change under clients that will keep serving their
+    /// cached copies until they are told otherwise. The sequence, from
+    /// inside a tool handler that holds a `RequestContext`:
     ///
     /// ```ignore
     /// let registry = rebuild_my_registry()?;          // domain-side
     /// let active = reloader.reinject_skills(&registry)?;
-    /// notify_skills_changed(&context.peer).await?;    // one call for both lists
+    /// server.announce_list_changed(&context.peer, ListChange::BOTH).await?;
     /// ```
     ///
-    /// [`notify_skills_changed`] is the helper; it is two rmcp calls
-    /// and you can make them yourself.
+    /// [`McpServer::announce_list_changed`] reaches handshake clients
+    /// directly and 2026-07-28 clients through their open
+    /// `subscriptions/listen` streams.
     ///
     /// **Session loaded-set rule.** A skill an agent already fetched
     /// with `skill(name)` stays fetched across a rebuild when its body
@@ -2318,25 +2369,6 @@ impl SkillReloader {
     pub fn is_live(&self) -> bool {
         self.skills.strong_count() > 0
     }
-}
-
-/// Tell a connected client that both the tool list and the prompt list
-/// have changed, in that order.
-///
-/// The counterpart to [`McpServer::reinject_skills`], which changes the
-/// two lists but stores no peers. A handler that holds a
-/// `RequestContext` has the peer:
-/// `notify_skills_changed(&context.peer).await`. Sending the tool
-/// notification first is deliberate — the tool plane is the one every
-/// real client exposes to the model.
-///
-/// Returns on the first failure; a client that never advertised
-/// interest in either list still accepts both notifications.
-pub async fn notify_skills_changed(
-    peer: &rmcp::service::Peer<rmcp::RoleServer>,
-) -> Result<(), rmcp::service::ServiceError> {
-    peer.notify_tool_list_changed().await?;
-    peer.notify_prompt_list_changed().await
 }
 
 /// Remove every `<!-- mcp-skill:… -->` block the injection pass
@@ -3016,12 +3048,12 @@ impl ServerHandler for McpServer {
             .flatten();
         let expansion_tool = self.response_expansion_name();
         let legacy = crate::server::send_ledger::is_legacy(context.protocol_version());
-        let owner = ResponseSession(
-            context
-                .peer
-                .peer_info()
-                .ok_or_else(|| McpError::invalid_request("initialize is required", None))?,
-        );
+        let owner = ResponseSession(session_info(&context).ok_or_else(|| {
+            McpError::invalid_request(
+                "no initialize handshake and no protocolVersion in the request _meta",
+                None,
+            )
+        })?);
         self.adopt_carried(&owner);
         if reload_request {
             if let Some(check) = self
@@ -3255,10 +3287,7 @@ impl ServerHandler for McpServer {
                     })
                 })
                 .collect();
-            let session = context
-                .peer
-                .peer_info()
-                .map(|i| format!("{:x}", Arc::as_ptr(&i) as usize));
+            let session = session_info(&context).map(|i| format!("{:x}", Arc::as_ptr(&i) as usize));
             ledger.record(
                 "tools/list",
                 session,
@@ -3317,7 +3346,7 @@ impl ServerHandler for McpServer {
                     .as_ref()
                     .map_or(env!("CARGO_PKG_VERSION"), |c| c.running_version()),
             ))
-            .with_protocol_version(ProtocolVersion::V_2024_11_05);
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
         if let Some(text) = &self.options.instructions {
             info = info.with_instructions(text.clone());
         }
@@ -3363,6 +3392,30 @@ impl ServerHandler for McpServer {
         context: rmcp::service::NotificationContext<rmcp::RoleServer>,
     ) {
         crate::server::roots::on_client_roots_changed(&self.options, &context.peer).await;
+    }
+
+    /// Grants `subscriptions/listen` for the two list-changed categories
+    /// this server announces. Without this rmcp answers the request with
+    /// method-not-found.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(crate::server::subscriptions::accepted_filter())
+    }
+
+    /// Hold one `subscriptions/listen` stream open, registered so
+    /// [`McpServer::announce_list_changed`] can reach it, until the client
+    /// cancels it.
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        let raw = context
+            .request_context()
+            .extensions
+            .get::<crate::server::stdio::RawJsonRpcRequest>()
+            .map(|raw| raw.source.clone());
+        let _registered = self.subscriptions.register(context.sink().clone(), raw);
+        context.cancelled().await;
+        Ok(())
     }
 
     async fn list_prompts(

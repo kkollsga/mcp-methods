@@ -44,7 +44,7 @@ The most-imported types and functions, grouped:
 - [`mcp_methods::server::McpServer::active_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.active_skills) — the same list, readable from a tool handler at request time. Returns an owned `Vec<ActiveSkill>`.
 - [`mcp_methods::server::McpServer::reinject_skills`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.reinject_skills) — re-resolve a registry **after** the server is serving: strip the previous injection, replace the skill prompt routes, re-register the loader, inject again. Takes `&self`, returns `Result<Vec<ActiveSkill>, String>`. See [Rebuilding skills at runtime](../guides/authoring-skills.md#rebuilding-skills-at-runtime).
 - [`mcp_methods::server::McpServer::skill_reloader`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.skill_reloader) / [`SkillReloader`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.SkillReloader.html) — a cloneable handle a dynamic tool handler captures before `serve`, so a `Fn(T) -> Result<String, String>` closure with no `&self` can drive the rebuild
-- [`mcp_methods::server::notify_skills_changed`](https://docs.rs/mcp-methods/latest/mcp_methods/server/fn.notify_skills_changed.html) — `notifications/tools/list_changed` then `notifications/prompts/list_changed` on a `Peer`. The framework stores no peers; the caller owns the notification.
+- [`mcp_methods::server::McpServer::announce_list_changed`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.McpServer.html#method.announce_list_changed) / [`ListChange`](https://docs.rs/mcp-methods/latest/mcp_methods/server/struct.ListChange.html) — announce that the tool list, the prompt list or both changed: a direct notification to an `initialize` peer, a tagged notification on every open `subscriptions/listen` stream for 2026-07-28 clients.
 - [`mcp_methods::server::Delivery`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/enum.Delivery.html) — `Eager` | `Lazy`, the frontmatter `delivery:` key. **Absent means `Lazy`.**
 - [`mcp_methods::server::SKILL_TOOL_NAME`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/constant.SKILL_TOOL_NAME.html) / [`SkillArgs`](https://docs.rs/mcp-methods/latest/mcp_methods/server/server/struct.SkillArgs.html) — the `skill(name)` loader tool registered by `serve_prompts`: one required string argument `name`, returns that skill's body, `isError: true` naming the active set for an unknown or inactive name. The framework-owned loader is **exempt from the default response budget** — a body is capped at `HARD_SIZE_LIMIT_BYTES` (16 KB) when it loads, so the exemption is bounded and the body is never returned as a preview excerpt. A downstream tool that took the `skill` name is not the framework loader and stays budgeted.
 - [`ResolvedRegistry::total_body_bytes`](https://docs.rs/mcp-methods/latest/mcp_methods/server/skills/struct.ResolvedRegistry.html#method.total_body_bytes) — the sum checked against `SESSION_TOTAL_LIMIT_BYTES`, counted over both delivery tiers
@@ -80,7 +80,7 @@ The most-imported types and functions, grouped:
 Disable with `default-features = false` for the bare primitives:
 
 ```toml
-mcp-methods = { version = "0.5", default-features = false }
+mcp-methods = { version = "0.6", default-features = false }
 ```
 
 ## See also

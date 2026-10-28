@@ -31,7 +31,7 @@ name = "my-mcp-server"
 path = "src/main.rs"
 
 [dependencies]
-mcp-methods = { version = "0.5", features = ["server"] }
+mcp-methods = { version = "0.6", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io"] }

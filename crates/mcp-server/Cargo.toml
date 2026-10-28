@@ -22,10 +22,10 @@ name = "mcp-server"
 path = "src/main.rs"
 
 [dependencies]
-mcp-methods = { version = "0.5", path = "../mcp-methods", features = ["server"] }
+mcp-methods = { version = "0.6", path = "../mcp-methods", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

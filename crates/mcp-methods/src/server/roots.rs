@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::service::Peer;
-use rmcp::{model::ProtocolVersion, RoleServer};
+use rmcp::RoleServer;
 
 use crate::server::server::ServerOptions;
 use crate::server::workspace::{RootOwnership, Workspace};
@@ -127,12 +127,13 @@ fn adoption_candidate(options: &ServerOptions) -> Option<&Workspace> {
     ws.adopts_client_roots().then_some(ws)
 }
 
-/// `roots` was removed from the 2026-07-28 protocol revision. A client that
-/// accidentally carries its old capability forward must not make this server
-/// emit a method the negotiated revision no longer defines.
+/// 2026-07-28 removed server-to-client requests, `roots/list` among them,
+/// together with the `initialize` handshake. A client that carries its old
+/// capability forward must not make this server emit a method the
+/// negotiated revision no longer defines.
 fn negotiated_protocol_supports_roots(peer: &Peer<RoleServer>) -> bool {
     peer.peer_info()
-        .is_some_and(|info| info.protocol_version != ProtocolVersion::V_2026_07_28)
+        .is_some_and(|info| info.protocol_version.has_initialize())
 }
 
 /// Does the client advertise the `roots` capability at all? When it does

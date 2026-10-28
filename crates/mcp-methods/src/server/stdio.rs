@@ -349,8 +349,17 @@ impl Outstanding {
 
     /// Track a decoded inbound message: a request becomes outstanding, and a
     /// cancellation retires its request (rmcp need not answer a cancelled one).
+    ///
+    /// A `subscriptions/listen` request is never outstanding: it stays open
+    /// by design until cancelled, so counting it would make a reload wait
+    /// for an answer that is not coming.
     fn observe_inbound(&self, message: &RxJsonRpcMessage<RoleServer>) {
         match message {
+            JsonRpcMessage::Request(request)
+                if matches!(
+                    request.request,
+                    rmcp::model::ClientRequest::SubscriptionsListenRequest(_)
+                ) => {}
             JsonRpcMessage::Request(request) => self.begin(request.id.clone()),
             JsonRpcMessage::Notification(notification) => {
                 if let ClientNotification::CancelledNotification(cancelled) =

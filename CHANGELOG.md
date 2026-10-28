@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.6.0 — 2026-10-28
+
+### Breaking — `notify_skills_changed` is removed
+
+It sent directly to the peer, which a 2026-07-28 client never receives.
+Replace `notify_skills_changed(&context.peer)` with
+`server.announce_list_changed(&context.peer, ListChange::BOTH)`, and any
+direct `peer.notify_tool_list_changed()` with
+`announce_list_changed(&peer, ListChange::TOOLS)`. Dependents that require
+`mcp-methods = "0.5"` keep resolving 0.5.x and are unaffected until they move
+to 0.6.
+
+### Fixed — clients on protocol 2026-07-28 (no `initialize`) can use every tool
+
+A 2026-07-28 client opens with `server/discover` and never sends `initialize`.
+Every `tools/call` from such a client failed with `-32600 "initialize is
+required"`, because the response store, loaded-skill memory and send ledger
+key on the connection's peer info, which only `initialize` set.
+
+The first request that needs a session now installs peer info built from its
+`_meta` (version, `clientInfo`, `clientCapabilities`); the rest of the
+connection reuses it. One connection is one session, which on stdio is the
+single client the process serves: `expand_response` handles and loaded skills
+work across calls, and another connection cannot read them. A transport that
+serves every handshake-less request on a fresh peer (stateless Streamable
+HTTP) still gets a session per request.
+
+### Added — `subscriptions/listen` and `McpServer::announce_list_changed`
+
+2026-07-28 delivers `notifications/tools/list_changed` and
+`notifications/prompts/list_changed` only on an open `subscriptions/listen`
+request, tagged with `io.modelcontextprotocol/subscriptionId`. The server now
+accepts `toolsListChanged` and `promptsListChanged` and holds the stream until
+the client cancels it.
+
+`McpServer::announce_list_changed(&peer, ListChange::{TOOLS, PROMPTS, BOTH})`
+is the one call that announces a change to every kind of client: a direct
+notification to a peer that completed `initialize`, a tagged notification on
+every open listen stream for 2026-07-28 clients.
+
+### Fixed — in-place reload for handshake-less sessions
+
+`ping(reload=true)` now carries a 2026-07-28 session's peer info and its open
+listen streams in the handover. The new process re-opens each stream by
+replaying its `subscriptions/listen` request line (the client sees a second
+acknowledgement for the same subscription id) and announces a changed tool set
+on it. An open listen stream no longer counts as an in-flight request, which
+made every reload from such a session refuse with "other requests are still in
+flight". Handover files from older builds still load.
+
+### Changed
+
+- An `initialize` that names a revision without a handshake (2026-07-28) is
+  answered with 2025-11-25, the newest revision that has one, not 2024-11-05.
+  A client requesting a handshake revision the server supports is still
+  answered with that revision.
+- `roots/list` adoption is disabled by `ProtocolVersion::has_initialize()`
+  instead of equality with 2026-07-28, so later revisions behave the same.
+- Minimum `rmcp` is 3.5.0.
+
 ## 0.5.1 — 2026-10-20
 
 ### Security — HTTP client moved to ureq 3 (RUSTSEC-2026-0381)

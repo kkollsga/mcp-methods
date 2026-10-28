@@ -57,6 +57,7 @@ pub mod source;
 #[cfg(unix)]
 mod stdin_pump;
 pub mod stdio;
+mod subscriptions;
 pub mod watch;
 pub mod workspace;
 
@@ -74,9 +75,9 @@ pub use runtime::{
 };
 pub use self_check::SelfCheck;
 pub use server::{
-    notify_skills_changed, serve_prompts, ActiveSkill, McpServer, PromptRouterMut, RepoProvider,
-    ResponsePreviewHook, ResultCtx, ResultPostprocessHook, ServerOptions, SkillArgs, SkillReloader,
-    ToolRouterMut, SKILL_TOOL_NAME,
+    serve_prompts, ActiveSkill, McpServer, PromptRouterMut, RepoProvider, ResponsePreviewHook,
+    ResultCtx, ResultPostprocessHook, ServerOptions, SkillArgs, SkillReloader, ToolRouterMut,
+    SKILL_TOOL_NAME,
 };
 pub use skills::{
     library_bundled_skills, render_skill_template, write_skill_template, AppliesWhen, BundledSkill,
@@ -85,6 +86,7 @@ pub use skills::{
     SkillFrontmatter, SkillPredicateEvaluator, SkillProvenance,
 };
 pub use source::SourceRootsProvider;
+pub use subscriptions::ListChange;
 pub use watch::{watch as watch_dir, ChangeHandler, WatchHandle};
 pub use workspace::{
     ActivationBuild, ActivationId, ActivationRequest, ActivationSummaryHook,

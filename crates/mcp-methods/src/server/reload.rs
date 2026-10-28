@@ -2,14 +2,18 @@
 //! with the newly installed build and continues the same MCP session.
 //!
 //! Handover by replay. The old process takes the writer lock, freezes the
-//! stdin pump, and writes a private file holding the client's `initialize`
-//! peer info, the exact `ping(reload=true)` request line, every stdin byte it
-//! had read but not decoded, the tool names and its version. It then
+//! stdin pump, and writes a private file holding the session's peer info
+//! (the client's `initialize` params, or for a 2026-07-28 client the params
+//! built from its request `_meta`), the exact `subscriptions/listen` lines
+//! still open, the exact `ping(reload=true)` request line, every stdin byte
+//! it had read but not decoded, the tool names and its version. It then
 //! `exec`s the configured argv with `MCP_METHODS_RELOAD_HANDOVER` pointing at that file
 //! (same PID, same stdio). The new process, entered through
 //! [`McpServer::serve_with_handover`], reads and deletes the file, serves
 //! with the recorded peer info instead of a handshake, and feeds the replay
-//! bytes ahead of live stdin, so the replayed ping is answered with
+//! bytes ahead of live stdin, so each listen stream is re-opened (the client
+//! sees a second acknowledgement for the same subscription id) and the
+//! replayed ping is answered with
 //! `reloaded: <old> → <new>` and any request pipelined behind it is
 //! answered normally.
 //!
@@ -46,8 +50,12 @@ pub(crate) const HANDOVER_ENV: &str = "MCP_METHODS_RELOAD_HANDOVER";
 /// What the old process leaves for the new one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Handover {
-    /// The client's `initialize` parameters (an `InitializeRequestParams`).
+    /// The session's peer info (an `InitializeRequestParams`).
     pub(crate) peer_info: serde_json::Value,
+    /// `subscriptions/listen` request lines open at reload time, replayed
+    /// ahead of `replay_line`. Empty for a handshake client.
+    #[serde(default)]
+    pub(crate) subscriptions: Vec<String>,
     /// The `ping(reload=true)` request line exactly as received.
     pub(crate) replay_line: String,
     /// Input bytes the old process had read but not decoded.
@@ -188,6 +196,10 @@ impl Handover {
     /// front of live stdin.
     pub(crate) fn replay_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.replay_line.len() + 1 + self.pending.len());
+        for line in &self.subscriptions {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
         bytes.extend_from_slice(self.replay_line.as_bytes());
         bytes.push(b'\n');
         bytes.extend_from_slice(&self.pending);
@@ -398,21 +410,18 @@ pub(crate) async fn reload_ping(
     let Some(raw) = context.extensions.get::<RawJsonRpcRequest>() else {
         return refused("the request text is unavailable");
     };
-    let Some(peer_info) = context
-        .peer
-        .peer_info()
-        .and_then(|info| serde_json::to_value(&*info).ok())
-    else {
-        return refused("the session's initialize parameters are unavailable");
-    };
     let Some(peer_arc) = context.peer.peer_info() else {
-        return refused("the session's initialize parameters are unavailable");
+        return refused("the session's client parameters are unavailable");
+    };
+    let Ok(peer_info) = serde_json::to_value(&*peer_arc) else {
+        return refused("the session's client parameters are unavailable");
     };
     let replay_line = raw.source.to_string();
     let carried = Carried {
         session: server.carry_session(peer_arc),
         workspace: carry_workspace(server.options()),
         instructions: server.options().instructions.clone(),
+        subscriptions: server.subscriptions().raw_lines(),
     };
     perform(
         check,
@@ -432,6 +441,7 @@ struct Carried {
     session: CarriedSession,
     workspace: Option<CarriedWorkspace>,
     instructions: Option<String>,
+    subscriptions: Vec<String>,
 }
 
 /// Longest a reload waits for earlier requests' answers to be written.
@@ -480,6 +490,7 @@ async fn perform(
     };
     let handover = Handover {
         peer_info,
+        subscriptions: carried.subscriptions,
         replay_line,
         pending,
         tools,
@@ -673,10 +684,14 @@ impl McpServer {
         let server = self;
         let peer = service.peer().clone();
         let old_tools = handover.tools;
+        let reopened = handover.subscriptions.len();
         tokio::spawn(async move {
             crate::server::roots::on_client_initialized(server.options(), &peer).await;
             if server.tool_names() != old_tools {
-                let _ = peer.notify_tool_list_changed().await;
+                server.await_subscriptions(reopened).await;
+                let _ = server
+                    .announce_list_changed(&peer, crate::server::ListChange::TOOLS)
+                    .await;
             }
         });
         Ok(service)
@@ -692,6 +707,7 @@ mod tests {
     fn handover_round_trips_including_non_utf8_pending_bytes() {
         let handover = Handover {
             peer_info: serde_json::json!({"protocolVersion":"2024-11-05"}),
+            subscriptions: vec![],
             replay_line: r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#.into(),
             pending: vec![b'{', 0xFF, b'\n', 0, 200],
             tools: vec!["grep".into(), "ping".into()],
@@ -737,6 +753,7 @@ mod tests {
         let handover = read_handover(&path).unwrap();
         assert_eq!(handover.session, CarriedSession::default());
         assert!(handover.workspace.is_none());
+        assert!(handover.subscriptions.is_empty());
         assert!(!handover.instructions_known);
         assert!(handover.consumer.is_none());
         assert_eq!(instructions_note(&handover, Some("anything")), None);
@@ -746,6 +763,7 @@ mod tests {
     fn instructions_note_reports_a_change_with_the_new_text_and_is_silent_otherwise() {
         let mut handover = Handover {
             peer_info: json!({}),
+            subscriptions: vec![],
             replay_line: String::new(),
             pending: vec![],
             tools: vec![],
@@ -949,6 +967,16 @@ mod session_tests {
     }
 
     async fn boot_with(configure: impl FnOnce(SelfCheck) -> SelfCheck, pumped: bool) -> Harness {
+        boot_session(configure, pumped, true).await
+    }
+
+    /// `handshake: false` leaves the connection as a 2026-07-28 client would:
+    /// no `initialize`, every request carrying its own `_meta`.
+    async fn boot_session(
+        configure: impl FnOnce(SelfCheck) -> SelfCheck,
+        pumped: bool,
+        handshake: bool,
+    ) -> Harness {
         let serve = SERVE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bin"), b"v1").unwrap();
@@ -1004,11 +1032,13 @@ mod session_tests {
             gate,
             exited,
         };
-        let init = h
-            .request("initialize", serde_json::from_str(INIT).unwrap())
-            .await;
-        assert!(init.get("error").is_none(), "{init}");
-        h.send_raw("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+        if handshake {
+            let init = h
+                .request("initialize", serde_json::from_str(INIT).unwrap())
+                .await;
+            assert!(init.get("error").is_none(), "{init}");
+            h.send_raw("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+        }
         h
     }
 
@@ -1343,6 +1373,68 @@ mod session_tests {
         assert_eq!(*order.lock().unwrap(), vec!["save", "before_exec"]);
     }
 
+    const STATELESS_META: &str = r#"{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+    /// A stateless client's open `subscriptions/listen` stream and its peer
+    /// info are written into the handover, so the new process can re-open
+    /// the stream and serve the session with no handshake.
+    #[tokio::test]
+    async fn a_stateless_sessions_listen_stream_and_peer_info_are_handed_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = tempfile::tempdir().unwrap();
+        let script = bin_dir.path().join("server");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let sink = captured.clone();
+        let argv = [script.clone()];
+        let mut h = boot_session(
+            move |sc| {
+                sc.with_reload(argv).with_before_exec(move || {
+                    let prefix = format!("mcp-methods-reload-{}-", std::process::id());
+                    let file = std::fs::read_dir(std::env::temp_dir())
+                        .unwrap()
+                        .flatten()
+                        .find(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                        .expect("handover file exists when before_exec runs");
+                    let text = std::fs::read_to_string(file.path()).unwrap();
+                    *sink.lock().unwrap() = Some(serde_json::from_str(&text).unwrap());
+                })
+            },
+            true,
+            false,
+        )
+        .await;
+        let meta: Value = serde_json::from_str(STATELESS_META).unwrap();
+        let listen = h.line(
+            1,
+            "subscriptions/listen",
+            json!({"_meta": meta, "notifications": {"toolsListChanged": true}}),
+        );
+        h.send_raw(&listen);
+        let ack = h.next_frame().await.unwrap();
+        assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+        h.replace();
+        h.id = 1;
+        let answer = h
+            .request(
+                "tools/call",
+                json!({"name":"ping","arguments":{"reload":true},"_meta": meta}),
+            )
+            .await;
+        // The interpreter does not exist, so the exec fails after the hook ran.
+        assert!(
+            Harness::text(&answer).contains("before_exec ran"),
+            "{answer}"
+        );
+        let handover = captured.lock().unwrap().clone().expect("hook ran");
+        assert_eq!(handover["peer_info"]["protocolVersion"], "2026-07-28");
+        assert_eq!(handover["peer_info"]["clientInfo"]["name"], "c");
+        let lines = handover["subscriptions"].as_array().unwrap();
+        assert_eq!(lines.len(), 1, "{handover}");
+        assert_eq!(lines[0].as_str().unwrap(), listen.trim_end());
+    }
+
     #[test]
     fn exec_viability_requires_an_executable_regular_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -1503,6 +1595,7 @@ mod session_tests {
     fn sample_handover(tools: Vec<String>) -> Handover {
         Handover {
             peer_info: serde_json::from_str(INIT).unwrap(),
+            subscriptions: vec![],
             replay_line: REPLAY_PING.to_string(),
             pending: format!("{NEXT_PING}\n").into_bytes(),
             tools,
@@ -1631,6 +1724,42 @@ mod session_tests {
             let frame = r.frame(Duration::from_secs(10)).await.expect("frames");
             saw_change |= frame["method"] == "notifications/tools/list_changed";
             saw_reply |= frame["id"] == 7;
+        }
+    }
+
+    /// A stateless session resumes with no handshake: its `subscriptions/listen`
+    /// line is replayed ahead of the interrupted request, the stream is
+    /// acknowledged again, and the tool-set change reaches it tagged.
+    #[tokio::test]
+    async fn a_stateless_session_resumes_with_its_listen_stream_reopened() {
+        let meta = STATELESS_META;
+        let listen = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"subscriptions/listen","params":{{"_meta":{meta},"notifications":{{"toolsListChanged":true}}}}}}"#
+        );
+        let ping = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"ping","arguments":{{"reload":true}},"_meta":{meta}}}}}"#
+        );
+        let mut handover = sample_handover(vec!["removed_tool".into()]);
+        handover.peer_info = serde_json::from_str(
+            r#"{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"c","version":"1"}}"#,
+        )
+        .unwrap();
+        handover.subscriptions = vec![listen];
+        handover.replay_line = ping;
+        handover.pending = vec![];
+        let (mut r, _run) = resume(&handover, None).await;
+        let (mut acked, mut answered, mut tagged) = (false, false, false);
+        while !(acked && answered && tagged) {
+            let frame = r.frame(Duration::from_secs(10)).await.expect("frames");
+            acked |= frame["method"] == "notifications/subscriptions/acknowledged";
+            answered |= frame["id"] == 7 && frame.get("result").is_some();
+            if frame["method"] == "notifications/tools/list_changed" {
+                assert_eq!(
+                    frame["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    3
+                );
+                tagged = true;
+            }
         }
     }
 

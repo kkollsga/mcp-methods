@@ -181,16 +181,29 @@ server.register_typed_tool_fallible("reload_graph", "…", move |args: ReloadArg
 });
 ```
 
-**You must notify the peer.** The framework stores no peer handles, so
-`tools/list` and `prompts/list` change under clients that will keep serving
-their cached copies. A handler holds a `RequestContext`, which holds the peer:
+**You must announce the change.** `tools/list` and `prompts/list` change under
+clients that will keep serving their cached copies. A handler holds a
+`RequestContext`, which holds the peer:
 
 ```rust
-mcp_methods::server::notify_skills_changed(&context.peer).await?;
+use mcp_methods::server::ListChange;
+server.announce_list_changed(&context.peer, ListChange::BOTH).await?;
 ```
 
-That is `notify_tool_list_changed()` followed by `notify_prompt_list_changed()`;
-call them yourself if you want only one. `get_info` advertises
+`ListChange::TOOLS` and `ListChange::PROMPTS` announce one list. The call
+reaches both kinds of client:
+
+- A client that opened with `initialize` (2025-11-25 and older) gets
+  `notifications/tools/list_changed` / `prompts/list_changed` on its
+  connection.
+- A client on 2026-07-28 or later has no handshake and receives no
+  unsolicited notifications. It gets the notification on each open
+  `subscriptions/listen` stream that asked for that list, tagged with
+  `io.modelcontextprotocol/subscriptionId`. The streams are server-wide, so
+  they are announced to whichever connection triggered the change.
+
+Do not call `peer.notify_tool_list_changed()` yourself: it is dropped
+silently for a 2026-07-28 client. `get_info` advertises
 `tools.listChanged: true` unconditionally and `prompts.listChanged: true`
 whenever the prompts capability is advertised at all, so a client has reason to
 re-fetch.
