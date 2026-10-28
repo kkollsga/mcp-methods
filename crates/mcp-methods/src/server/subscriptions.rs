@@ -44,9 +44,6 @@ impl ListChange {
     };
 }
 
-/// Longest a resumed process waits for its replayed listen streams.
-const REOPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
 struct Entry {
     key: u64,
     sink: SubscriptionSink,
@@ -55,12 +52,40 @@ struct Entry {
     raw: Option<Arc<str>>,
 }
 
+#[derive(Default)]
+struct Inner {
+    open: Vec<Entry>,
+    /// Which lists have been announced as changed at any point in this
+    /// process.
+    changed: Option<ListChange>,
+}
+
 /// The `subscriptions/listen` streams currently open, across every
 /// connection this server (and its clones) serves.
+///
+/// A stream must hear about every list change that its client could have
+/// missed, and its client can miss one in two ways. rmcp acknowledges a
+/// request before it runs the handler's `listen`, which registers the
+/// stream, so an announcement in that gap reaches no stream. And a client
+/// sends `subscriptions/listen` and `tools/list` back to back without
+/// waiting for the acknowledgement, so the list can be served, changed
+/// and announced before the stream is granted at all. Request order cannot
+/// tell those apart from a harmless announcement, so [`register`] replays
+/// every category announced at any earlier point: at most one redundant
+/// `list_changed` per new stream on a server that has changed, which is a
+/// hint to re-list, and never a lost one. `announce` and `register` take
+/// the same lock, so an announcement is either replayed or finds the stream
+/// open.
+///
+/// [`register`]: Subscriptions::register
 #[derive(Default)]
 pub(crate) struct Subscriptions {
-    open: Mutex<Vec<Entry>>,
+    inner: Mutex<Inner>,
     next_key: AtomicU64,
+    /// Test seam: parks `listen` after the acknowledgement went out and
+    /// before the stream is registered. `(reached, release)`.
+    #[cfg(test)]
+    pub(crate) listen_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 /// Removes its subscription from the registry when dropped.
@@ -71,41 +96,71 @@ pub(crate) struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.registry.lock().retain(|e| e.key != self.key);
+        self.registry.lock().open.retain(|e| e.key != self.key);
+    }
+}
+
+impl Inner {
+    fn record(&mut self, change: ListChange) {
+        let seen = self.changed.get_or_insert(ListChange {
+            tools: false,
+            prompts: false,
+        });
+        seen.tools |= change.tools;
+        seen.prompts |= change.prompts;
     }
 }
 
 impl Subscriptions {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
-        self.open.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub(crate) fn register(
+    #[cfg(test)]
+    pub(crate) async fn hold_before_register(&self) {
+        let gate = self.listen_gate.lock().unwrap().clone();
+        if let Some((reached, release)) = gate {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
+
+    /// Record `change` without sending it, so every stream registered
+    /// from now on is caught up. An in-place reload calls this before the
+    /// replayed `subscriptions/listen` lines are read.
+    pub(crate) fn mark_changed(&self, change: ListChange) {
+        self.lock().record(change);
+    }
+
+    pub(crate) async fn register(
         self: &Arc<Self>,
         sink: SubscriptionSink,
         raw: Option<Arc<str>>,
     ) -> Registration {
         let key = self.next_key.fetch_add(1, Ordering::Relaxed);
-        self.lock().push(Entry { key, sink, raw });
+        let catch_up = {
+            let mut inner = self.lock();
+            inner.open.push(Entry {
+                key,
+                sink: sink.clone(),
+                raw,
+            });
+            inner.changed.unwrap_or(ListChange {
+                tools: false,
+                prompts: false,
+            })
+        };
+        send_change(&sink, catch_up).await;
         Registration {
             registry: self.clone(),
             key,
         }
     }
 
-    /// Wait until `count` streams are registered, at most [`REOPEN_WAIT`].
-    /// A resumed process re-opens the streams by replaying their request
-    /// lines, which the serve loop handles asynchronously.
-    pub(crate) async fn await_open(&self, count: usize) {
-        let deadline = tokio::time::Instant::now() + REOPEN_WAIT;
-        while self.lock().len() < count && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
     /// The raw `subscriptions/listen` lines of every open stream.
     pub(crate) fn raw_lines(&self) -> Vec<String> {
         self.lock()
+            .open
             .iter()
             .filter_map(|e| e.raw.as_deref().map(str::to_owned))
             .collect()
@@ -115,15 +170,23 @@ impl Subscriptions {
     /// list is skipped by the sink itself; a closed one is dropped by its
     /// [`Registration`].
     pub(crate) async fn announce(&self, change: ListChange) {
-        let sinks: Vec<SubscriptionSink> = self.lock().iter().map(|e| e.sink.clone()).collect();
+        let sinks: Vec<SubscriptionSink> = {
+            let mut inner = self.lock();
+            inner.record(change);
+            inner.open.iter().map(|e| e.sink.clone()).collect()
+        };
         for sink in sinks {
-            if change.tools {
-                log_send_failure(sink.notify_tool_list_changed().await);
-            }
-            if change.prompts {
-                log_send_failure(sink.notify_prompt_list_changed().await);
-            }
+            send_change(&sink, change).await;
         }
+    }
+}
+
+async fn send_change(sink: &SubscriptionSink, change: ListChange) {
+    if change.tools {
+        log_send_failure(sink.notify_tool_list_changed().await);
+    }
+    if change.prompts {
+        log_send_failure(sink.notify_prompt_list_changed().await);
     }
 }
 
@@ -163,8 +226,17 @@ async fn send_direct(peer: &Peer<RoleServer>, change: ListChange) -> Result<(), 
 }
 
 impl McpServer {
-    pub(crate) async fn await_subscriptions(&self, count: usize) {
-        self.subscriptions().await_open(count).await;
+    /// Only the direct half of [`announce_list_changed`](Self::announce_list_changed).
+    pub(crate) async fn announce_direct(
+        &self,
+        peer: &Peer<RoleServer>,
+        change: ListChange,
+    ) -> Result<(), ServiceError> {
+        if takes_direct_notifications(peer) {
+            send_direct(peer, change).await
+        } else {
+            Ok(())
+        }
     }
 
     /// Announce that the tool list, the prompt list, or both changed.
@@ -191,12 +263,147 @@ impl McpServer {
         peer: &Peer<RoleServer>,
         change: ListChange,
     ) -> Result<(), ServiceError> {
-        let direct = if takes_direct_notifications(peer) {
-            send_direct(peer, change).await
-        } else {
-            Ok(())
-        };
+        let direct = self.announce_direct(peer, change).await;
         self.subscriptions().announce(change).await;
         direct
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::stdio::StdioTransport;
+    use crate::server::ServerOptions;
+    use rmcp::ServiceExt;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const META: &str = r#"{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+    async fn frame(read: &mut (impl AsyncBufReadExt + Unpin), within_ms: u64) -> Option<Value> {
+        let mut line = String::new();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(within_ms),
+            read.read_line(&mut line),
+        )
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(&line).unwrap()),
+            _ => None,
+        }
+    }
+
+    /// Open a stream, force an announcement into the gap between the
+    /// acknowledgement and the registration, then assert the stream is told.
+    async fn announce_in_the_gap(change: ListChange, method: &str, requested: Value) {
+        let server = McpServer::new(ServerOptions::default());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *server.subscriptions().listen_gate.lock().unwrap() =
+            Some((reached.clone(), release.clone()));
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let serving = server.clone();
+        tokio::spawn(async move {
+            let (read, write) = tokio::io::split(a);
+            let service = serving
+                .serve(StdioTransport::from_io(read, write))
+                .await
+                .unwrap();
+            let _ = service.waiting().await;
+        });
+        let (read, mut write) = tokio::io::split(b);
+        let mut read = BufReader::new(read);
+        let meta: Value = serde_json::from_str(META).unwrap();
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"subscriptions/listen",
+            "params":{"_meta": meta, "notifications": requested}});
+        write
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let ack = frame(&mut read, 10_000).await.expect("acknowledged");
+        assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+        // `listen` is parked before registering: this announcement reaches
+        // no registered stream.
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached.notified())
+            .await
+            .expect("listen reached the gate");
+        server.subscriptions().announce(change).await;
+        release.notify_one();
+        let told = frame(&mut read, 3_000)
+            .await
+            .expect("the list change announced after the acknowledgement was lost");
+        assert_eq!(told["method"], method, "{told}");
+        assert_eq!(
+            told["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tools_change_between_acknowledgement_and_registration_is_delivered() {
+        announce_in_the_gap(
+            ListChange::TOOLS,
+            "notifications/tools/list_changed",
+            json!({"toolsListChanged": true}),
+        )
+        .await;
+    }
+
+    /// Serve `server` over a duplex pipe and send a tools-list-changed
+    /// `subscriptions/listen` with id 7; returns the client's two ends.
+    async fn open_listen(
+        server: &McpServer,
+    ) -> (
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let serving = server.clone();
+        tokio::spawn(async move {
+            let (read, write) = tokio::io::split(a);
+            let service = serving
+                .serve(StdioTransport::from_io(read, write))
+                .await
+                .unwrap();
+            let _ = service.waiting().await;
+        });
+        let (read, mut write) = tokio::io::split(b);
+        let meta: Value = serde_json::from_str(META).unwrap();
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"subscriptions/listen",
+            "params":{"_meta": meta, "notifications": {"toolsListChanged": true}}});
+        write
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        (BufReader::new(read), write)
+    }
+
+    /// A client that sends `subscriptions/listen` and `tools/list` back to
+    /// back does not wait for the acknowledgement: the list can be served
+    /// and changed before the stream is even granted.
+    #[tokio::test]
+    async fn a_change_announced_before_the_stream_was_opened_is_delivered_when_it_opens() {
+        let server = McpServer::new(ServerOptions::default());
+        server.subscriptions().announce(ListChange::TOOLS).await;
+        let (mut read, _write) = open_listen(&server).await;
+        let ack = frame(&mut read, 10_000).await.expect("acknowledged");
+        assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+        let told = frame(&mut read, 3_000)
+            .await
+            .expect("a change announced before the stream opened was lost");
+        assert_eq!(told["method"], "notifications/tools/list_changed", "{told}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_opened_on_a_server_that_never_changed_is_told_nothing() {
+        let server = McpServer::new(ServerOptions::default());
+        let (mut read, _write) = open_listen(&server).await;
+        let ack = frame(&mut read, 10_000).await.expect("acknowledged");
+        assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+        assert!(frame(&mut read, 300).await.is_none());
+        // A real change afterwards still arrives.
+        server.subscriptions().announce(ListChange::TOOLS).await;
+        let told = frame(&mut read, 3_000).await.expect("live announce");
+        assert_eq!(told["method"], "notifications/tools/list_changed", "{told}");
     }
 }

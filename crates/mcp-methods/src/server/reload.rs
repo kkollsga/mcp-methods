@@ -679,18 +679,23 @@ impl McpServer {
         if let Some(state) = &state {
             state.mark_reloaded(handover.old_version.clone(), notes);
         }
+        let tools_changed = self.tool_names() != handover.tools;
+        if tools_changed {
+            // Recorded before the replay is read, so every re-opened
+            // stream is caught up on registration, however late it is
+            // processed.
+            self.subscriptions()
+                .mark_changed(crate::server::ListChange::TOOLS);
+        }
         transport.prepend_input(&handover.replay_bytes());
         let service = rmcp::service::serve_directly(self.clone(), transport, Some(peer_info));
         let server = self;
         let peer = service.peer().clone();
-        let old_tools = handover.tools;
-        let reopened = handover.subscriptions.len();
         tokio::spawn(async move {
             crate::server::roots::on_client_initialized(server.options(), &peer).await;
-            if server.tool_names() != old_tools {
-                server.await_subscriptions(reopened).await;
+            if tools_changed {
                 let _ = server
-                    .announce_list_changed(&peer, crate::server::ListChange::TOOLS)
+                    .announce_direct(&peer, crate::server::ListChange::TOOLS)
                     .await;
             }
         });

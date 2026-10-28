@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+## 0.6.1 (proposed)
+
+### Fixed — a list change announced before a `subscriptions/listen` stream registered was lost
+
+A client on protocol 2026-07-28 sends `subscriptions/listen` and `tools/list`
+back to back without waiting for the acknowledgement, and the server handles
+them concurrently. A list change announced after the list was served but
+before the stream was registered reached no stream, so the client kept a stale
+tool list until the next change. rmcp also acknowledges a request before the
+handler's `listen` registers the stream, which opened the same gap.
+
+A stream now registers under the same lock `announce_list_changed` takes, and
+is sent a `list_changed` for every list that has changed at any earlier point
+in the process. A server that has never changed a list sends nothing; one that
+has sends at most one redundant `list_changed` per new stream, which clients
+treat as a hint to re-list. The in-place reload path records the tool-set
+change the same way before the replayed streams are read, instead of waiting
+up to 2 seconds for them.
+
 ## 0.6.0 — 2026-10-28
 
 ### Breaking — `notify_skills_changed` is removed

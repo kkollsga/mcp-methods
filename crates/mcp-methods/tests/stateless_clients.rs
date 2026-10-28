@@ -240,8 +240,7 @@ async fn listen(client: &mut Client, notifications: Value) -> i64 {
     id
 }
 
-/// Announce until the client sees a notification with `method`, tolerating
-/// the instant between the acknowledgement and the stream being registered.
+/// Announce until the client sees a notification with `method`.
 async fn announce_until(client: &mut Client, server: &McpServer, method: &str) -> Value {
     for _ in 0..50 {
         server

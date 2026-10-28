@@ -3413,7 +3413,12 @@ impl ServerHandler for McpServer {
             .extensions
             .get::<crate::server::stdio::RawJsonRpcRequest>()
             .map(|raw| raw.source.clone());
-        let _registered = self.subscriptions.register(context.sink().clone(), raw);
+        #[cfg(test)]
+        self.subscriptions.hold_before_register().await;
+        let _registered = self
+            .subscriptions
+            .register(context.sink().clone(), raw)
+            .await;
         context.cancelled().await;
         Ok(())
     }
