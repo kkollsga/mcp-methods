@@ -117,10 +117,6 @@ Tools own domain relevance; the generic fallback only describes structure.
 
 `graph` is any object exposing `describe()` / `cypher()` / `save()`. [kglite's](https://github.com/kkollsga/kglite) `KnowledgeGraph` satisfies this duck-type interface. Other graph backends that adopt the same three methods work too.
 
-## End-to-end example
-
-A runnable stub lives at [`python_tests/fastmcp_demo.py`](https://github.com/kkollsga/mcp-methods/blob/main/python_tests/fastmcp_demo.py) in the repo. It boots an `MCPServer` with all five helpers wired up and a kglite-style graph backend.
-
 ## When to use FastMCP vs the Rust binary
 
 | You want | Use |
