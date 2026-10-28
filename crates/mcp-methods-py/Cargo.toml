@@ -26,4 +26,4 @@ mcp-methods = { path = "../mcp-methods", default-features = false, features = ["
 # collapses the per-Python-version wheel matrix into a single abi3
 # wheel per OS.
 pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310"] }
-serde_json = "1"
+serde_json = "1.0.154"

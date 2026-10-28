@@ -47,46 +47,46 @@ server = [
 
 [dependencies]
 # --- always-on (primitives) ---
-regex = "1"
+regex = "1.13.1"
 fancy-regex = "0.17"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ureq = { version = "3.4.2", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.0", features = ["json"] }
 # ripgrep crates
-grep-matcher = "0.1"
-grep-regex = "0.1"
-grep-searcher = "0.1"
-# 0.4.15, not "0.4": grep/walker.rs and list_dir.rs call
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+# Floor kept at the latest release; the code itself needs 0.4.15 or later: grep/walker.rs and list_dir.rs call
 # WalkBuilder::filter_entry and ::sort_by_file_path. Bisected against the
 # individual releases -- 0.4.14 has neither filter_entry nor (below 0.4.10)
 # sort_by_file_path; 0.4.15 has both. A bare "0.4" let a consumer resolving
 # to declared minimums pick 0.4.3 and fail to compile this crate, which is
 # what kglite's minimal-versions CI job hit.
-ignore = "0.4.15"
+ignore = "0.4.34"
 # Glob-pattern matching for `workspace.applies_to`. Already a
 # transitive dep via `ignore`; making it direct so the manifest
 # parser can validate patterns at boot.
-globset = "0.4"
+globset = "0.4.21"
 
 # --- server feature ---
-rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time", "net"], optional = true }
-serde_yaml = { version = "0.9", optional = true }
-schemars = { version = "1", optional = true }
-anyhow = { version = "1", optional = true }
-thiserror = { version = "2", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-notify = { version = "8", optional = true }
+rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time", "net"], optional = true }
+serde_yaml = { version = "0.9.34", optional = true }
+schemars = { version = "1.2.3", optional = true }
+anyhow = { version = "1.0.104", optional = true }
+thiserror = { version = "2.0.21", optional = true }
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+notify = { version = "8.2.1", optional = true }
 notify-debouncer-mini = { version = "0.6", optional = true }
 # Framing for the stdio transport (`server::stdio`): the same codec stack
 # rmcp's own async-rw transport uses.
-futures = { version = "0.3", optional = true }
-tokio-util = { version = "0.7.9", features = ["codec"], optional = true }
+futures = { version = "0.3.34", optional = true }
+tokio-util = { version = "0.7.20", features = ["codec"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"

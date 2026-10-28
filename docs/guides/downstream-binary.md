@@ -34,7 +34,7 @@ path = "src/main.rs"
 mcp-methods = { version = "0.6", features = ["server"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rmcp = { version = "3.1.1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
