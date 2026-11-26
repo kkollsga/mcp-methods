@@ -79,7 +79,7 @@ The pattern is well-established for Rust crates that want both audiences.
 - **Rust library consumers**: `cargo add mcp-methods` from a Rust project. Zero pyo3 in your `cargo tree`. Library version moves in lockstep with the wheel.
 - **Operators preferring cargo over pip**: `cargo install --git https://github.com/kkollsga/mcp-methods mcp-server`. Not on crates.io because we don't want the maintenance overhead of a second published name.
 
-The release line is single — `0.3.X` covers all three paths. No "library is at 0.5 but wheel is at 0.3.30" version skew.
+The release line is single: one version number covers all three paths, so the library and the wheel never drift apart.
 
 ## See also
 
