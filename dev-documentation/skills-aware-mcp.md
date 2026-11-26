@@ -753,19 +753,19 @@ pub struct Manifest {
 Manifest's `skills` is `SkillsSource::Disabled` by default. The build_skills parser populates it from YAML:
 
 ```rust
-fn build_skills(raw: Option<&serde_yaml::Value>, yaml_path: &Path)
+fn build_skills(raw: Option<&yaml_serde::Value>, yaml_path: &Path)
     -> Result<SkillsSource, ManifestError>
 {
     match raw {
-        None | Some(serde_yaml::Value::Null) => Ok(SkillsSource::Disabled),
-        Some(serde_yaml::Value::Bool(false)) => Ok(SkillsSource::Disabled),
-        Some(serde_yaml::Value::Bool(true)) => Ok(SkillsSource::Sources(vec![SkillSource::Bundled])),
-        Some(serde_yaml::Value::String(s)) => Ok(SkillsSource::Sources(vec![SkillSource::Path(s.into())])),
-        Some(serde_yaml::Value::Sequence(seq)) => {
+        None | Some(yaml_serde::Value::Null) => Ok(SkillsSource::Disabled),
+        Some(yaml_serde::Value::Bool(false)) => Ok(SkillsSource::Disabled),
+        Some(yaml_serde::Value::Bool(true)) => Ok(SkillsSource::Sources(vec![SkillSource::Bundled])),
+        Some(yaml_serde::Value::String(s)) => Ok(SkillsSource::Sources(vec![SkillSource::Path(s.into())])),
+        Some(yaml_serde::Value::Sequence(seq)) => {
             let sources = seq.iter().map(|item| match item {
-                serde_yaml::Value::Bool(true) => Ok(SkillSource::Bundled),
-                serde_yaml::Value::Bool(false) => Err(/* ... */),
-                serde_yaml::Value::String(s) => Ok(SkillSource::Path(s.into())),
+                yaml_serde::Value::Bool(true) => Ok(SkillSource::Bundled),
+                yaml_serde::Value::Bool(false) => Err(/* ... */),
+                yaml_serde::Value::String(s) => Ok(SkillSource::Path(s.into())),
                 _ => Err(/* ... */),
             }).collect::<Result<Vec<_>, _>>()?;
             Ok(SkillsSource::Sources(sources))

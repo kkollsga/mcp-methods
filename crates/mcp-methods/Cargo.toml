@@ -32,7 +32,7 @@ default = ["server"]
 server = [
     "dep:rmcp",
     "dep:tokio",
-    "dep:serde_yaml",
+    "dep:yaml_serde",
     "dep:schemars",
     "dep:anyhow",
     "dep:thiserror",
@@ -71,7 +71,7 @@ globset = "0.4.21"
 # --- server feature ---
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time", "net"], optional = true }
-serde_yaml = { version = "0.9.34", optional = true }
+yaml_serde = { version = "0.10.7", optional = true }
 schemars = { version = "1.2.3", optional = true }
 anyhow = { version = "1.0.104", optional = true }
 thiserror = { version = "2.0.21", optional = true }

@@ -822,10 +822,10 @@ pub fn find_workspace_manifest(workspace_dir: &Path) -> Option<PathBuf> {
 pub fn load(yaml_path: &Path) -> Result<Manifest, ManifestError> {
     let text = fs::read_to_string(yaml_path)
         .map_err(|e| ManifestError::at(yaml_path, format!("read error: {e}")))?;
-    let raw: serde_yaml::Value = serde_yaml::from_str(&text)
+    let raw: yaml_serde::Value = yaml_serde::from_str(&text)
         .map_err(|e| ManifestError::at(yaml_path, format!("YAML parse error: {e}")))?;
     let raw = match raw {
-        serde_yaml::Value::Null => serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        yaml_serde::Value::Null => yaml_serde::Value::Mapping(yaml_serde::Mapping::new()),
         v => v,
     };
     let map = raw
@@ -834,7 +834,7 @@ pub fn load(yaml_path: &Path) -> Result<Manifest, ManifestError> {
     build(map, yaml_path)
 }
 
-fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, ManifestError> {
+fn build(raw: &yaml_serde::Mapping, yaml_path: &Path) -> Result<Manifest, ManifestError> {
     check_keys(raw, ALLOWED_TOP_KEYS, "top-level keys", yaml_path)?;
 
     if raw.contains_key("source_root") && raw.contains_key("source_roots") {
@@ -923,10 +923,10 @@ fn build(raw: &serde_yaml::Mapping, yaml_path: &Path) -> Result<Manifest, Manife
 /// Useful for operators who want to rely solely on adjacent project
 /// skills.
 fn build_skills(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<SkillsSource, ManifestError> {
-    use serde_yaml::Value;
+    use yaml_serde::Value;
 
     match raw {
         None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(SkillsSource::Disabled),
@@ -1008,7 +1008,7 @@ fn build_skills(
 ///   its own unknown keys are rejected by `AppliesWhen`'s
 ///   `deny_unknown_fields`)
 fn build_inline_skill(
-    map: &serde_yaml::Mapping,
+    map: &yaml_serde::Mapping,
     idx: usize,
     yaml_path: &Path,
 ) -> Result<InlineSkill, ManifestError> {
@@ -1021,7 +1021,7 @@ fn build_inline_skill(
 
     let required_str = |key: &str| -> Result<String, ManifestError> {
         match map.get(key) {
-            Some(serde_yaml::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+            Some(yaml_serde::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
             _ => Err(ManifestError::at(
                 yaml_path,
                 format!("skills[{idx}]: inline skill `{key}` must be a non-empty string"),
@@ -1033,12 +1033,12 @@ fn build_inline_skill(
     let body = required_str("body")?;
 
     let references_tools = match map.get("references_tools") {
-        None | Some(serde_yaml::Value::Null) => Vec::new(),
-        Some(serde_yaml::Value::Sequence(seq)) => {
+        None | Some(yaml_serde::Value::Null) => Vec::new(),
+        Some(yaml_serde::Value::Sequence(seq)) => {
             let mut tools = Vec::with_capacity(seq.len());
             for item in seq {
                 match item {
-                    serde_yaml::Value::String(s) if !s.is_empty() => tools.push(s.clone()),
+                    yaml_serde::Value::String(s) if !s.is_empty() => tools.push(s.clone()),
                     _ => {
                         return Err(ManifestError::at(
                             yaml_path,
@@ -1061,8 +1061,8 @@ fn build_inline_skill(
     };
 
     let delivery = match map.get("delivery") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) if VALID_SKILL_DELIVERY.contains(&s.as_str()) => {
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) if VALID_SKILL_DELIVERY.contains(&s.as_str()) => {
             Some(s.clone())
         }
         Some(other) => {
@@ -1077,9 +1077,9 @@ fn build_inline_skill(
     };
 
     let applies_when = match map.get("applies_when") {
-        None | Some(serde_yaml::Value::Null) => None,
+        None | Some(yaml_serde::Value::Null) => None,
         Some(value) => Some(
-            serde_yaml::from_value::<AppliesWhen>(value.clone()).map_err(|e| {
+            yaml_serde::from_value::<AppliesWhen>(value.clone()).map_err(|e| {
                 ManifestError::at(
                     yaml_path,
                     format!("skills[{idx}]: inline skill `applies_when` is invalid: {e}"),
@@ -1099,13 +1099,13 @@ fn build_inline_skill(
 }
 
 fn build_extensions(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ManifestError> {
     let Some(raw) = raw else {
         return Ok(serde_json::Map::new());
     };
-    if matches!(raw, serde_yaml::Value::Null) {
+    if matches!(raw, yaml_serde::Value::Null) {
         return Ok(serde_json::Map::new());
     }
     if !raw.is_mapping() {
@@ -1121,11 +1121,11 @@ fn build_extensions(
 }
 
 fn build_workspace(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<Option<WorkspaceConfig>, ManifestError> {
     let Some(raw) = raw else { return Ok(None) };
-    if matches!(raw, serde_yaml::Value::Null) {
+    if matches!(raw, yaml_serde::Value::Null) {
         return Ok(None);
     }
     let map = raw
@@ -1133,8 +1133,8 @@ fn build_workspace(
         .ok_or_else(|| ManifestError::at(yaml_path, "workspace must be a mapping"))?;
     check_keys(map, ALLOWED_WORKSPACE_KEYS, "workspace keys", yaml_path)?;
     let kind = match map.get("kind") {
-        None | Some(serde_yaml::Value::Null) => WorkspaceKind::default(),
-        Some(serde_yaml::Value::String(s)) => match s.as_str() {
+        None | Some(yaml_serde::Value::Null) => WorkspaceKind::default(),
+        Some(yaml_serde::Value::String(s)) => match s.as_str() {
             "github" => WorkspaceKind::Github,
             "local" => WorkspaceKind::Local,
             other => {
@@ -1154,8 +1154,8 @@ fn build_workspace(
         }
     };
     let root = match map.get("root") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1164,8 +1164,8 @@ fn build_workspace(
         }
     };
     let sandbox_root = match map.get("sandbox_root") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1174,8 +1174,8 @@ fn build_workspace(
         }
     };
     let watch = match map.get("watch") {
-        None | Some(serde_yaml::Value::Null) => false,
-        Some(serde_yaml::Value::Bool(b)) => *b,
+        None | Some(yaml_serde::Value::Null) => false,
+        Some(yaml_serde::Value::Bool(b)) => *b,
         Some(_) => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1184,8 +1184,8 @@ fn build_workspace(
         }
     };
     let adopt_client_roots = match map.get("adopt_client_roots") {
-        None | Some(serde_yaml::Value::Null) => false,
-        Some(serde_yaml::Value::Bool(b)) => *b,
+        None | Some(yaml_serde::Value::Null) => false,
+        Some(yaml_serde::Value::Bool(b)) => *b,
         Some(_) => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1195,11 +1195,11 @@ fn build_workspace(
     };
     let applies_to =
         match map.get("applies_to") {
-            None | Some(serde_yaml::Value::Null) => None,
-            Some(serde_yaml::Value::String(s)) => {
+            None | Some(yaml_serde::Value::Null) => None,
+            Some(yaml_serde::Value::String(s)) => {
                 Some(AppliesTo::Pattern(parse_applies_to_pattern(s, yaml_path)?))
             }
-            Some(serde_yaml::Value::Sequence(seq)) => {
+            Some(yaml_serde::Value::Sequence(seq)) => {
                 if seq.is_empty() {
                     return Err(ManifestError::at(
                         yaml_path,
@@ -1341,7 +1341,7 @@ fn parse_applies_to_pattern(raw: &str, yaml_path: &Path) -> Result<String, Manif
 }
 
 fn check_keys(
-    map: &serde_yaml::Mapping,
+    map: &yaml_serde::Mapping,
     allowed: &[&str],
     label: &str,
     yaml_path: &Path,
@@ -1364,13 +1364,13 @@ fn check_keys(
 }
 
 fn optional_str(
-    raw: &serde_yaml::Mapping,
+    raw: &yaml_serde::Mapping,
     key: &str,
     yaml_path: &Path,
 ) -> Result<Option<String>, ManifestError> {
     match raw.get(key) {
-        None | Some(serde_yaml::Value::Null) => Ok(None),
-        Some(serde_yaml::Value::String(s)) => Ok(Some(s.clone())),
+        None | Some(yaml_serde::Value::Null) => Ok(None),
+        Some(yaml_serde::Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(ManifestError::at(
             yaml_path,
             format!("{key} must be a string"),
@@ -1379,7 +1379,7 @@ fn optional_str(
 }
 
 fn build_trust(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<TrustConfig, ManifestError> {
     let Some(raw) = raw else {
@@ -1404,7 +1404,7 @@ fn build_trust(
 }
 
 fn build_tools(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<Vec<ToolSpec>, ManifestError> {
     let Some(raw) = raw else {
@@ -1430,7 +1430,7 @@ fn build_tools(
 }
 
 fn build_tool(
-    entry: &serde_yaml::Value,
+    entry: &yaml_serde::Value,
     idx: usize,
     yaml_path: &Path,
 ) -> Result<ToolSpec, ManifestError> {
@@ -1501,8 +1501,8 @@ fn build_tool(
     }
 
     let description = match map.get("description") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) => Some(s.clone()),
         Some(_) => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1512,7 +1512,7 @@ fn build_tool(
     };
 
     let parameters = match map.get("parameters") {
-        None | Some(serde_yaml::Value::Null) => None,
+        None | Some(yaml_serde::Value::Null) => None,
         Some(v) if v.is_mapping() => Some(yaml_to_json(v.clone())?),
         Some(_) => {
             return Err(ManifestError::at(
@@ -1580,7 +1580,7 @@ fn build_tool(
 /// (`build_tool`) has already established that the entry has
 /// `bundled:` set as the kind discriminator.
 fn build_bundled_override(
-    map: &serde_yaml::Mapping,
+    map: &yaml_serde::Mapping,
     idx: usize,
     yaml_path: &Path,
 ) -> Result<ToolSpec, ManifestError> {
@@ -1616,8 +1616,8 @@ fn build_bundled_override(
     }
 
     let description = match map.get("description") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) => Some(s.clone()),
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) => Some(s.clone()),
         Some(_) => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1627,8 +1627,8 @@ fn build_bundled_override(
     };
 
     let hidden = match map.get("hidden") {
-        None | Some(serde_yaml::Value::Null) => false,
-        Some(serde_yaml::Value::Bool(b)) => *b,
+        None | Some(yaml_serde::Value::Null) => false,
+        Some(yaml_serde::Value::Bool(b)) => *b,
         Some(_) => {
             return Err(ManifestError::at(
                 yaml_path,
@@ -1642,8 +1642,8 @@ fn build_bundled_override(
     // job (it knows what other names — bundled, cypher, python — it
     // has in scope).
     let rename = match map.get("rename") {
-        None | Some(serde_yaml::Value::Null) => None,
-        Some(serde_yaml::Value::String(s)) => {
+        None | Some(yaml_serde::Value::Null) => None,
+        Some(yaml_serde::Value::String(s)) => {
             if !valid_identifier(s) {
                 return Err(ManifestError::at(
                     yaml_path,
@@ -1672,11 +1672,11 @@ fn build_bundled_override(
 }
 
 fn build_embedder(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<Option<EmbedderConfig>, ManifestError> {
     let Some(raw) = raw else { return Ok(None) };
-    if matches!(raw, serde_yaml::Value::Null) {
+    if matches!(raw, yaml_serde::Value::Null) {
         return Ok(None);
     }
     let map = raw
@@ -1706,7 +1706,7 @@ fn build_embedder(
         })?
         .to_string();
     let kwargs = match map.get("kwargs") {
-        None | Some(serde_yaml::Value::Null) => serde_json::Map::new(),
+        None | Some(yaml_serde::Value::Null) => serde_json::Map::new(),
         Some(v) if v.is_mapping() => match yaml_to_json(v.clone())? {
             serde_json::Value::Object(o) => o,
             _ => {
@@ -1731,13 +1731,13 @@ fn build_embedder(
 }
 
 fn build_builtins(
-    raw: Option<&serde_yaml::Value>,
+    raw: Option<&yaml_serde::Value>,
     yaml_path: &Path,
 ) -> Result<BuiltinsConfig, ManifestError> {
     let Some(raw) = raw else {
         return Ok(BuiltinsConfig::default());
     };
-    if matches!(raw, serde_yaml::Value::Null) {
+    if matches!(raw, yaml_serde::Value::Null) {
         return Ok(BuiltinsConfig::default());
     }
     let map = raw
@@ -1792,7 +1792,7 @@ fn valid_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn yaml_to_json(v: serde_yaml::Value) -> Result<serde_json::Value, ManifestError> {
+fn yaml_to_json(v: yaml_serde::Value) -> Result<serde_json::Value, ManifestError> {
     serde_json::to_value(&v)
         .map_err(|e| ManifestError::bare(format!("yaml→json conversion failed: {e}")))
 }

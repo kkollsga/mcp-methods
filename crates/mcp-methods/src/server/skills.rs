@@ -599,7 +599,7 @@ pub fn parse_skill(content: &str, path: &Path) -> Result<(SkillFrontmatter, Stri
         })?;
 
     let frontmatter: SkillFrontmatter =
-        serde_yaml::from_str(frontmatter_str).map_err(|e| SkillError::InvalidFrontmatter {
+        yaml_serde::from_str(frontmatter_str).map_err(|e| SkillError::InvalidFrontmatter {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
@@ -806,39 +806,39 @@ pub fn library_bundled_skills() -> Vec<BundledSkill> {
 /// with the extension keys commented out. Here every key the operator
 /// actually set has to come out live.
 ///
-/// Frontmatter values go through `serde_yaml` rather than string
+/// Frontmatter values go through `yaml_serde` rather than string
 /// interpolation, so a description with a colon, a body-looking
 /// `---`, or any other YAML metacharacter survives the trip.
 fn render_inline_skill(inline: &InlineSkill) -> String {
-    let mut front = serde_yaml::Mapping::new();
-    let mut put = |key: &str, value: serde_yaml::Value| {
-        front.insert(serde_yaml::Value::String(key.to_string()), value);
+    let mut front = yaml_serde::Mapping::new();
+    let mut put = |key: &str, value: yaml_serde::Value| {
+        front.insert(yaml_serde::Value::String(key.to_string()), value);
     };
-    put("name", serde_yaml::Value::String(inline.name.clone()));
+    put("name", yaml_serde::Value::String(inline.name.clone()));
     put(
         "description",
-        serde_yaml::Value::String(inline.description.clone()),
+        yaml_serde::Value::String(inline.description.clone()),
     );
     if !inline.references_tools.is_empty() {
         put(
             "references_tools",
-            serde_yaml::Value::Sequence(
+            yaml_serde::Value::Sequence(
                 inline
                     .references_tools
                     .iter()
-                    .map(|t| serde_yaml::Value::String(t.clone()))
+                    .map(|t| yaml_serde::Value::String(t.clone()))
                     .collect(),
             ),
         );
     }
     if let Some(delivery) = &inline.delivery {
-        put("delivery", serde_yaml::Value::String(delivery.clone()));
+        put("delivery", yaml_serde::Value::String(delivery.clone()));
     }
     if let Some(applies_when) = &inline.applies_when {
         // `AppliesWhen` serialises back to the same mapping it was
         // parsed from; an unset predicate is skipped, not emitted as
         // null, so the re-parse sees what the operator wrote.
-        match serde_yaml::to_value(applies_when) {
+        match yaml_serde::to_value(applies_when) {
             Ok(value) => put("applies_when", value),
             Err(e) => {
                 // Unreachable for the bounded predicate set, but a
@@ -852,7 +852,7 @@ fn render_inline_skill(inline: &InlineSkill) -> String {
                 );
                 put(
                     "applies_when",
-                    serde_yaml::Value::String(format!("<unserialisable: {e}>")),
+                    yaml_serde::Value::String(format!("<unserialisable: {e}>")),
                 );
             }
         }
@@ -861,7 +861,7 @@ fn render_inline_skill(inline: &InlineSkill) -> String {
     // Same rule as the `applies_when` arm: on the unreachable failure,
     // emit frontmatter `parse_skill` rejects (no `description`) so the
     // entry becomes a warning instead of a skill with a lost gate.
-    let frontmatter = serde_yaml::to_string(&serde_yaml::Value::Mapping(front))
+    let frontmatter = yaml_serde::to_string(&yaml_serde::Value::Mapping(front))
         .unwrap_or_else(|e| format!("name: <unserialisable: {e}>\n"));
     let body = &inline.body;
     let separator = if body.ends_with('\n') { "" } else { "\n" };
@@ -2036,7 +2036,7 @@ Body.\n";
     fn load_skills_from_dir_surfaces_yaml_parse_failure_as_warning() {
         // The exact scenario the operator hit: unquoted colon in
         // description value triggers PyYAML's "mapping values are
-        // not allowed here" — except ours uses serde_yaml so the
+        // not allowed here" — except ours uses yaml_serde so the
         // failure mode is `InvalidFrontmatter`. Either way, the
         // file is skipped, the rest of the dir loads, and the
         // warning surfaces structurally rather than just via
