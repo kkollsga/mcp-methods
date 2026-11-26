@@ -77,6 +77,7 @@ struct Stored<S> {
 /// One retained response in transit across an in-place reload. Carries the
 /// time it has left rather than an `Instant`, which means nothing in another
 /// process.
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CarriedResponse {
     id: String,
@@ -90,6 +91,7 @@ pub(crate) struct CarriedResponse {
 
 /// A session's retained responses plus the id counter, as handed to the
 /// process that replaces this one.
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CarriedResponses {
     pub(crate) entries: Vec<CarriedResponse>,
@@ -168,6 +170,7 @@ impl<S: PartialEq> ResponseStore<S> {
     /// The unexpired entries of `owner`, oldest first, with their remaining
     /// lifetime. `next_id` is the whole store's counter, so ids issued after
     /// a restore never collide with a carried one.
+    #[cfg(feature = "server")]
     pub(crate) fn carry(&mut self, owner: &S) -> CarriedResponses {
         self.expire();
         let entries = self
@@ -195,6 +198,7 @@ impl<S: PartialEq> ResponseStore<S> {
     /// when the old process would have expired it, and keep the counter above
     /// every restored id. The usual entry and byte caps apply: the oldest
     /// entries go first.
+    #[cfg(feature = "server")]
     pub(crate) fn restore(&mut self, owner: &S, carried: CarriedResponses)
     where
         S: Clone,
@@ -613,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn carried_entries_expand_after_restore_keep_their_clock_and_never_collide() {
         let mut old = ResponseStore::default();
         let mut ids = Vec::new();
@@ -674,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn restore_respects_the_entry_cap_and_drops_expired_entries() {
         let entry = |n: u64, remaining_ms: u64| CarriedResponse {
             id: format!("r{n}"),

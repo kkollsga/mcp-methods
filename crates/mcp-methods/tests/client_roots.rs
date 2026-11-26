@@ -18,6 +18,8 @@
 //! completes rather than deadlocking. Every test that adopts a root would
 //! hang instead of failing if that claim were wrong.
 
+#![cfg(feature = "server")]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

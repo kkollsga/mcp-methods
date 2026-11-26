@@ -1,6 +1,8 @@
 //! Compile-level contract for downstream crates that use the public rmcp
 //! escape hatch instead of `register_typed_tool`.
 
+#![cfg(feature = "server")]
+
 use std::sync::Arc;
 
 use mcp_methods::server::{McpServer, ServerOptions};
