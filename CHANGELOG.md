@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Changed — rmcp is declared without its default features
+
+`mcp-methods` and the `mcp-server` binary now depend on rmcp with
+`default-features = false` and list the features they use. Two effects:
+
+- mcp-methods no longer turns on rmcp's `base64` feature. It uses none of the
+  items behind it. A crate that calls `PromptMessage::new_image` or
+  `PromptMessage::new_audio` must enable `base64` on its own rmcp dependency;
+  one that keeps rmcp's default features is unaffected.
+- chrono (RUSTSEC-2026-0543, unmaintained) still reaches the tree through
+  rmcp 3.11 and earlier. An open upstream change makes chrono an optional
+  default rmcp feature. Once a release carries it, chrono leaves the tree for a
+  build where every rmcp dependent opts out of the defaults.
+
+The minimum rmcp is now 3.10.0, past the range of RUSTSEC-2026-0462. kglite
+already requires it.
+
+### Changed — YAML parsing uses `yaml_serde`
+
+Manifest and skill frontmatter parsing moves from the deprecated `serde_yaml`
+to `yaml_serde`, the YAML organization's maintained fork with the same API.
+This removes `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) from the
+tree. No parsing difference was found, and the manifest and skill suites pass
+unchanged.
+
+### Fixed — the `default-features = false` build is warning-free
+
+The pure-Rust configuration (no `server` feature) compiled with dead-code
+warnings and its server-only integration tests did not compile. Both are
+fixed, and CI now lints that configuration. The unused optional `clap`
+dependency is gone.
+
+### Changed — CI resolves and audits dependencies weekly
+
+`Cargo.lock` is not committed, so CI always resolves fresh. A weekly scheduled
+run now catches an upstream release that breaks the build in a quiet week. A
+new `Dependency audit` job runs `cargo audit --deny warnings`. Accepted
+exceptions live in `.cargo/audit.toml`; the only one is chrono, until rmcp
+ships it as optional. The audit job does not gate publishing.
+
 ## 0.6.2 — 2026-10-28
 
 ### Breaking — Python 3.12 or later
