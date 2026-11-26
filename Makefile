@@ -76,15 +76,16 @@ clean:
 	else \
 		echo "no target/ — nothing to clean"; \
 		echo "  (if this checkout should use a shared build volume, restore the link:"; \
-		echo "   make clean SHARED_TARGET_DIR=/Users/Shared/cargo-targets/mcp-methods"; \
-		echo "   — see dev-docs/plans/target-symlink-and-clean.md)"; \
+		echo "   make clean SHARED_TARGET_DIR=<shared build dir>/mcp-methods)"; \
 	fi
 	rm -rf wheels/ dist/ *.egg-info build/
 
 ## Size-gated prune of the build dir (doctrine 0.1.9, R4: "a bound checked
 ## only at milestones is not a bound"). The release gate runs this FIRST —
-## before its heavy build — and a phased run should run it after every phase
-## commit; on a lean tree it is a free no-op. Measures APPARENT size (`du -A`)
+## before its heavy build — and a single-agent phased run may run it after a
+## phase commit; on a lean tree it is a free no-op. Never run it while another
+## agent is building against the same shared cache: it cannot tell whose
+## artifacts are live. Measures APPARENT size (`du -A`)
 ## because the on-disk meter undercounted a real ENOSPC by ~2x; resolves the
 ## `target` symlink the same way `clean` does so it never deletes the link.
 ## Override the bound: `make prune-target PRUNE_TARGET_GIB=4`.
