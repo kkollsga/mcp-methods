@@ -1,0 +1,6 @@
+[advisories]
+# chrono (RUSTSEC-2026-0543, unmaintained) reaches the tree only through
+# rmcp. No rmcp release makes it optional yet (upstream PR
+# modelcontextprotocol/rust-sdk#1474). Retire this entry when the rmcp floor
+# reaches that release and `cargo tree -i chrono` finds no package.
+ignore = ["RUSTSEC-2026-0543"]

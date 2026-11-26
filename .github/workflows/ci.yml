@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Cargo.lock is not committed, so every run resolves fresh. The weekly run
+  # catches an upstream release breaking the build in a week with no pushes
+  # (kglite hit this class with fastembed 7.8.0).
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
 
 jobs:
   rust-checks:
@@ -16,6 +22,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt -- --check
       - run: cargo clippy --workspace -- -D warnings
+      # The pure-Rust configuration the README documents (no server feature).
+      - run: cargo clippy -p mcp-methods --no-default-features --all-targets -- -D warnings
       # Published doc surfaces must be attached and well-fenced: this
       # turns broken/private intra-doc links, redundant explicit link
       # targets and unclosed HTML tags into build failures instead of
@@ -105,3 +113,19 @@ jobs:
         run: |
           source .venv/bin/activate
           python -c "from mcp_methods import github_discussions, git_api, ripgrep_files, read_file, list_dir, ElementCache; print('Import successful')"
+
+  # Deliberately not in the publish workflows' `ci-gate` check-regexp
+  # (`^(Rust checks|Rust 1.88 MSRV|Python checks|Tests)`): a newly published
+  # advisory reddens CI without blocking an unrelated release. Accepted
+  # exceptions live in .cargo/audit.toml.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo generate-lockfile
+      - run: cargo audit --deny warnings
