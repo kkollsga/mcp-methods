@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "Reusable utility methods for MCP servers — pure-Rust library"
 repository = "https://github.com/kkollsga/mcp-methods"
-homepage = "https://github.com/kkollsga/mcp-methods"
 documentation = "https://docs.rs/mcp-methods"
 readme = "../../README.md"
 keywords = ["mcp", "ai", "rmcp", "agent", "stdio"]
@@ -36,7 +35,6 @@ server = [
     "dep:schemars",
     "dep:anyhow",
     "dep:thiserror",
-    "dep:clap",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:notify",
@@ -78,7 +76,6 @@ yaml_serde = { version = "0.10.7", optional = true }
 schemars = { version = "1.2.3", optional = true }
 anyhow = { version = "1.0.104", optional = true }
 thiserror = { version = "2.0.21", optional = true }
-clap = { version = "4.6.7", features = ["derive"], optional = true }
 tracing = { version = "0.1.44", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 notify = { version = "8.2.1", optional = true }

@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 description = "Generic Rust-native MCP server CLI — built on the mcp-methods framework"
 repository = "https://github.com/kkollsga/mcp-methods"
-homepage = "https://github.com/kkollsga/mcp-methods"
 readme = "../../README.md"
 keywords = ["mcp", "cli", "ai", "rmcp", "agent"]
 categories = ["command-line-utilities", "development-tools"]
