@@ -69,7 +69,10 @@ ignore = "0.4.34"
 globset = "0.4.21"
 
 # --- server feature ---
-rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
+# Defaults off: chrono leaves the tree once rmcp ships it as an optional default
+# feature (consumers must opt out too, since features unify). Floor 3.10.0 is
+# past RUSTSEC-2026-0462's affected range and matches kglite.
+rmcp = { version = "3.10.0", default-features = false, features = ["server", "macros", "transport-io", "transport-async-rw", "schemars"], optional = true }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "fs", "sync", "time", "net"], optional = true }
 yaml_serde = { version = "0.10.7", optional = true }
 schemars = { version = "1.2.3", optional = true }
